@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <optional>
 #include <thread>
 
 namespace dvb
@@ -34,8 +35,42 @@ namespace dvb
 			return false;
 		}
 
+		json GameHandler(const json& a_args, const ToolContext& a_ctx);
+
+		// Console `save`/`load` run the whole save/load synchronously inside the GFx
+		// console drain, off the engine's sanctioned save point: the save job spins in
+		// SkyrimVM::Freeze waiting for Papyrus stacks that only the (blocked) main loop
+		// can drain — an engine-level deadlock that reproduces with every devbench hook
+		// disabled. Reroute those commands to the BGSSaveLoadManager request path the
+		// `game` tool uses, which the engine services at its own save point.
+		std::optional<json> RedirectConsoleSaveLoad(const std::string& a_command, const ToolContext& a_ctx)
+		{
+			const auto  sp = a_command.find(' ');
+			std::string verb = a_command.substr(0, sp);
+			std::transform(verb.begin(), verb.end(), verb.begin(),
+				[](unsigned char c) { return static_cast<char>((c >= 'A' && c <= 'Z') ? c + 0x20 : c); });
+			const bool isSave = (verb == "save" || verb == "savegame");
+			const bool isLoad = (verb == "load" || verb == "loadgame");
+			if (!isSave && !isLoad)
+				return std::nullopt;
+
+			std::string name = (sp == std::string::npos) ? std::string{} : a_command.substr(sp + 1);
+			if (const auto b = name.find_first_not_of(" \t"); b != std::string::npos)
+				name = name.substr(b, name.find_last_not_of(" \t") - b + 1);
+			else
+				name.clear();
+			if (name.size() >= 2 && name.front() == '"' && name.back() == '"')
+				name = name.substr(1, name.size() - 2);
+			if (name.empty())
+				throw ToolError(400, std::format("console '{}' requires a save name (it is rerouted to the `game` tool)", verb));
+
+			json out = GameHandler(json{ { "action", isSave ? "save" : "load" }, { "name", name } }, a_ctx);
+			out["redirected"] = "game";
+			return out;
+		}
+
 		// console: run a Skyrim console command; optionally fence + capture its output.
-		json ConsoleHandler(const json& a_args, const ToolContext&)
+		json ConsoleHandler(const json& a_args, const ToolContext& a_ctx)
 		{
 			const std::string action = a_args.value("action", std::string("exec"));
 
@@ -63,6 +98,9 @@ namespace dvb
 			const std::string command = a_args.value("command", std::string{});
 			if (command.empty())
 				throw ToolError(400, "missing required parameter 'command'");
+
+			if (auto redirected = RedirectConsoleSaveLoad(command, a_ctx))
+				return *std::move(redirected);
 
 			// A `coc <cell>` is a reproducible entry point for a later recording — note the
 			// cell so the recording manifest can capture "how to get here". (|0x20 lowercases
@@ -1396,7 +1434,10 @@ namespace dvb
 			"later action='read' slices ConsoleLog's buffer between the markers and returns the "
 			"command's output as { markersFound, lines:[…] }. Useful for printing commands "
 			"(getav, getgs, getpos, help). Read promptly after exec — heavy ConsoleLog spam can "
-			"scroll the markers out of the buffer (then markersFound=false, no wrong data).";
+			"scroll the markers out of the buffer (then markersFound=false, no wrong data). "
+			"`save <name>`/`load <name>` are rerouted to the `game` tool's BGSSaveLoadManager "
+			"path and return { redirected:'game' } — running them as raw console commands "
+			"deadlocks the engine (SkyrimVM::Freeze vs blocked main loop).";
 		console.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
