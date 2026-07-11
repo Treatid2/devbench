@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <ctime>
 #include <filesystem>
 #include <format>
@@ -562,7 +563,19 @@ namespace dvb::Recording
 					if (settleMs > 0)
 						steps.push_back(json{ { "wait", settleMs } });
 				}
-				steps.push_back(json{ { "tool", "console" }, { "args", json{ { "action", "exec" }, { "command", "coc " + value } } } });
+				// Exterior editor ids are not unique across worldspaces, and a
+				// raw coc from an interior straight into a worldspace can wedge
+				// the engine's streaming init (observed: permanent main-thread
+				// hang). Exterior entries restore via the recorded worldspace +
+				// anchor grid cell instead; interiors keep coc (unique ids).
+				std::string enter = "coc " + value;
+				if (!interior && meta.contains("anchor") && !meta.value("worldspace", std::string{}).empty()) {
+					const json anchor = meta.value("anchor", json::object());
+					const int  gx = static_cast<int>(std::floor(anchor.value("x", 0.0) / 4096.0));
+					const int  gy = static_cast<int>(std::floor(anchor.value("y", 0.0) / 4096.0));
+					enter = std::format("cow {} {} {}", meta.value("worldspace", std::string{}), gx, gy);
+				}
+				steps.push_back(json{ { "tool", "console" }, { "args", json{ { "action", "exec" }, { "command", enter } } } });
 				steps.push_back(json{ { "waitUntil", "playerLoaded" }, { "timeoutMs", 60000 } });
 				restored = true;
 				// anchored: a save-load would restore time/weather, but a coc doesn't — re-apply
