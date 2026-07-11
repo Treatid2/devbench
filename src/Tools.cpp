@@ -1109,7 +1109,7 @@ namespace dvb
 		}
 
 		json ScenarioHandler(const json& a_args, const ToolContext& a_ctx,
-			const ToolRegistry& a_registry, const EventBus& a_events)
+			const ToolRegistry& a_registry, EventBus& a_events)
 		{
 			if (!a_args.contains("steps") || !a_args["steps"].is_array())
 				throw ToolError(400, "scenario requires a 'steps' array");
@@ -1145,6 +1145,24 @@ namespace dvb
 						r["repeat"] = rep;
 					const auto stepStart = steady_clock::now();
 					bool       stepFailed = false;
+
+					// Progress marker BEFORE the step runs: a poller reading
+					// GET /api/events can follow a blocking run, and when a
+					// step wedges the game the last event names the culprit
+					// (every synchronous surface 504s in that state).
+					{
+						json prog{ { "index", static_cast<int>(i) }, { "total", static_cast<int>(steps.size()) } };
+						if (repeat > 1)
+							prog["repeat"] = rep;
+						for (const char* kind : { "tool", "wait", "waitFor", "waitUntil", "assert" })
+							if (step.contains(kind)) {
+								prog["kind"] = kind;
+								break;
+							}
+						if (step.contains("tool"))
+							prog["tool"] = step.value("tool", std::string{});
+						a_events.Publish("scenario.step", std::move(prog));
+					}
 
 					try {
 						if (step.contains("wait")) {
@@ -1545,7 +1563,9 @@ namespace dvb
 			"PREFER waitFor over a fixed wait — e.g. wait for postLoadGame to know a load truly "
 			"finished. Optional top-level: repeat (≤1000), continueOnError. waitFor/waitUntil take "
 			"timeoutMs + pollMs. Blocks the request for the run's duration (seconds); keep "
-			"per-step timeouts sane.";
+			"per-step timeouts sane. Publishes a scenario.step event (index/total/kind/tool) "
+			"before each step — poll GET /api/events to follow a blocking run; if the game "
+			"wedges mid-run, the last scenario.step names the culprit step.";
 		scenario.inputSchema = json{
 			{ "type", "object" },
 			{ "required", json::array({ "steps" }) },
@@ -1572,9 +1592,12 @@ namespace dvb
 			"writes the trajectory to Data/SKSE/Plugins/devbench/recordings/recording_<stamp>.json "
 			"and returns its path + meta. 'status' reports recording/sampleCount/intervalMs. "
 			"'replay' runs a recording file ('path'): with restoreScene=true it re-establishes "
-			"the entryPoint (loads the save / coc's the cell) and waits for the player before the "
-			"trajectory, so the run reproduces the recorded scene; otherwise it teleports along "
-			"the path in the current scene. Emits record.started / record.stopped markers. The "
+			"the entryPoint and waits for the player before the trajectory, so the run reproduces "
+			"the recorded scene (interiors coc the cell; exterior entries use cow with the "
+			"recorded worldspace + anchor grid cell — exterior editor ids are not unique and a "
+			"raw exterior coc can wedge the engine); otherwise it teleports along "
+			"the path in the current scene. Emits record.started / record.stopped and "
+			"replay.started / replay.finished markers, plus scenario.step progress events. The "
 			"recipe's coupling tier (meta.coupling) is the producer's signal for how tightly the "
 			"start must be reproduced; a consumer can override it — 'coupling' forces a looser tier "
 			"('worldspace' skips the restore) and 'force' turns a scene mismatch from an abort into a "
@@ -1605,10 +1628,12 @@ namespace dvb
 							estMs += s["wait"].get<long>();
 					Recording::Notify(std::format("devbench: replaying {} steps (~{:.1f}s)", steps.size(), estMs / 1000.0));
 					logs::info("devbench: replay starting — {} steps, ~{}ms", steps.size(), estMs);
+					a_events.Publish("replay.started", json{ { "steps", steps.size() }, { "estMs", estMs }, { "path", a_args.value("path", std::string{}) } });
 					json result = ScenarioHandler(json{ { "steps", steps } }, a_ctx, a_registry, a_events);
 					result["coupling"] = plan.value("coupling", json::object());  // surface effective tier / override
 					logs::info("devbench: replay finished — {} steps, ok={}",
 						result.value("stepsRun", 0), result.value("ok", false));
+					a_events.Publish("replay.finished", json{ { "ok", result.value("ok", false) }, { "stepsRun", result.value("stepsRun", 0) } });
 					return result;
 				}
 				return Recording::Handle(a_args, a_events);
