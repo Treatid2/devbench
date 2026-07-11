@@ -1150,7 +1150,11 @@ namespace dvb
 					// GET /api/events can follow a blocking run, and when a
 					// step wedges the game the last event names the culprit
 					// (every synchronous surface 504s in that state).
-					{
+					// Trajectory replays run tens of thousands of setpos/wait
+					// steps; sample those so they don't flood the event ring,
+					// but always mark gate steps and the first of a pass.
+					const bool routineStep = step.contains("tool") || step.contains("wait");
+					if (!routineStep || i == 0 || (i % 100) == 0) {
 						json prog{ { "index", static_cast<int>(i) }, { "total", static_cast<int>(steps.size()) } };
 						if (repeat > 1)
 							prog["repeat"] = rep;
