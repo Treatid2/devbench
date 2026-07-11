@@ -1,5 +1,6 @@
 #include "MainThread.h"
 
+#include "GameState.h"     // dvb::game::CurrentFrame
 #include "ToolRegistry.h"  // dvb::ToolError
 
 #include <future>
@@ -29,8 +30,20 @@ namespace dvb::MainThread
 			}
 		});
 
-		if (future.wait_for(a_timeout) != std::future_status::ready)
-			throw ToolError(504, std::format("main-thread task did not run within {}ms", a_timeout.count()));
+		// The engine's frame counter discriminates the two 504 causes: still
+		// advancing = main thread busy (retry can succeed); frozen = main
+		// thread hung (nothing recovers it but a process restart).
+		const int frameAtStart = game::CurrentFrame();
+		if (future.wait_for(a_timeout) != std::future_status::ready) {
+			const int frameNow = game::CurrentFrame();
+			if (frameNow >= 0 && frameNow == frameAtStart)
+				throw ToolError(504, std::format(
+										 "main-thread task did not run within {}ms and the game frame counter has not advanced -- main thread appears hung (only a process restart recovers)",
+										 a_timeout.count()));
+			throw ToolError(504, std::format(
+									 "main-thread task did not run within {}ms ({} frames elapsed -- main thread busy, a retry may succeed)",
+									 a_timeout.count(), frameNow - frameAtStart));
+		}
 
 		return future.get();  // rethrows the handler's exception on the listener thread
 	}
