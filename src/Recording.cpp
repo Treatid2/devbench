@@ -568,12 +568,17 @@ namespace dvb::Recording
 				// the engine's streaming init (observed: permanent main-thread
 				// hang). Exterior entries restore via the recorded worldspace +
 				// anchor grid cell instead; interiors keep coc (unique ids).
-				std::string enter = "coc " + value;
-				if (!interior && meta.contains("anchor") && !meta.value("worldspace", std::string{}).empty()) {
+				std::string       enter = "coc " + value;
+				const std::string ws = meta.value("worldspace", std::string{});
+				// A display name with spaces would not parse as a console arg;
+				// such recordings keep the coc fallback.
+				if (!interior && meta.contains("anchor") && !ws.empty() && ws.find(' ') == std::string::npos) {
 					const json anchor = meta.value("anchor", json::object());
 					const int  gx = static_cast<int>(std::floor(anchor.value("x", 0.0) / 4096.0));
 					const int  gy = static_cast<int>(std::floor(anchor.value("y", 0.0) / 4096.0));
-					enter = std::format("cow {} {} {}", meta.value("worldspace", std::string{}), gx, gy);
+					enter = std::format("cow {} {} {}", ws, gx, gy);
+				} else if (!interior) {
+					logs::warn("devbench record(replay): exterior entry restored via coc ('{}' unusable for cow) -- editor-id ambiguity possible", ws);
 				}
 				steps.push_back(json{ { "tool", "console" }, { "args", json{ { "action", "exec" }, { "command", enter } } } });
 				steps.push_back(json{ { "waitUntil", "playerLoaded" }, { "timeoutMs", 60000 } });

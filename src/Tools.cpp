@@ -1122,6 +1122,14 @@ namespace dvb
 				throw ToolError(400, "repeat capped at 1000");
 			const bool continueOnError = a_args.value("continueOnError", false);
 
+			// Correlates this run's scenario.step / replay.* events: concurrent
+			// runs interleave on the bus, and the id keys them apart. A caller
+			// (the replay wrapper) may pass its own id; standalone runs mint one.
+			static std::atomic<uint64_t> s_runSeq{ 0 };
+			const uint64_t               runId = a_args.value("runId", static_cast<uint64_t>(0)) ?
+			                                         a_args.value("runId", static_cast<uint64_t>(0)) :
+			                                         ++s_runSeq;
+
 			json       results = json::array();
 			const auto t0 = steady_clock::now();
 			bool       anyFailure = false;
@@ -1155,7 +1163,7 @@ namespace dvb
 					// but always mark gate steps and the first of a pass.
 					const bool routineStep = step.contains("tool") || step.contains("wait");
 					if (!routineStep || i == 0 || (i % 100) == 0) {
-						json prog{ { "index", static_cast<int>(i) }, { "total", static_cast<int>(steps.size()) } };
+						json prog{ { "runId", runId }, { "index", static_cast<int>(i) }, { "total", static_cast<int>(steps.size()) } };
 						if (repeat > 1)
 							prog["repeat"] = rep;
 						for (const char* kind : { "tool", "wait", "waitFor", "waitUntil", "assert" })
@@ -1630,14 +1638,24 @@ namespace dvb
 					for (const auto& s : steps)
 						if (s.contains("wait"))
 							estMs += s["wait"].get<long>();
+					static std::atomic<uint64_t> s_replaySeq{ 0 };
+					const uint64_t               runId = ++s_replaySeq;
 					Recording::Notify(std::format("devbench: replaying {} steps (~{:.1f}s)", steps.size(), estMs / 1000.0));
 					logs::info("devbench: replay starting — {} steps, ~{}ms", steps.size(), estMs);
-					a_events.Publish("replay.started", json{ { "steps", steps.size() }, { "estMs", estMs }, { "path", a_args.value("path", std::string{}) } });
-					json result = ScenarioHandler(json{ { "steps", steps } }, a_ctx, a_registry, a_events);
+					a_events.Publish("replay.started", json{ { "runId", runId }, { "steps", steps.size() }, { "estMs", estMs }, { "path", a_args.value("path", std::string{}) } });
+					// replay.finished must publish on EVERY exit -- a poller
+					// waiting on it would otherwise hang when a step throws.
+					json result;
+					try {
+						result = ScenarioHandler(json{ { "steps", steps }, { "runId", runId } }, a_ctx, a_registry, a_events);
+					} catch (const std::exception& e) {
+						a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", false }, { "error", e.what() } });
+						throw;
+					}
 					result["coupling"] = plan.value("coupling", json::object());  // surface effective tier / override
 					logs::info("devbench: replay finished — {} steps, ok={}",
 						result.value("stepsRun", 0), result.value("ok", false));
-					a_events.Publish("replay.finished", json{ { "ok", result.value("ok", false) }, { "stepsRun", result.value("stepsRun", 0) } });
+					a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", result.value("ok", false) }, { "stepsRun", result.value("stepsRun", 0) } });
 					return result;
 				}
 				return Recording::Handle(a_args, a_events);
