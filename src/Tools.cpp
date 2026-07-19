@@ -1246,8 +1246,8 @@ namespace dvb
 								prog["kind"] = kind;
 								break;
 							}
-						if (step.contains("tool"))
-							prog["tool"] = step.value("tool", std::string{});
+						if (step.contains("tool") && step["tool"].is_string())
+							prog["tool"] = step["tool"].get<std::string>();
 						a_events.Publish("scenario.step", std::move(prog));
 					}
 
