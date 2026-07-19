@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <thread>
 
@@ -1108,6 +1109,80 @@ namespace dvb
 			throw ToolError(400, std::format("unknown waitUntil condition '{}' (playerLoaded|noModal|noMenu)", a_cond));
 		}
 
+		// Tracks in-flight/completed async replay runs (record{action:"replay"}, async by default)
+		// so a caller can poll record{action:"status", runId:…} instead of blocking the HTTP
+		// request for the run's duration — mirrors game{action:"load"}'s queued/poll convention.
+		// Entries are pruned once the retention cap is hit so a caller that never polls a
+		// finished run doesn't leak state across a long-lived session.
+		class ReplayRunRegistry
+		{
+		public:
+			static ReplayRunRegistry& Get()
+			{
+				static ReplayRunRegistry inst;
+				return inst;
+			}
+
+			void Start(uint64_t a_runId)
+			{
+				std::lock_guard lock(m_mtx);
+				m_runs.emplace(a_runId, State{});
+				Prune();
+			}
+
+			void Finish(uint64_t a_runId, json a_result)
+			{
+				std::lock_guard lock(m_mtx);
+				State&          st = m_runs[a_runId];
+				st.done = true;
+				st.ok = true;
+				st.result = std::move(a_result);
+			}
+
+			void Fail(uint64_t a_runId, std::string a_error)
+			{
+				std::lock_guard lock(m_mtx);
+				State&          st = m_runs[a_runId];
+				st.done = true;
+				st.ok = false;
+				st.error = std::move(a_error);
+			}
+
+			std::optional<json> Status(uint64_t a_runId)
+			{
+				std::lock_guard lock(m_mtx);
+				const auto      it = m_runs.find(a_runId);
+				if (it == m_runs.end())
+					return std::nullopt;
+				const State& st = it->second;
+				if (!st.done)
+					return json{ { "runId", a_runId }, { "done", false } };
+				if (st.ok)
+					return json{ { "runId", a_runId }, { "done", true }, { "ok", true }, { "result", st.result } };
+				return json{ { "runId", a_runId }, { "done", true }, { "ok", false }, { "error", st.error } };
+			}
+
+		private:
+			struct State
+			{
+				bool        done = false;
+				bool        ok = false;
+				json        result;
+				std::string error;
+			};
+
+			// runId is a monotonic counter, so the smallest key is the oldest run.
+			void Prune()
+			{
+				constexpr size_t kRetention = 64;
+				while (m_runs.size() > kRetention)
+					m_runs.erase(m_runs.begin());
+			}
+
+			std::mutex                m_mtx;
+			std::map<uint64_t, State> m_runs;
+		};
+
 		json ScenarioHandler(const json& a_args, const ToolContext& a_ctx,
 			const ToolRegistry& a_registry, EventBus& a_events)
 		{
@@ -1613,8 +1688,12 @@ namespace dvb
 			"recipe's coupling tier (meta.coupling) is the producer's signal for how tightly the "
 			"start must be reproduced; a consumer can override it — 'coupling' forces a looser tier "
 			"('worldspace' skips the restore) and 'force' turns a scene mismatch from an abort into a "
-			"reported warning, to run a recipe generally accepting it may not reproduce. replay "
-			"returns the effective { coupling: { tier, producer, overridden, forced } }.";
+			"reported warning, to run a recipe generally accepting it may not reproduce. replay is "
+			"ASYNC BY DEFAULT — mirroring game{action:'load'} — and returns {queued:true, runId, steps, "
+			"estMs} immediately; poll completion via record{action:'status', runId} (returns {done, ok, "
+			"result} once finished, {done:false} while running) or watch replay.started / "
+			"replay.finished on GET /api/events (both carry runId). Pass async:false to block the "
+			"request for the run's duration and get the result object directly instead.";
 		record.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
@@ -1624,14 +1703,17 @@ namespace dvb
 								{ "restoreScene", json{ { "type", "boolean" }, { "description", "replay: re-establish the recorded entryPoint + wait for load before the trajectory (default false)" } } },
 								{ "coupling", json{ { "type", "string" }, { "enum", json::array({ "anchored", "cell", "worldspace" }) }, { "description", "replay: override the recipe's coupling tier — run looser than the producer signaled (worldspace skips the scene restore)" } } },
 								{ "force", json{ { "type", "boolean" }, { "description", "replay: proceed even if the scene doesn't match the recording — report the mismatch as a warning instead of aborting (default false)" } } },
+								{ "async", json{ { "type", "boolean" }, { "description", "replay: return {queued:true, runId} immediately and run in the background (default true); false blocks and returns the result directly" } } },
+								{ "runId", json{ { "type", "integer" }, { "description", "status: poll an async replay run started earlier (from replay's 'runId')" } } },
 							} },
 		};
 		a_registry.Register(std::move(record),
 			[&a_registry, &a_events](const json& a_args, const ToolContext& a_ctx) {
+				const std::string action = a_args.value("action", std::string{});
 				// replay assembles a step list (optionally prefixed with scene restore) and runs
 				// it through the scenario engine, which needs the registry — hence handled here
 				// rather than in Recording::Handle.
-				if (a_args.value("action", std::string{}) == "replay") {
+				if (action == "replay") {
 					const json plan = Recording::BuildReplaySteps(a_args);
 					const json steps = plan.value("steps", json::array());
 					long       estMs = 0;  // sum of wait steps ≈ replay duration
@@ -1643,20 +1725,45 @@ namespace dvb
 					Recording::Notify(std::format("devbench: replaying {} steps (~{:.1f}s)", steps.size(), estMs / 1000.0));
 					logs::info("devbench: replay starting — {} steps, ~{}ms", steps.size(), estMs);
 					a_events.Publish("replay.started", json{ { "runId", runId }, { "steps", steps.size() }, { "estMs", estMs }, { "path", a_args.value("path", std::string{}) } });
-					// replay.finished must publish on EVERY exit -- a poller
-					// waiting on it would otherwise hang when a step throws.
-					json result;
-					try {
-						result = ScenarioHandler(json{ { "steps", steps }, { "runId", runId } }, a_ctx, a_registry, a_events);
-					} catch (const std::exception& e) {
-						a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", false }, { "error", e.what() } });
-						throw;
-					}
-					result["coupling"] = plan.value("coupling", json::object());  // surface effective tier / override
-					logs::info("devbench: replay finished — {} steps, ok={}",
-						result.value("stepsRun", 0), result.value("ok", false));
-					a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", result.value("ok", false) }, { "stepsRun", result.value("stepsRun", 0) } });
-					return result;
+
+					// Captured by value: a_ctx is request-scoped and this may run on a detached
+					// thread past this handler's return; steps/coupling are already independent
+					// copies. replay.finished must publish on EVERY exit -- a poller waiting on
+					// it would otherwise hang when a step throws.
+					const json coupling = plan.value("coupling", json::object());
+					auto       runReplay = [&a_registry, &a_events, a_ctx, steps, runId, coupling]() -> json {
+						json result;
+						try {
+							result = ScenarioHandler(json{ { "steps", steps }, { "runId", runId } }, a_ctx, a_registry, a_events);
+						} catch (const std::exception& e) {
+							a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", false }, { "error", e.what() } });
+							throw;
+						}
+						result["coupling"] = coupling;  // surface effective tier / override
+						logs::info("devbench: replay finished — {} steps, ok={}",
+							result.value("stepsRun", 0), result.value("ok", false));
+						a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", result.value("ok", false) }, { "stepsRun", result.value("stepsRun", 0) } });
+						return result;
+					};
+
+					if (!a_args.value("async", true))
+						return runReplay();
+
+					ReplayRunRegistry::Get().Start(runId);
+					std::thread([runReplay, runId]() {
+						try {
+							ReplayRunRegistry::Get().Finish(runId, runReplay());
+						} catch (const std::exception& e) {
+							ReplayRunRegistry::Get().Fail(runId, e.what());
+						}
+					}).detach();
+					return json{ { "queued", true }, { "runId", runId }, { "steps", steps.size() }, { "estMs", estMs } };
+				}
+				if (action == "status" && a_args.contains("runId")) {
+					const uint64_t runId = a_args["runId"].get<uint64_t>();
+					if (auto st = ReplayRunRegistry::Get().Status(runId))
+						return *st;
+					throw ToolError(404, std::format("unknown replay runId {}", runId));
 				}
 				return Recording::Handle(a_args, a_events);
 			});
