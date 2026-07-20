@@ -10,11 +10,14 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 
 namespace
 {
+	std::atomic<int> g_boundPort{ 0 };
+
 	// True if 127.0.0.1:port can be bound (i.e. it's free). WSAStartup is ref-counted,
 	// so pairing it with WSACleanup here is safe whether or not winsock is already up.
 	bool PortAvailable(const std::string& a_host, int a_port)
@@ -105,6 +108,7 @@ namespace dvb
 
 		const bool ok = m_mcp->start(false);  // non-blocking; spawns the listener thread
 		if (ok) {
+			g_boundPort.store(chosen);
 			WriteRuntimeInfo(chosen);
 			if (chosen != m_port)
 				logs::info("devbench: configured port {} busy → bound {}", m_port, chosen);
@@ -121,10 +125,16 @@ namespace dvb
 		}
 		m_restAdapter.reset();
 		m_mcpAdapter.reset();
+		g_boundPort.store(0);
 	}
 
 	bool Server::Running() const
 	{
 		return m_mcp && m_mcp->is_running();
+	}
+
+	int BoundPort()
+	{
+		return g_boundPort.load();
 	}
 }

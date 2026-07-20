@@ -8,6 +8,7 @@
 #include "MainThread.h"
 #include "Papyrus.h"
 #include "Recording.h"
+#include "Server.h"
 #include "ToolExtensions.h"
 #include "ToolRegistry.h"
 #include "Version.h"
@@ -22,6 +23,18 @@ namespace dvb
 {
 	namespace
 	{
+		// Basename of the running exe (SkyrimSE.exe / SkyrimVR.exe), for inspect{kind:"state"} —
+		// with multiple game instances each on their own port, this plus pid/port lets a caller
+		// confirm which one it's actually talking to instead of a silent misattach (devbench#16).
+		std::string ExecutableName()
+		{
+			char        path[MAX_PATH]{};
+			const DWORD len = ::GetModuleFileNameA(nullptr, path, MAX_PATH);
+			if (len == 0 || len == MAX_PATH)
+				return {};
+			return std::filesystem::path(path).filename().string();
+		}
+
 		bool Truthy(const json& a_v)
 		{
 			if (a_v.is_boolean())
@@ -456,7 +469,7 @@ namespace dvb
 			const std::string kind = a_args.value("kind", std::string("state"));
 
 			if (kind == "state") {
-				return MainThread::RunAndWait([]() -> json {
+				json out = MainThread::RunAndWait([]() -> json {
 					auto*      pc = RE::PlayerCharacter::GetSingleton();
 					const bool loaded = pc && pc->Get3D() != nullptr;
 					return json{
@@ -467,6 +480,13 @@ namespace dvb
 						{ "frame", game::CurrentFrame() },
 					};
 				});
+				// pid/port/exe identify which instance answered — with multiple games
+				// running on adjacent auto-iterated ports, a caller can confirm it's
+				// talking to the intended one instead of silently misattaching.
+				out["pid"] = ::GetCurrentProcessId();
+				out["port"] = BoundPort();
+				out["exe"] = ExecutableName();
+				return out;
 			}
 
 			// vm: Papyrus VM health — how loaded the script engine is (spot script lag).
@@ -1356,7 +1376,10 @@ namespace dvb
 			inspect.description =
 				"Read live game/plugin state. Runs on the main thread and returns the value "
 				"synchronously (times out if the game is mid-load / not pumping tasks). kinds: "
-				"'state' → { plugin, version, vr, playerLoaded, frame }; 'vm' → Papyrus VM health "
+				"'state' → { plugin, version, vr, playerLoaded, frame, pid, port, exe } — pid/port/exe "
+				"identify the answering instance, so a multi-instance session (e.g. SE + VR both "
+				"running, on adjacent auto-iterated ports) can confirm it's talking to the intended "
+				"one; 'vm' → Papyrus VM health "
 				"{ loadedTypes, attachedScripts, arrays, runningStacks, frozenStacks, overstressed }; "
 				"'scene' → player context { cell, worldspace, location, position, gameHour, daysPassed, "
 				"weather }; 'mods' → active load order { count, lightCount, total, plugins:[{index, name}], "

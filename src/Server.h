@@ -45,4 +45,11 @@ namespace dvb
 		std::unique_ptr<McpAdapter>  m_mcpAdapter;
 		std::unique_ptr<RestAdapter> m_restAdapter;
 	};
+
+	/// The port actually bound by the (single, process-wide) Server instance — may differ
+	/// from the configured port if it was busy, since Start() auto-iterates. 0 before a
+	/// Server has started. Exposed so inspect{kind:"state"} can report it: with multiple
+	/// game instances each on their own port, a caller can tell which one it's actually
+	/// talking to instead of silently misattaching (devbench#16).
+	int BoundPort();
 }
