@@ -2,6 +2,8 @@
 
 #include <RE/Skyrim.h>
 
+#include <atomic>
+
 namespace dvb::game
 {
 	int CurrentFrame()
@@ -15,6 +17,9 @@ namespace dvb::game
 				return nullptr;
 			}
 		}();
-		return counter ? *counter : -1;
+		// The engine main loop writes this global while we read it off the listener thread;
+		// atomic_ref makes that read well-defined (a raw *counter is a formal data race the
+		// compiler may cache/hoist).
+		return counter ? std::atomic_ref<int32_t>(*counter).load(std::memory_order_relaxed) : -1;
 	}
 }

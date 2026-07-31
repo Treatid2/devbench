@@ -4,6 +4,7 @@
 #include "RestAdapter.h"
 #include "Version.h"
 
+#include <RE/Skyrim.h>  // REL::Module::IsVR
 #include <httplib.h>
 #include <mcp_server.h>
 
@@ -111,12 +112,23 @@ namespace dvb
 		} else
 			logs::warn("devbench: cpp-mcp http() returned null; REST facade unavailable");
 
+		// Publish the chosen port before start() spawns the listener, so a health/inspect
+		// hit racing startup reads the right port rather than 0.
+		g_boundPort.store(chosen);
 		const bool ok = m_mcp->start(false);  // non-blocking; spawns the listener thread
 		if (ok) {
-			g_boundPort.store(chosen);
 			WriteRuntimeInfo(chosen);
 			if (chosen != m_port)
 				logs::info("devbench: configured port {} busy → bound {}", m_port, chosen);
+		} else {
+			// Tear down the constructed-but-not-listening members: the `if (m_mcp)` guard at
+			// the top treats a non-null m_mcp as "already started", so leaving them set would
+			// make a later Start() return true without a live listener. Reset the port too, or
+			// it would advertise a live bridge for a server that never came up.
+			g_boundPort.store(0);
+			m_restAdapter.reset();
+			m_mcpAdapter.reset();
+			m_mcp.reset();
 		}
 		logs::info("devbench: server on {}:{} — {}", m_host, chosen, ok ? "listening (mcp + rest)" : "FAILED to start");
 		return ok;
@@ -141,5 +153,25 @@ namespace dvb
 	int BoundPort()
 	{
 		return g_boundPort.load();
+	}
+
+	std::string ExecutableName()
+	{
+		char        path[MAX_PATH]{};
+		const DWORD len = ::GetModuleFileNameA(nullptr, path, MAX_PATH);
+		if (len == 0 || len == MAX_PATH)
+			return {};
+		return std::filesystem::path(path).filename().string();
+	}
+
+	json InstanceIdentity()
+	{
+		// pid/exe/vr are constant for the process lifetime — compute once. /api/health is
+		// polled frequently, so avoid a GetModuleFileNameA + path + string alloc per call;
+		// only the bound port (an atomic) is read live.
+		static const int         pid = static_cast<int>(::GetCurrentProcessId());
+		static const std::string exe = ExecutableName();
+		static const bool        vr = REL::Module::IsVR();
+		return json{ { "pid", pid }, { "port", BoundPort() }, { "exe", exe }, { "vr", vr } };
 	}
 }
