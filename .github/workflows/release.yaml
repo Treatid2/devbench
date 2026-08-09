@@ -1,10 +1,18 @@
-# Release pipeline. Every push to main runs semantic-release: it reads the
-# Conventional Commit history (squash-merge makes each PR title the commit subject),
+# Release pipeline. Every push to main, after a short debounce, runs semantic-release: it
+# reads the Conventional Commit history (squash-merge makes each PR title the commit subject),
 # picks the next version, bumps `local version` in xmake.lua, commits it back to main
 # (with [skip ci] so it doesn't re-trigger), creates the vX.Y.Z tag, and publishes a
 # GitHub Release whose body is the curated changelog. Downstream jobs then build the
 # plugin, attach the .7z mod archive to that release, and — on the source repo —
 # upload to Nexus with the same changelog.
+#
+# Debounce: a leading `debounce` job waits out a short quiet window; each new push cancels the
+# still-sleeping wait and restarts it, so a burst of merges collapses into ONE release instead of
+# one per push. workflow_dispatch skips the wait; the [skip ci] bump commit triggers neither.
+# Concurrency is per-job (a top-level group can't hold both semantics): `debounce` is
+# cancel-in-progress (only ever a sleeping wait); `semantic-release` and `nexus` are
+# cancel-in-progress:false so a live publish/upload is never aborted, and the `nexus` group also
+# serializes uploads across runs (the reusable uploader reads-then-writes the mod file list).
 #
 # Single workflow on purpose (mirrors CrashLoggerSSE): because build/package/nexus
 # run in the same run as semantic-release, they read its outputs directly and nothing
@@ -21,21 +29,42 @@ on:
     branches: [main]
   workflow_dispatch:
 
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
-
 # Default to read-only; the two jobs that push commits/tags or publish assets
 # opt into contents: write individually.
 permissions:
   contents: read
 
 jobs:
+  debounce:
+    name: Debounce merges
+    runs-on: ubuntu-latest
+    # Source repo only. Skip semantic-release's own [skip ci] bump commit — but ONLY for push
+    # events, so a manual dispatch right after a "chore(release): X.Y.Z [skip ci]" bump is never
+    # blocked (GitHub also skips [skip ci] pushes natively; belt-and-braces).
+    if: >-
+      github.repository_owner == 'alandtse' &&
+      (github.event_name != 'push' ||
+       !contains(github.event.head_commit.message, '[skip ci]'))
+    concurrency:
+      group: semantic-release-debounce
+      cancel-in-progress: true
+    steps:
+      - name: Wait for the merge burst to settle
+        # Only debounce real pushes; workflow_dispatch releases immediately.
+        if: github.event_name == 'push'
+        run: sleep 300 # 5 min; a newer merge cancels + restarts this wait
+
   semantic-release:
     name: Semantic Release
+    needs: debounce
     runs-on: ubuntu-latest
     # Source repo only: forks have no release/Nexus credentials.
     if: github.repository_owner == 'alandtse'
+    # Own group, cancel-in-progress: false — a live bump commit + tag + Release is never aborted
+    # by a newer push; concurrent runs queue behind it.
+    concurrency:
+      group: semantic-release-publish
+      cancel-in-progress: false
     permissions:
       contents: write # push the bump commit + tag, create the GitHub Release
     outputs:
@@ -142,6 +171,14 @@ jobs:
     name: Nexus upload
     needs: [semantic-release, build, package]
     if: needs.semantic-release.outputs.new_release_published == 'true'
+    # Serialize Nexus uploads across runs: the reusable uploader reads the mod's file list
+    # (check_existing + previous_file:auto) then writes, which isn't concurrency-safe against one
+    # mod page. cancel-in-progress:false so an in-flight upload finishes and a second run queues.
+    # (Queue depth is 1: a third release piling on while one uploads and one waits evicts the
+    # waiter — its GitHub release/tag survive and re-upload via nexus-upload.yaml. Accepted.)
+    concurrency:
+      group: nexus-upload-${{ github.repository }}
+      cancel-in-progress: false
     uses: ./.github/workflows/nexus-upload.yaml
     with:
       tag: ${{ needs.semantic-release.outputs.new_release_git_tag }}
