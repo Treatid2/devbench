@@ -98,6 +98,14 @@
             },
             version = "v1.16.0"
         },
+        ["stb#31fecfc4"] = {
+            repo = {
+                branch = "master",
+                commit = "b0b316eb13e79e5ea7e7a56b80117a3526dedeeb",
+                url = "https://gitlab.com/tboox/xmake-repo.git"
+            },
+            version = "2025.03.14"
+        },
         ["xbyak v7.06#31fecfc4"] = {
             repo = {
                 branch = "master",

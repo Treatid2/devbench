@@ -1,9 +1,11 @@
 #include "Tools.h"
 
+#include "Capture.h"
 #include "ConsoleLogCapture.h"
 #include "EventBus.h"
 #include "GameEvents.h"
 #include "GameState.h"
+#include "HostApi.h"
 #include "Json.h"
 #include "MainThread.h"
 #include "Papyrus.h"
@@ -1097,6 +1099,46 @@ namespace dvb
 				});
 			}
 
+			// 'registrants': who has requested the C-ABI interface, and what they registered
+			// through it — the human/agent-facing view of the ledger HostApi keeps. `capabilities`
+			// is the same ToolExtensions::Keys() data the capture-provider gate reads, surfaced
+			// here so a person can see why a gate failed without reading source. Consumers and
+			// registrations are NOT joined by plugin name — the C-ABI interface has no per-call
+			// caller identity (see ROADMAP.md's "Event source tagging" item), so guessing which
+			// consumer owns which registration would be a confident lie; both lists are returned
+			// side by side instead.
+			if (kind == "registrants") {
+				json consumers = json::array();
+				for (const auto& c : HostApi::Consumers())
+					consumers.push_back(json{ { "name", c.name }, { "atEpoch", c.atEpoch }, { "atFrame", c.atFrame } });
+
+				json registrations = json::array();
+				for (const auto& r : HostApi::Registrations())
+					registrations.push_back(json{
+						{ "kind", r.kind }, { "name", r.name },
+						{ "atEpoch", r.atEpoch }, { "atFrame", r.atFrame }, { "replaced", r.replaced } });
+
+				json capabilities = json::object();
+				for (const char* base : { "capture", "inspect", "menu" }) {
+					json keys = json::array();
+					for (const auto& k : ToolExtensions::Keys(base))
+						keys.push_back(k);
+					capabilities[base] = std::move(keys);
+				}
+
+				return json{
+					{ "consumers", std::move(consumers) },
+					{ "registrations", std::move(registrations) },
+					{ "capabilities", std::move(capabilities) },
+				};
+			}
+
+			// 'screenshots': list image files sitting in the vanilla screenshot directories,
+			// independent of the `capture` tool — lets a human/agent confirm where THIS install
+			// actually writes before relying on the capture tool's native fallback.
+			if (kind == "screenshots")
+				return Capture::ListScreenshots(a_args);
+
 			// 'extensions' lists consumer-registered inspect kinds (C-ABI RegisterToolExtension).
 			if (kind == "extensions") {
 				json out = json::array();
@@ -1113,7 +1155,7 @@ namespace dvb
 			if (auto entry = ToolExtensions::Find("inspect", kind))
 				return entry->handler(a_args, a_ctx);
 
-			throw ToolError(400, std::format("unknown kind '{}' (state|vm|scene|mods|player|inventory|quests|effects|refs|extensions, or a registered kind — see inspect kind=extensions)", kind));
+			throw ToolError(400, std::format("unknown kind '{}' (state|vm|scene|mods|player|inventory|quests|effects|refs|registrants|screenshots|extensions, or a registered kind — see inspect kind=extensions)", kind));
 		}
 
 		// camera: read or set the player camera point of view, so a recording can capture the
@@ -1298,6 +1340,42 @@ namespace dvb
 			std::string out;
 			for (size_t i = 0; i < a_names.size(); ++i)
 				out += (i ? ", " : "") + a_names[i];
+			return out;
+		}
+
+		// Summarizes a scenario transcript's `capture` steps into a flat, per-checkpoint rollup
+		// — {id, ok, path, inconclusive, inconclusiveReason?, ssim?, threshold?, passed?} — so a
+		// caller doesn't have to filter the full step transcript (which can run into the hundreds
+		// for a multi-checkpoint recording; a live test with 3 checkpoints produced 467 steps) to
+		// answer "did my checkpoints pass." Every field devbench already computed per capture; this
+		// just collects them where a caller — an LLM in particular — can find them in one place
+		// without re-deriving anything.
+		json SummarizeCheckpoints(const json& a_scenarioResult)
+		{
+			json out = json::array();
+			for (const auto& r : a_scenarioResult.value("results", json::array())) {
+				if (r.value("kind", std::string{}) != "tool" || r.value("tool", std::string{}) != "capture")
+					continue;
+				if (!r.value("ok", false) || !r.contains("result"))
+					continue;
+				const json& cap = r["result"];
+				if (!cap.contains("checkpointId"))
+					continue;
+				json entry{
+					{ "id", cap.value("checkpointId", std::string{}) },
+					{ "ok", cap.value("ok", false) },
+					{ "path", cap.value("path", std::string{}) },
+					{ "inconclusive", cap.value("inconclusive", false) },
+				};
+				if (cap.contains("inconclusiveReason"))
+					entry["inconclusiveReason"] = cap["inconclusiveReason"];
+				if (cap.contains("ssim")) {
+					entry["ssim"] = cap["ssim"];
+					entry["threshold"] = cap["threshold"];
+					entry["passed"] = cap["passed"];
+				}
+				out.push_back(std::move(entry));
+			}
 			return out;
 		}
 
@@ -1532,6 +1610,9 @@ namespace dvb
 			} replayGuard;
 
 			for (int rep = 0; rep < repeat && !aborted; ++rep) {
+				// Per-repetition, not per-run: a scene mismatch on rep N must not poison rep N+1's
+				// captures if rep N+1's own scene assert succeeds.
+				bool runSceneMismatch = false;
 				for (size_t i = 0; i < steps.size() && !aborted; ++i) {
 					const json& step = steps[i];
 					json        r{ { "index", i } };
@@ -1668,11 +1749,22 @@ namespace dvb
 							}
 						} else if (step.contains("tool")) {
 							const std::string tool = step["tool"].get<std::string>();
-							const json        args = step.value("args", json::object());
+							json              args = step.value("args", json::object());  // non-const: run-scoped injection below
 							r["kind"] = "tool";
 							r["tool"] = tool;
 							if (step.contains("label"))
 								r["label"] = step["label"];
+							if (tool == "capture") {
+								// Context the static step list can't carry — a checkpoint's capture step
+								// doesn't know its own runId or whether an earlier scene assert this
+								// repetition failed. Reaches the transcript via the tool's RESULT (which
+								// Capture::Handle echoes these back into), not via these mutated args.
+								args["runId"] = runId;
+								if (repeat > 1)
+									args["repeat"] = rep;
+								if (runSceneMismatch)
+									args["sceneMismatch"] = true;
+							}
 							ToolContext stepCtx = a_ctx;
 							stepCtx.internal = true;  // scenario-driven — don't log each step (replay logs a summary)
 							const ToolResult tr = a_registry.Invoke(tool, args, stepCtx);
@@ -1737,6 +1829,9 @@ namespace dvb
 
 								if (!ready) {
 									// soft: don't fail the run, just note we couldn't confirm the scene.
+									// An unconfirmed scene is as unusable a golden reference as a mismatched
+									// one — a capture step after this must know not to trust it either.
+									runSceneMismatch = true;
 									r["ok"] = soft;
 									r["sceneConfirmed"] = false;
 									(soft ? r["warning"] : r["error"]) = "scene assert: player never finished loading";
@@ -1751,6 +1846,7 @@ namespace dvb
 										interior ? "cell" : "worldspace", wantEid, interior ? cellWant : wsWant, cur,
 										soft ? " — forced, proceeding" : " — aborting replay");
 									r["sceneMismatch"] = true;
+									runSceneMismatch = true;
 									r["worldspaceFormID"] = check.value("worldspaceFormID", 0u);
 									r["cellFormID"] = check.value("cellFormID", 0u);
 									// soft: a forced consumer accepted that the scene may not match — warn, don't abort.
@@ -1862,18 +1958,28 @@ namespace dvb
 				"'refs' → identify reference(s) sharing one shape { formId, formType, name, "
 				"editorId, base, position } — pass 'formId' for one form, 'selected'=true for the "
 				"console/crosshair ref (set via prid), or neither to enumerate loaded refs in the grid "
-				"(optional 'formType' filter, 'radius' from player, 'limit' default 100). A consumer mod "
+				"(optional 'formType' filter, 'radius' from player, 'limit' default 100). "
+				"'registrants' → who has requested the C-ABI interface and what they registered "
+				"through it { consumers:[{name,atEpoch,atFrame}], registrations:[{kind,name,atEpoch,"
+				"atFrame,replaced}], capabilities:{capture,inspect,menu → [registered keys]} } — "
+				"consumers and registrations are reported side by side, not joined, since the C-ABI "
+				"has no per-call caller identity. "
+				"'screenshots' → image files in the vanilla screenshot directories (game root + "
+				"'Screenshots/') { dirs, count, returned, truncated, screenshots:[{file,path,bytes,"
+				"mtimeEpoch}] } newest-first (optional 'dir' override, 'limit' default 50) — see also "
+				"the `capture` tool, which has its own native fallback using the same directories. "
+				"A consumer mod "
 				"can add a custom kind via the C-ABI RegisterToolExtension (e.g. load-timing data); "
 				"'extensions' lists those registered kinds + descriptors, and kind=<registered> dispatches.";
 			inspect.description += RegisteredExtensionSummary("inspect", "kinds");
 			inspect.readOnly = true;
-			json kinds = json::array({ "state", "health", "vm", "scene", "mods", "player", "inventory", "quests", "effects", "refs", "extensions" });
+			json kinds = json::array({ "state", "health", "vm", "scene", "mods", "player", "inventory", "quests", "effects", "refs", "registrants", "screenshots", "extensions" });
 			for (const auto& k : ToolExtensions::Keys("inspect"))
 				kinds.push_back(k);
 			inspect.inputSchema = json{
 				{ "type", "object" },
 				{ "properties", json{
-									{ "kind", json{ { "type", "string" }, { "enum", kinds }, { "description", "state | health | vm | scene | mods | player | inventory | quests | effects | refs | extensions (health answers off-thread for liveness+identity; or a registered mod kind — listed here + via kind=extensions)" } } },
+									{ "kind", json{ { "type", "string" }, { "enum", kinds }, { "description", "state | health | vm | scene | mods | player | inventory | quests | effects | refs | registrants | screenshots | extensions (health answers off-thread for liveness+identity; or a registered mod kind — listed here + via kind=extensions)" } } },
 									{ "formId", json{ { "type", "string" }, { "description", "refs: identify this form; inventory: the container ref to read (default player); effects: the actor to read (default player) (hex formId, e.g. 0x14, or EditorID)" } } },
 									{ "selected", json{ { "type", "boolean" }, { "description", "refs: identify the console-selected / crosshair ref instead" } } },
 									{ "formType", json{ { "type", "string" }, { "description", "refs/inventory: keep only entries whose type matches (e.g. Actor, Weapon, Potion)" } } },
@@ -1998,14 +2104,16 @@ namespace dvb
 		};
 		a_registry.Register(std::move(camera), &CameraHandler);
 
-		// inspect/menu are rebuilt (not frozen) so registered mod kinds/menus show in tools/list.
+		// inspect/menu/capture are rebuilt (not frozen) so registered mod kinds/menus/providers
+		// show in tools/list.
 		a_registry.Register(BuildInspectDescriptor(), &InspectHandler);
 		a_registry.Register(BuildMenuDescriptor(), &MenuHandler);
+		a_registry.Register(Capture::BuildCaptureDescriptor(), &Capture::Handle);
 
-		// When a mod registers a kind/menu, rebuild that base tool's descriptor so the new key is
-		// discoverable on the first call (the registry's registration path re-registers it with the
-		// adapters and fires tools/list_changed). Captures the registry by pointer — it outlives this
-		// function (owned by the Server).
+		// When a mod registers a kind/menu/provider, rebuild that base tool's descriptor so the new
+		// key is discoverable on the first call (the registry's registration path re-registers it
+		// with the adapters and fires tools/list_changed). Captures the registry by pointer — it
+		// outlives this function (owned by the Server).
 		ToolExtensions::SetChangeListener([reg = &a_registry](const std::string& a_baseTool) {
 			std::string base = a_baseTool;
 			std::transform(base.begin(), base.end(), base.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -2013,6 +2121,8 @@ namespace dvb
 				reg->Register(BuildInspectDescriptor(), &InspectHandler);
 			else if (base == "menu")
 				reg->Register(BuildMenuDescriptor(), &MenuHandler);
+			else if (base == "capture")
+				reg->Register(Capture::BuildCaptureDescriptor(), &Capture::Handle);
 		});
 
 		ToolDescriptor papyrus;
@@ -2140,9 +2250,15 @@ namespace dvb
 			"intervalMs (default from config recordIntervalMs, min 10) on a background thread "
 			"and captures a one-time scene manifest "
 			"(worldspace/cell, time of day, weather, anchor pose, and the entryPoint — the save "
-			"loaded or coc'd to reach the scene, or 'unknown'); a game must be loaded. 'stop' "
+			"loaded or coc'd to reach the scene, or 'unknown'); a game must be loaded. "
+			"'checkpoint' marks THIS moment (while recording is active) as a screenshot checkpoint "
+			"— requires 'id' (unique this recording); optional excludeUi (default true). Mirrors "
+			"'stop' capturing the trajectory: no manual JSON editing needed. Carries no golden/"
+			"threshold — those are supplied later, per-checkpoint, on replay's 'goldens' arg, since "
+			"a golden reference doesn't exist yet at mark-time. 'stop' "
 			"writes the trajectory to Data/SKSE/Plugins/devbench/recordings/recording_<stamp>.json "
-			"and returns its path + meta. 'status' reports recording/sampleCount/intervalMs. "
+			"and returns its path + meta (meta.checkpoints holds any marked via 'checkpoint'). "
+			"'status' reports recording/sampleCount/intervalMs/checkpointCount. "
 			"'replay' runs a recording file ('path'): with restoreScene=true it re-establishes "
 			"the entryPoint and waits for the player before the trajectory, so the run reproduces "
 			"the recorded scene (interiors coc the cell; exterior entries use cow with the "
@@ -2160,14 +2276,30 @@ namespace dvb
 			"replay.finished on GET /api/events (both carry runId; the runId space is shared with "
 			"scenario, so a replay's runId also resolves via scenario{action:'status'}). Pass "
 			"async:false to block the request for the run's duration and get the result object "
-			"directly instead.";
+			"directly. If the recording has meta.checkpoints, each expands into a `capture` step "
+			"at the point in the trajectory its atMs was recorded, tagged with 'variant' for "
+			"correlation (default 'default') — see the `capture` tool. Pass "
+			"captureCheckpoints:false to replay the same recording as a plain trajectory-only run "
+			"instead — checkpoints are skipped entirely (no capture provider required, nothing "
+			"captured), so one recording can serve as both a general tour and a visual-review run "
+			"depending on the call. Pass 'goldens' to also get "
+			"an inline SSIM verdict per checkpoint: {\"<checkpointId>\": {golden, threshold?, "
+			"regions?}}; a checkpoint with no matching entry is captured but not scored. The "
+			"result's top-level 'checkpoints' array rolls up every capture step into "
+			"{id, ok, path, inconclusive, inconclusiveReason?, ssim?, threshold?, passed?} — read "
+			"this instead of filtering the (often much larger) 'results' step transcript yourself.";
 		record.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
-								{ "action", json{ { "type", "string" }, { "enum", json::array({ "start", "stop", "status", "replay" }) }, { "description", "start | stop | status | replay" } } },
+								{ "action", json{ { "type", "string" }, { "enum", json::array({ "start", "stop", "status", "replay", "checkpoint" }) }, { "description", "start | stop | status | replay | checkpoint" } } },
 								{ "intervalMs", json{ { "type", "integer" }, { "description", "start: pose sample period in ms (default = config recordIntervalMs, min 10)" } } },
+								{ "id", json{ { "type", "string" }, { "description", "checkpoint: unique id for this checkpoint (required)" } } },
+								{ "excludeUi", json{ { "type", "boolean" }, { "description", "checkpoint: request a pre-UI capture source at replay (default true) — see the `capture` tool" } } },
 								{ "path", json{ { "type", "string" }, { "description", "replay: recording file to play back (from stop's 'path')" } } },
 								{ "restoreScene", json{ { "type", "boolean" }, { "description", "replay: re-establish the recorded entryPoint + wait for load before the trajectory (default false)" } } },
+								{ "variant", json{ { "type", "string" }, { "description", "replay: tag for any meta.checkpoints captures, for correlation (default 'default')" } } },
+								{ "captureCheckpoints", json{ { "type", "boolean" }, { "description", "replay: expand meta.checkpoints into capture steps (default true) — pass false for a plain trajectory-only replay of a checkpoint-bearing recording (no provider required, nothing captured)" } } },
+								{ "goldens", json{ { "type", "object" }, { "description", "replay: per-checkpoint SSIM comparison config, keyed by checkpoint id — {\"<id>\": {golden, threshold?, regions?}} — see the `capture` tool. Never stored in the recording itself; supply it fresh per replay so the same recording can check against different variants' goldens." } } },
 								{ "coupling", json{ { "type", "string" }, { "enum", json::array({ "anchored", "cell", "worldspace" }) }, { "description", "replay: override the recipe's coupling tier — run looser than the producer signaled (worldspace skips the scene restore)" } } },
 								{ "force", json{ { "type", "boolean" }, { "description", "replay: proceed even if the scene doesn't match the recording — report the mismatch as a warning instead of aborting (default false)" } } },
 								{ "closeMenus", json{ { "type", "boolean" }, { "description", "replay: if a MODAL is open at start, cancel it and continue instead of erroring; non-modal gameplay menus still error (default false)" } } },
@@ -2231,6 +2363,7 @@ namespace dvb
 							throw;
 						}
 						result["coupling"] = coupling;  // surface effective tier / override
+						result["checkpoints"] = SummarizeCheckpoints(result);
 						logs::info("devbench: replay finished — {} steps, ok={}",
 							result.value("stepsRun", 0), result.value("ok", false));
 						a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", result.value("ok", false) }, { "stepsRun", result.value("stepsRun", 0) } });

@@ -2,6 +2,7 @@
 
 #include "GameState.h"
 #include "MainThread.h"
+#include "ToolExtensions.h"
 #include "ToolRegistry.h"
 
 #include <RE/Skyrim.h>
@@ -52,6 +53,10 @@ namespace dvb::Recording
 		long        g_cellMs = 60000;
 		bool        g_cleanTransition = true;
 		std::string g_cleanTransitionCell = "QASmoke";
+
+		// Default settle (ms) inserted before a checkpoint's capture, when the checkpoint doesn't
+		// specify its own settleMs. Set from config via SetCaptureDefaults.
+		long g_captureSettleMs = 500;
 
 		// True while devbench is replaying a scenario (teleporting the player). The pose sampler
 		// skips these ticks: the replay's own setpos/setangle commands — captured via the console
@@ -176,7 +181,8 @@ namespace dvb::Recording
 			std::thread              worker;
 			std::mutex               mtx;
 			std::vector<json>        samples;
-			std::vector<json>        commands;  // console commands seen mid-recording: { command, frame }
+			std::vector<json>        commands;     // console commands seen mid-recording: { command, frame }
+			std::vector<json>        checkpoints;  // screenshot checkpoints marked mid-recording: { id, atMs, excludeUi }
 			json                     manifest;
 			long                     intervalMs = kDefaultIntervalMs;
 			steady_clock::time_point startTick;
@@ -278,6 +284,12 @@ namespace dvb::Recording
 			meta["commandCount"] = a_rec.commands.size();
 			meta["recordedMs"] = a_recordedMs;
 			meta["recordedAt"] = static_cast<long long>(std::time(nullptr));  // record-time epoch, for tooling
+			// Checkpoints marked live via record{action:"checkpoint"} during this session. Each
+			// entry's atMs is already the recorder's own elapsed-ms clock (steady_clock since
+			// startTick) -- the SAME clock BuildReplaySteps reconstructs by summing this scenario's
+			// own "wait" values, so no reconciliation is needed here; the values just carry over.
+			if (!a_rec.checkpoints.empty())
+				meta["checkpoints"] = a_rec.checkpoints;
 			return json{ { "meta", std::move(meta) }, { "steps", std::move(steps) } };
 		}
 
@@ -353,6 +365,7 @@ namespace dvb::Recording
 				std::lock_guard lock(rec.mtx);
 				rec.samples.clear();
 				rec.commands.clear();
+				rec.checkpoints.clear();
 				rec.manifest = std::move(manifest);
 				rec.intervalMs = interval;
 			}
@@ -365,6 +378,39 @@ namespace dvb::Recording
 			Notify("devbench: recording started");
 			logs::info("devbench: recording started (interval {}ms)", interval);
 			return json{ { "action", "start" }, { "recording", true }, { "intervalMs", interval } };
+		}
+
+		if (action == "checkpoint") {
+			// Mark a screenshot checkpoint at THIS moment of an active recording -- mirrors how
+			// `stop` already captures the trajectory with zero manual JSON editing after the fact.
+			// Deliberately carries NO golden/threshold here: at mark-time there is by definition
+			// no golden yet for a first-time checkpoint, and for a regression check the comparison
+			// target belongs to replay (see record{action:"replay"}'s `goldens` arg), not to the
+			// act of marking a moment -- baking it in here would reintroduce exactly the kind of
+			// side-channel bookkeeping this action exists to eliminate.
+			if (!rec.running.load())
+				return json{ { "error", "not recording — call action=start first" } };
+			const std::string id = a_args.value("id", std::string{});
+			if (id.empty())
+				return json{ { "error", "checkpoint requires a non-empty 'id'" } };
+
+			const long atMs = static_cast<long>(
+				duration_cast<milliseconds>(steady_clock::now() - rec.startTick).count());
+			json entry{ { "id", id }, { "atMs", atMs }, { "excludeUi", a_args.value("excludeUi", true) } };
+
+			size_t count = 0;
+			{
+				std::lock_guard lock(rec.mtx);
+				if (std::any_of(rec.checkpoints.begin(), rec.checkpoints.end(),
+						[&](const json& c) { return c.value("id", std::string{}) == id; }))
+					return json{ { "error", std::format("checkpoint id '{}' already marked this recording", id) } };
+				rec.checkpoints.push_back(entry);
+				count = rec.checkpoints.size();
+			}
+			a_events.Publish("record.checkpoint", entry);
+			Notify(std::format("devbench: checkpoint '{}' marked", id));
+			logs::info("devbench: checkpoint '{}' marked at {}ms", id, atMs);
+			return json{ { "action", "checkpoint" }, { "id", id }, { "atMs", atMs }, { "checkpointCount", count } };
 		}
 
 		if (action == "stop") {
@@ -391,6 +437,7 @@ namespace dvb::Recording
 			return json{
 				{ "action", "stop" },
 				{ "sampleCount", rec.samples.size() },
+				{ "checkpointCount", rec.checkpoints.size() },
 				{ "recordedMs", recordedMs },
 				{ "path", pathStr },
 				{ "meta", scenario["meta"] },
@@ -403,10 +450,11 @@ namespace dvb::Recording
 				{ "recording", rec.running.load() },
 				{ "sampleCount", rec.samples.size() },
 				{ "intervalMs", rec.intervalMs },
+				{ "checkpointCount", rec.checkpoints.size() },
 			};
 		}
 
-		return json{ { "error", "unknown action (start|stop|status)" }, { "action", action } };
+		return json{ { "error", "unknown action (start|stop|status|checkpoint)" }, { "action", action } };
 	}
 
 	void Notify(const std::string& a_msg)
@@ -486,6 +534,113 @@ namespace dvb::Recording
 		g_cellMs = (a_cellMs < a_anchorMs) ? a_anchorMs : a_cellMs;  // cell window must cover the anchor window
 		g_cleanTransition = a_cleanTransition;
 		g_cleanTransitionCell = a_transitionCell;
+	}
+
+	void SetCaptureDefaults(int a_settleMs)
+	{
+		g_captureSettleMs = (a_settleMs < 0) ? 0 : a_settleMs;
+	}
+
+	namespace
+	{
+		// The recording's meta.capabilities entry for "capture", or an empty object if it
+		// declares none (which means: no gate, any/no provider is fine).
+		json FindCaptureCapability(const json& a_meta)
+		{
+			for (const auto& cap : a_meta.value("capabilities", json::array()))
+				if (cap.value("capability", std::string{}) == "capture")
+					return cap;
+			return json::object();
+		}
+
+		// Validate + sort meta.checkpoints by atMs. Throws on a duplicate/missing id or a
+		// negative atMs — a bad checkpoint should fail the replay call up front, not silently
+		// misfire mid-trajectory.
+		json SortedCheckpoints(const json& a_meta)
+		{
+			json checkpoints = a_meta.value("checkpoints", json::array());
+			if (!checkpoints.is_array())
+				throw ToolError(400, "meta.checkpoints must be an array");
+			std::vector<std::string> seen;
+			for (const auto& cp : checkpoints) {
+				if (!cp.contains("id") || !cp["id"].is_string() || cp["id"].get<std::string>().empty())
+					throw ToolError(400, "each checkpoint requires a non-empty string 'id'");
+				const std::string id = cp["id"].get<std::string>();
+				if (std::find(seen.begin(), seen.end(), id) != seen.end())
+					throw ToolError(400, std::format("duplicate checkpoint id '{}'", id));
+				seen.push_back(id);
+				if (cp.value("atMs", 0LL) < 0)
+					throw ToolError(400, std::format("checkpoint '{}' has negative atMs", id));
+			}
+			std::stable_sort(checkpoints.begin(), checkpoints.end(),
+				[](const json& a, const json& b) { return a.value("atMs", 0LL) < b.value("atMs", 0LL); });
+			return checkpoints;
+		}
+
+		// Expand one checkpoint into existing scenario primitives — a MACRO, not a new step
+		// kind (the scenario step list stays a thin sequencer; see ROADMAP.md's "keep scenario
+		// thin" scope guard). No pose step is emitted: the trajectory's own immediately-preceding
+		// `pose` step already set position/angle, so re-issuing it would be a redundant no-op;
+		// only POV is re-asserted (Skyrim's idle-vanity timer can flip it). No HUD-suppression
+		// step either — UI exclusion is the capture provider's job (`excludeUi` in the capture
+		// args), not something the step list can do reliably (a console `tm` toggle leaks HUD-
+		// hidden state on any aborted step).
+		void AppendCheckpointSteps(json& a_steps, const json& a_cp, const json& a_cap,
+			const std::string& a_recordingStem, const json& a_args, long a_cumMs, long a_defaultSettleMs)
+		{
+			// waitUntil FIRST so a transient menu (a loading spinner, a fading message box) can
+			// clear within its timeout; assert only fails the checkpoint if it's STILL blocked
+			// afterward. The reverse order made the wait pointless -- assert fired on whatever
+			// was open at this exact instant, before the wait ever got a chance to run.
+			a_steps.push_back(json{ { "waitUntil", "noBlockingMenu" }, { "timeoutMs", 5000 }, { "pollMs", 100 } });
+			a_steps.push_back(json{ { "assert", "noBlockingMenu" } });
+			if (a_cp.contains("pov"))
+				a_steps.push_back(json{ { "tool", "camera" }, { "args", json{ { "action", "setPov" }, { "pov", a_cp["pov"] } } } });
+			if (const long settleMs = a_cp.value("settleMs", a_defaultSettleMs); settleMs > 0)
+				a_steps.push_back(json{ { "wait", settleMs } });
+
+			// kind is the CAPABILITY-RESOLVED provider (or "auto" if none was declared), never a
+			// bare "auto" independent of the gate that already validated it above — otherwise the
+			// gate and the macro could disagree (gate passes because the named provider IS
+			// registered, but "auto" 400s at runtime if a second provider also happens to be
+			// registered). ".value()" only substitutes the default when the key is ABSENT, so an
+			// explicit-but-empty "provider": "" (a malformed recipe) needs its own fallback too.
+			std::string provider = a_cap.value("provider", std::string("auto"));
+			if (provider.empty())
+				provider = "auto";
+			json capArgs{
+				{ "kind", provider },
+				{ "allowNative", a_cap.value("allowNative", false) },
+				{ "checkpointId", a_cp.at("id") },
+				{ "recording", a_recordingStem },
+				{ "variant", a_args.value("variant", std::string("default")) },
+				{ "excludeUi", a_cp.value("excludeUi", true) },
+				{ "atMs", a_cp.value("atMs", 0LL) },
+				{ "resolvedAtMs", a_cumMs },
+				{ "resolvedIndex", static_cast<long>(a_steps.size()) },
+			};
+			if (a_cp.contains("subrect"))
+				capArgs["subrect"] = a_cp["subrect"];
+
+			// golden/threshold/regions come from THIS replay call's "goldens" map, keyed by
+			// checkpoint id — never from the checkpoint itself (meta.checkpoints carries no
+			// golden; see record{action:"checkpoint"}'s doc comment for why). Lets the same
+			// recording be replayed against different variants' goldens without touching the
+			// recording file at all.
+			if (const json goldens = a_args.value("goldens", json::object());
+				goldens.is_object() && goldens.contains(a_cp.at("id").get<std::string>())) {
+				const json& g = goldens.at(a_cp.at("id").get<std::string>());
+				if (g.is_object()) {
+					if (g.contains("golden"))
+						capArgs["golden"] = g["golden"];
+					if (g.contains("threshold"))
+						capArgs["threshold"] = g["threshold"];
+					if (g.contains("regions"))
+						capArgs["regions"] = g["regions"];
+				}
+			}
+			a_steps.push_back(json{ { "tool", "capture" }, { "args", std::move(capArgs) } });
+		}
 	}
 
 	json BuildReplaySteps(const json& a_args)
@@ -575,6 +730,8 @@ namespace dvb::Recording
 		// reported warning instead of an abort. The consumer explicitly opted into "may not work".
 		const bool force = a_args.value("force", false);
 
+		const bool captureCheckpoints = a_args.value("captureCheckpoints", true);
+
 		// Runtime gate: a flat setpos/setangle recording gives non-comparable frames on VR (HMD
 		// drives pitch + culling), and a VR recording won't drive a flat game. Abort on a runtime
 		// the recording wasn't marked for; force downgrades it to a warning. Unmarked (v1) = ungated.
@@ -589,6 +746,30 @@ namespace dvb::Recording
 			if (!ok && !force)
 				throw ToolError(409, std::format("recording is for runtimes {} but this game is {} — pass force to replay anyway",
 										 compat.dump(), curVR ? "vr" : "flat (se/ae)"));
+		}
+
+		// Capability gate: if this recording declares checkpoints need a capture provider,
+		// check it's actually available BEFORE running anything — same shape as the runtime
+		// gate above (force downgrades an abort to a warning), so a missing provider fails
+		// clearly and early instead of 400ing on the first checkpoint's capture step deep
+		// into the trajectory.
+		const json captureCap = FindCaptureCapability(meta);
+		if (captureCheckpoints && !captureCap.empty() && captureCap.value("required", true)) {
+			const std::string want = captureCap.value("provider", std::string{});
+			const auto        keys = ToolExtensions::Keys("capture");
+			bool              ok = want.empty() ? !keys.empty() : ToolExtensions::Find("capture", want).has_value();
+			if (!ok && captureCap.value("allowNative", false))
+				ok = true;  // native is always available as a (lower-fidelity) fallback
+			if (!ok && !force) {
+				std::string names;
+				for (const auto& k : keys)
+					names += (names.empty() ? "" : ", ") + k;
+				throw ToolError(409, std::format(
+										 "recording requires capture provider '{}' but none is registered (registered: [{}]) — "
+										 "install the provider mod (see inspect kind=registrants), set "
+										 "meta.capabilities[].allowNative, or pass force",
+										 want.empty() ? "<any>" : want, names));
+			}
 		}
 
 		const bool restoreScene = a_args.value("restoreScene", false);
@@ -686,9 +867,24 @@ namespace dvb::Recording
 		// the destination cell must finish loading before the following setpos teleports the player,
 		// or the replay teleports onto a not-yet-valid ref mid-load and CTDs. Done here (not baked
 		// into the recording) so existing recipes get the fix too.
-		const long txnSettleMs = a_args.value("settleMs", static_cast<long>(g_loadSettleMs));
+		//
+		// Interleaved: checkpoint capture steps, flushed once cumMs (the cumulative sum of the
+		// RECORDING'S OWN "wait" values — the same clock BuildScenario stamped from tMs deltas)
+		// reaches each checkpoint's atMs. This is resolved HERE, once, at plan time — nothing
+		// during replay execution (a slow cell load, a long waitFor) can move it, because the
+		// checkpoint's insertion point is a fixed index in the already-built step list by the
+		// time replay starts. cumMs deliberately sums ONLY the original recording's own "wait"
+		// steps below — the coc/cow settle steps injected right after them, and the restore
+		// prologue's settle waits above, are NOT part of that clock and must never be added in.
+		const long        txnSettleMs = a_args.value("settleMs", static_cast<long>(g_loadSettleMs));
+		const json        checkpoints = captureCheckpoints ? SortedCheckpoints(meta) : json::array();
+		const std::string recordingStem = fs::path(path).stem().string();
+		long              cumMs = 0;
+		size_t            cpIdx = 0;
 		for (const auto& s : rec["steps"]) {
 			steps.push_back(s);
+			if (s.contains("wait"))
+				cumMs += s["wait"].get<long>();
 			if (s.value("tool", std::string{}) == "console") {
 				const std::string c = s.value("args", json::object()).value("command", std::string{});
 				if (c.size() >= 4 && c[3] == ' ' && (c[0] | 0x20) == 'c' && (c[1] | 0x20) == 'o' &&
@@ -698,7 +894,13 @@ namespace dvb::Recording
 						steps.push_back(json{ { "wait", txnSettleMs } });
 				}
 			}
+			while (cpIdx < checkpoints.size() && checkpoints[cpIdx].value("atMs", 0LL) <= cumMs)
+				AppendCheckpointSteps(steps, checkpoints[cpIdx++], captureCap, recordingStem, a_args, cumMs, g_captureSettleMs);
 		}
+		// Checkpoints anchored past the end of the trajectory still fire, at the end.
+		while (cpIdx < checkpoints.size())
+			AppendCheckpointSteps(steps, checkpoints[cpIdx++], captureCap, recordingStem, a_args, cumMs, g_captureSettleMs);
+
 		// Return the steps plus the effective coupling so the caller can surface what it
 		// actually did (which tier ran, whether the consumer overrode the producer's signal).
 		return json{

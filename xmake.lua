@@ -33,6 +33,11 @@ add_rules("plugin.vsxmake.autoupdate")
 
 -- packages
 add_requires("nlohmann_json")
+-- Decode-only image loading for the `capture` tool's native SSIM comparison (two already-
+-- captured PNGs -> pixel buffers). Same single-header library Open Shaders already vendors
+-- for its own screenshot encode/decode -- no new dependency ecosystem, just the one everyone
+-- adjacent to this already uses.
+add_requires("stb")
 
 -- Local package repo: pins the optional SMF3 client API header (single header, pulled at build
 -- time, runtime GetProcAddress — inert when SMF is not installed). See xmake-pkgs/.
@@ -73,7 +78,7 @@ target_end()
 -- target
 target("devbench")
 add_deps("commonlibsse-ng", "cpp-mcp", "devbench-UI", "devbench-UI-fuck")
-add_packages("nlohmann_json")
+add_packages("nlohmann_json", "stb")
 
 -- DLL output name
 set_basename("devbench")
@@ -148,10 +153,11 @@ target("devbench-tests")
 set_kind("binary")
 set_default(false)
 set_languages("c++23")
-add_packages("nlohmann_json")
+add_packages("nlohmann_json", "stb")
 add_includedirs("src")
 add_files("tests/*.cpp")
 add_files("src/ToolRegistry.cpp") -- exercised directly; pure logic, no game deps
+add_files("src/Ssim.cpp") -- exercised directly; pure logic, no game deps
 add_headerfiles("tests/*.h")
 set_pcxxheader("tests/pch.h")
 add_defines("_WINSOCKAPI_")
