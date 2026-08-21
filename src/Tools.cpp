@@ -519,7 +519,7 @@ namespace dvb
 						{ "messageBoxOpen", true },
 						{ "bodyText", data->bodyText.c_str() ? std::string(data->bodyText.c_str()) : std::string{} },
 						{ "buttons", std::move(buttons) },
-						{ "cancelIndex", data->cancelOptionIndex },
+						{ "cancelIndex", data->cancelButtonIndex },
 					};
 				});
 			}
@@ -535,7 +535,7 @@ namespace dvb
 						if (!data->bodyText.c_str() || !ContainsCI(data->bodyText.c_str(), matchBody))
 							return json{ { "accepted", false }, { "reason", "body did not match matchBody" } };
 						// Non-cancel button, but never out of range: fall back to 0 on a one-button box.
-						const int pick = (data->cancelOptionIndex == 0 && data->buttonText.size() > 1) ? 1 : 0;
+						const int pick = (data->cancelButtonIndex == 0 && data->buttonText.size() > 1) ? 1 : 0;
 						RE::MessageBoxMenu::SelectOption(pick);
 						return json{ { "accepted", true }, { "index", pick } };
 					});
@@ -1424,7 +1424,7 @@ namespace dvb
 					auto* data = RE::MessageBoxMenu::GetCurrentMessageBoxData();
 					if (!data || !data->bodyText.c_str() || !ContainsCI(data->bodyText.c_str(), a_matchBody))
 						return false;
-					RE::MessageBoxMenu::SelectOption((data->cancelOptionIndex == 0 && data->buttonText.size() > 1) ? 1 : 0);
+					RE::MessageBoxMenu::SelectOption((data->cancelButtonIndex == 0 && data->buttonText.size() > 1) ? 1 : 0);
 					return true;
 				},
 					milliseconds(1000))
@@ -1440,7 +1440,7 @@ namespace dvb
 			try {
 				MainThread::RunAndWait([]() -> json {
 					if (auto* data = RE::MessageBoxMenu::GetCurrentMessageBoxData())
-						RE::MessageBoxMenu::SelectOption(data->cancelOptionIndex);
+						RE::MessageBoxMenu::SelectOption(data->cancelButtonIndex);
 					return true;
 				},
 					milliseconds(1000));
