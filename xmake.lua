@@ -10,6 +10,7 @@ set_config("skse_xbyak", true)
 -- includes
 includes("lib/commonlibsse-ng")
 includes("xmake/cpp-mcp.lua")
+includes("xmake/gopher-mcp.lua") -- spike: MCP 2.0 candidate, not yet wired into targets
 
 -- project
 set_project("devbench")
