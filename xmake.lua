@@ -158,6 +158,7 @@ add_includedirs("src")
 add_files("tests/*.cpp")
 add_files("src/ToolRegistry.cpp") -- exercised directly; pure logic, no game deps
 add_files("src/Ssim.cpp") -- exercised directly; pure logic, no game deps
+add_files("src/KeyboardInputState.cpp") -- key resolution + lease ownership; pure logic
 add_headerfiles("tests/*.h")
 set_pcxxheader("tests/pch.h")
 add_defines("_WINSOCKAPI_")
