@@ -7,6 +7,7 @@
 #include "GameState.h"
 #include "HostApi.h"
 #include "Json.h"
+#include "KeyboardInput.h"
 #include "MainThread.h"
 #include "Papyrus.h"
 #include "Recording.h"
@@ -2023,6 +2024,8 @@ namespace dvb
 
 	void RegisterCoreTools(ToolRegistry& a_registry, EventBus& a_events)
 	{
+		RegisterInputTool(a_registry, a_events);
+
 		ToolDescriptor console;
 		console.name = "console";
 		console.description =
