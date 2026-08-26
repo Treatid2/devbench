@@ -1,7 +1,9 @@
 #include "Recording.h"
 
+#include "GameEvents.h"
 #include "GameState.h"
 #include "MainThread.h"
+#include "RecordingActivity.h"
 #include "ToolExtensions.h"
 #include "ToolRegistry.h"
 
@@ -70,6 +72,111 @@ namespace dvb::Recording
 		// console command, so the flag stays clear and NoteCellChange captures that transition.
 		std::atomic<bool> g_userCocPending{ false };
 
+		std::string InputDeviceName(RE::INPUT_DEVICE a_device)
+		{
+			const int code = static_cast<int>(a_device);
+			switch (code) {
+			case 0:
+				return "keyboard";
+			case 1:
+				return "mouse";
+			case 2:
+				return "gamepad";
+			case 3:
+				return REL::Module::IsVR() ? "vivePrimary" : "virtualKeyboard";
+			case 4:
+				return "viveSecondary";
+			case 5:
+				return "oculusPrimary";
+			case 6:
+				return "oculusSecondary";
+			case 7:
+				return "wmrPrimary";
+			case 8:
+				return "wmrSecondary";
+			case 9:
+				return "vrVirtualKeyboard";
+			default:
+				return code < 0 ? "none" : "unknown";
+			}
+		}
+
+		std::string InputEventTypeName(int a_type)
+		{
+			switch (a_type) {
+			case 0:
+				return "button";
+			case 1:
+				return "mouseMove";
+			case 2:
+				return "char";
+			case 3:
+				return "thumbstick";
+			case 4:
+				return "deviceConnect";
+			case 5:
+				return "kinect";
+			case 6:
+				return REL::Module::IsVR() ? "vrTouchpadPosition" : "sixaxis";
+			case 7:
+				return REL::Module::IsVR() ? "vrTouchpadSwipe" : "motionGesture";
+			case 8:
+				return "amiibo";
+			default:
+				return "unknown";
+			}
+		}
+
+		json SerializeInputEvent(const RE::InputEvent& a_event)
+		{
+			const int type = static_cast<int>(a_event.GetEventType());
+			const int device = static_cast<int>(a_event.GetDevice());
+			json      out{
+				{ "kind", "input" },
+				{ "eventType", InputEventTypeName(type) },
+				{ "eventTypeCode", type },
+				{ "device", InputDeviceName(a_event.GetDevice()) },
+				{ "deviceCode", device },
+			};
+			if (const auto* id = a_event.AsIDEvent()) {
+				out["idCode"] = id->GetIDCode();
+				if (const char* user = id->userEvent.c_str(); user && *user)
+					out["userEvent"] = user;
+			}
+
+			if (const auto* button = a_event.AsButtonEvent()) {
+				out["idCode"] = button->GetIDCode();
+				if (const char* user = button->GetUserEvent().c_str(); user && *user)
+					out["userEvent"] = user;
+				out["value"] = button->Value();
+				out["heldSeconds"] = button->HeldDuration();
+				out["state"] = button->IsDown() ? "down" : button->IsHeld() ? "held" :
+					button->IsUp() ? "up" : "changed";
+				if (REL::Module::IsVR())
+					if (const auto* wand = button->AsVRWandEvent())
+						out["wandIndex"] = wand->unkVR28;
+			} else if (const auto* mouse = a_event.AsMouseMoveEvent()) {
+				out["x"] = mouse->mouseInputX;
+				out["y"] = mouse->mouseInputY;
+			} else if (const auto* character = a_event.AsCharEvent()) {
+				out["keyCode"] = character->keyCode;
+			} else if (const auto* stick = a_event.AsThumbstickEvent()) {
+				out["x"] = stick->xValue;
+				out["y"] = stick->yValue;
+			} else if (type == 4) {
+				out["connected"] = static_cast<const RE::DeviceConnectEvent&>(a_event).connected;
+			} else if (REL::Module::IsVR() && type == 6) {
+				const auto& touch = static_cast<const RE::VrWandTouchpadPositionEvent&>(a_event);
+				out["wandIndex"] = touch.unkVR28;
+				out["raw"] = json::array({ touch.unk30, touch.unk38, touch.unk40 });
+			} else if (REL::Module::IsVR() && type == 7) {
+				const auto& swipe = static_cast<const RE::VrWandTouchpadSwipeEvent&>(a_event);
+				out["wandIndex"] = swipe.unkVR28;
+				out["raw"] = json::array({ swipe.unk30, swipe.unk38 });
+			}
+			return out;
+		}
+
 		EntryPoint CurrentEntry()
 		{
 			std::lock_guard lock(g_entryMtx);
@@ -120,7 +227,89 @@ namespace dvb::Recording
 					}
 				}
 			}
+			if (REL::Module::IsVR()) {
+				const auto transform = [](const RE::NiAVObject* a_node) -> json {
+					if (!a_node)
+						return nullptr;
+					const auto& t = a_node->world;
+					return json::array({
+						t.translate.x, t.translate.y, t.translate.z,
+						t.rotate.entry[0][0], t.rotate.entry[0][1], t.rotate.entry[0][2],
+						t.rotate.entry[1][0], t.rotate.entry[1][1], t.rotate.entry[1][2],
+						t.rotate.entry[2][0], t.rotate.entry[2][1], t.rotate.entry[2][2],
+						t.scale,
+					});
+				};
+				if (const auto* nodes = pc->GetVRNodeData()) {
+					s["hmdTransform"] = transform(nodes->HmdNode.get());
+					s["leftWandTransform"] = transform(nodes->LeftWandNode.get());
+					s["rightWandTransform"] = transform(nodes->RightWandNode.get());
+				}
+			}
 			return s;
+		}
+
+		// Raw OpenVR tracking-space poses remain available at the main menu, before Skyrim has a
+		// PlayerCharacter/3D. They are essential for reconstructing which UI element a wand was
+		// aimed at. GetLastPoses is non-blocking and works with both SteamVR and OpenComposite;
+		// do not use WaitGetPoses from this sampler because Skyrim owns frame pacing.
+		json ReadVRTracking()
+		{
+			if (!REL::Module::IsVR())
+				return nullptr;
+			auto* openvr = RE::BSOpenVR::GetSingleton();
+			auto* system = openvr ? openvr->vrSystem : nullptr;
+			auto* compositor = RE::BSOpenVR::GetIVRCompositor();
+			if (!compositor && openvr)
+				compositor = openvr->vrContext.vrCompositor;
+			if (!system || !compositor)
+				return nullptr;
+			const auto trackingOrigin = compositor->GetTrackingSpace();
+			const char* trackingOriginName = trackingOrigin == vr::TrackingUniverseSeated ? "seated" :
+				trackingOrigin == vr::TrackingUniverseStanding ? "standing" :
+				trackingOrigin == vr::TrackingUniverseRawAndUncalibrated ? "rawAndUncalibrated" : "unknown";
+
+			std::array<vr::TrackedDevicePose_t, vr::k_unMaxTrackedDeviceCount> poses{};
+			if (compositor->GetLastPoses(poses.data(), static_cast<std::uint32_t>(poses.size()),
+					nullptr, 0) != vr::VRCompositorError_None)
+				return nullptr;
+
+			const auto encode = [&](vr::TrackedDeviceIndex_t a_index, const char* a_role) -> json {
+				if (a_index == vr::k_unTrackedDeviceIndexInvalid || a_index >= poses.size())
+					return json{ { "role", a_role }, { "available", false } };
+				const auto& p = poses[a_index];
+				json        out{
+					{ "role", a_role }, { "available", true }, { "index", a_index },
+					{ "connected", p.bDeviceIsConnected }, { "valid", p.bPoseIsValid },
+					{ "trackingResult", static_cast<int>(p.eTrackingResult) },
+					{ "velocity", json::array({ p.vVelocity.v[0], p.vVelocity.v[1], p.vVelocity.v[2] }) },
+					{ "angularVelocity", json::array({ p.vAngularVelocity.v[0], p.vAngularVelocity.v[1], p.vAngularVelocity.v[2] }) },
+				};
+				if (p.bPoseIsValid) {
+					json matrix = json::array();
+					for (int row = 0; row < 3; ++row)
+						for (int col = 0; col < 4; ++col)
+							matrix.push_back(p.mDeviceToAbsoluteTracking.m[row][col]);
+					out["matrix"] = std::move(matrix);
+				}
+				return out;
+			};
+
+			return json{
+				{ "origin", trackingOriginName },
+				{ "originCode", static_cast<int>(trackingOrigin) },
+				{ "hmd", encode(vr::k_unTrackedDeviceIndex_Hmd, "hmd") },
+				{ "left", encode(system->GetTrackedDeviceIndexForControllerRole(
+					vr::TrackedControllerRole_LeftHand), "left") },
+				{ "right", encode(system->GetTrackedDeviceIndexForControllerRole(
+					vr::TrackedControllerRole_RightHand), "right") },
+			};
+		}
+
+		json ReadFrameSample()
+		{
+			return json{ { "frame", game::CurrentFrame() }, { "pose", ReadPose() },
+				{ "tracking", ReadVRTracking() } };
 		}
 
 		// One-time scene manifest captured at start: the location and lighting state a
@@ -172,8 +361,8 @@ namespace dvb::Recording
 			return m;
 		}
 
-		// Background pose recorder. One instance (function-local static). start() spawns the
-		// sampler; stop() joins and serializes. `samples`/`manifest`/`intervalMs` are guarded
+		// Background activity recorder. One instance (function-local static). start() spawns the
+		// sampler; stop() joins and serializes. Sample streams/manifest/intervalMs are guarded
 		// by `mtx` (sampler appends, status reads); the thread lifecycle is gated by `running`.
 		struct Recorder
 		{
@@ -183,6 +372,9 @@ namespace dvb::Recording
 			std::vector<json>        samples;
 			std::vector<json>        commands;     // console commands seen mid-recording: { command, frame }
 			std::vector<json>        checkpoints;  // screenshot checkpoints marked mid-recording: { id, atMs, excludeUi }
+			std::vector<json>        activityEvents;  // input/menu/lifecycle/cell on the same monotonic clock
+			std::vector<json>        trackingSamples;  // raw OpenVR tracking space; available before player load
+			std::uint64_t            nextActivitySeq = 1;
 			json                     manifest;
 			long                     intervalMs = kDefaultIntervalMs;
 			steady_clock::time_point startTick;
@@ -193,22 +385,53 @@ namespace dvb::Recording
 					std::this_thread::sleep_for(milliseconds(intervalMs));
 					if (!running.load(std::memory_order_relaxed))
 						break;
-					json pose;
+					json frameSample;
 					try {
 						// Pass &running so a stop() aborts the in-flight wait within one slice
 						// instead of blocking join() for the full 2s during a load screen.
-						pose = MainThread::RunAndWait(&ReadPose, milliseconds(2000), &running);
+						frameSample = MainThread::RunAndWait(&ReadFrameSample, milliseconds(2000), &running);
 					} catch (const std::exception&) {
 						continue;  // main thread stalled mid-load — skip this tick
 					}
-					if (pose.is_null())
+					json pose = frameSample.value("pose", json(nullptr));
+					json tracking = frameSample.value("tracking", json(nullptr));
+					if (pose.is_null() && tracking.is_null()) {
+						// Main-menu/new-game capture needs the input sink, not 100 empty pose
+						// probes per second. Keep detection responsive without adding startup load.
+						if (intervalMs < 100)
+							std::this_thread::sleep_for(milliseconds(100 - intervalMs));
 						continue;  // player not loaded (or the wait was aborted by stop)
-					if (g_replaying.load(std::memory_order_relaxed))
-						continue;  // devbench is teleporting; the replay's setpos commands (captured
-								   // via the console hook) are the trajectory — don't re-sample it
+					}
+					const auto tMs = duration_cast<milliseconds>(steady_clock::now() - startTick).count();
+					if (!tracking.is_null()) {
+						tracking["tMs"] = tMs;
+						tracking["frame"] = frameSample.value("frame", 0u);
+						std::lock_guard lock(mtx);
+						trackingSamples.push_back(std::move(tracking));
+					}
+					if (pose.is_null() || g_replaying.load(std::memory_order_relaxed))
+						continue;  // raw tracking is still sampled, but replay's teleported player pose is not
+					// A main-menu-start recording has no anchor. Preserve its initial state and
+					// also capture the first loaded scene without pretending that was the start.
+					bool needFirstScene = false;
+					{
+						std::lock_guard lock(mtx);
+						needFirstScene = !manifest.contains("anchor") && !manifest.contains("firstPlayerScene");
+					}
+					if (needFirstScene) {
+						try {
+							json first = MainThread::RunAndWait(&ReadManifest, milliseconds(2000), &running);
+							if (first.contains("anchor")) {
+								std::lock_guard lock(mtx);
+								if (!manifest.contains("firstPlayerScene"))
+									manifest["firstPlayerScene"] = std::move(first);
+							}
+						} catch (const std::exception&) {
+						}
+					}
 					// Wall-clock offset so BuildScenario can use real inter-sample deltas as
 					// wait values — RunAndWait latency inflates actual intervals above intervalMs.
-					pose["tMs"] = duration_cast<milliseconds>(steady_clock::now() - startTick).count();
+					pose["tMs"] = tMs;
 					std::lock_guard lock(mtx);
 					samples.push_back(std::move(pose));
 				}
@@ -221,17 +444,37 @@ namespace dvb::Recording
 			return r;
 		}
 
+		void AppendActivity(json a_event)
+		{
+			auto& rec = Get();
+			if (!rec.running.load(std::memory_order_relaxed))
+				return;
+			a_event["tMs"] = duration_cast<milliseconds>(steady_clock::now() - rec.startTick).count();
+			a_event["frame"] = game::CurrentFrame();
+			std::lock_guard lock(rec.mtx);
+			if (!rec.running.load(std::memory_order_relaxed))
+				return;
+			a_event["seq"] = rec.nextActivitySeq++;
+			rec.activityEvents.push_back(std::move(a_event));
+		}
+
 		// Build a replayable scenario: teleport the player to each sample (per-axis setpos +
 		// setangle in degrees) with a wait of intervalMs between, so the captured path doubles
 		// as the measure window. Player-teleport replay needs no new engine hooks; smooth
 		// interpolation and a free-camera path are later enhancements.
 		json BuildScenario(const Recorder& a_rec, long a_recordedMs)
 		{
-			const auto consoleStep = [](const std::string& a_cmd) {
-				return json{ { "tool", "console" }, { "args", json{ { "action", "exec" }, { "command", a_cmd } } } };
+			const auto consoleStep = [](const std::string& a_cmd, long a_atMs) {
+				json step{ { "tool", "console" }, { "args", json{ { "action", "exec" }, { "command", a_cmd } } } };
+				if (a_atMs >= 0)
+					step["atMs"] = a_atMs;
+				return step;
 			};
-			const auto cameraStep = [](const std::string& a_pov) {
-				return json{ { "tool", "camera" }, { "args", json{ { "action", "setPov" }, { "pov", a_pov } } } };
+			const auto cameraStep = [](const std::string& a_pov, long a_atMs) {
+				json step{ { "tool", "camera" }, { "args", json{ { "action", "setPov" }, { "pov", a_pov } } } };
+				if (a_atMs >= 0)
+					step["atMs"] = a_atMs;
+				return step;
 			};
 
 			json                  steps = json::array();
@@ -244,11 +487,13 @@ namespace dvb::Recording
 				// Replay console commands the user/agent ran during recording at the point in the
 				// trajectory they were issued (ordered by frame), so value-setting is reproduced.
 				const auto frame = s.value("frame", 0u);
+				const long tMs = s.value("tMs", static_cast<long>(-1));
 				for (; cmdIdx < a_rec.commands.size() && a_rec.commands[cmdIdx].value("frame", 0u) <= frame; ++cmdIdx)
-					steps.push_back(consoleStep(a_rec.commands[cmdIdx].value("command", std::string{})));
+					steps.push_back(consoleStep(a_rec.commands[cmdIdx].value("command", std::string{}),
+						a_rec.commands[cmdIdx].value("tMs", static_cast<long>(-1))));
 
 				if (const auto pov = s.value("pov", std::string{}); !pov.empty() && pov != lastPov) {
-					steps.push_back(cameraStep(pov));
+					steps.push_back(cameraStep(pov, tMs));
 					lastPov = pov;
 				}
 				// One compact pose row per changed sample; a bare wait for a run of identical
@@ -262,26 +507,52 @@ namespace dvb::Recording
 					r2(s.value("angleZ", 0.0) * kRadToDeg),
 					r2(s.value("angleX", 0.0) * kRadToDeg),  // pitch
 				};
-				const long tMs = s.value("tMs", static_cast<long>(-1));
 				const long waitMs = (tMs > 0 && prevTMs >= 0) ? std::max(1L, tMs - prevTMs) : a_rec.intervalMs;
+				json       row{ { "wait", waitMs } };
+				if (tMs >= 0)
+					row["atMs"] = tMs;
 				if (!havePose || pose != lastPose) {
-					steps.push_back(json{ { "pose", pose }, { "wait", waitMs } });
+					row["pose"] = pose;
 					lastPose = pose;
 					havePose = true;
-				} else {
-					steps.push_back(json{ { "wait", waitMs } });
 				}
+				steps.push_back(std::move(row));
 				prevTMs = tMs;
 			}
 			// Trailing commands issued after the final pose sample.
 			for (; cmdIdx < a_rec.commands.size(); ++cmdIdx)
-				steps.push_back(consoleStep(a_rec.commands[cmdIdx].value("command", std::string{})));
+				steps.push_back(consoleStep(a_rec.commands[cmdIdx].value("command", std::string{}),
+					a_rec.commands[cmdIdx].value("tMs", static_cast<long>(-1))));
 
 			json meta = a_rec.manifest;
-			meta["format"] = "devbench-recording-2";
+			meta["format"] = "devbench-recording-3";
 			meta["intervalMs"] = a_rec.intervalMs;
 			meta["sampleCount"] = a_rec.samples.size();
 			meta["commandCount"] = a_rec.commands.size();
+			meta["activityCapture"] = ActivityCaptureContract();
+			meta["trackingCapture"] = json{
+				{ "name", "devbench.recording.openvrTracking" },
+				{ "version", json{ { "major", 1 }, { "minor", 0 } } },
+				{ "source", "IVRCompositor.GetLastPoses" },
+				{ "origin", "captured per sample from IVRCompositor.GetTrackingSpace" },
+				{ "devices", json::array({ "hmd", "left", "right" }) },
+				{ "transformEncoding", "OpenVR device-to-absolute 3x4 row-major" },
+				{ "velocityEncoding", "tracking-space metres/second" },
+				{ "angularVelocityEncoding", "tracking-space radians/second" },
+				{ "availableBeforePlayerLoad", true },
+				{ "replay", false },
+			};
+			meta["poseCapture"] = json{
+				{ "name", "devbench.recording.pose" },
+				{ "version", json{ { "major", 2 }, { "minor", 0 } } },
+				{ "player", json::array({ "position", "yaw", "pitch" }) },
+				{ "camera", json::array({ "worldPosition", "worldPitch", "worldYaw", "pov" }) },
+				{ "vrTrackedNodes", json::array({ "hmd", "leftWand", "rightWand" }) },
+				{ "transformEncoding", "[tx,ty,tz,r00,r01,r02,r10,r11,r12,r20,r21,r22,scale]" },
+				{ "vrTransformReplay", false },
+			};
+			meta["activityCounts"] = SummarizeActivity(a_rec.activityEvents);
+			meta["trackingSampleCount"] = a_rec.trackingSamples.size();
 			meta["recordedMs"] = a_recordedMs;
 			meta["recordedAt"] = static_cast<long long>(std::time(nullptr));  // record-time epoch, for tooling
 			// Checkpoints marked live via record{action:"checkpoint"} during this session. Each
@@ -290,7 +561,9 @@ namespace dvb::Recording
 			// own "wait" values, so no reconciliation is needed here; the values just carry over.
 			if (!a_rec.checkpoints.empty())
 				meta["checkpoints"] = a_rec.checkpoints;
-			return json{ { "meta", std::move(meta) }, { "steps", std::move(steps) } };
+			return json{ { "meta", std::move(meta) },
+				{ "activityEvents", a_rec.activityEvents },
+				{ "trackingSamples", a_rec.trackingSamples }, { "steps", std::move(steps) } };
 		}
 
 		// Data/SKSE/Plugins/devbench/recordings/recording_<epoch>.json
@@ -303,8 +576,23 @@ namespace dvb::Recording
 			// Preserve any other top-level keys a consumer added (only meta/steps get special
 			// formatting) so a validate round-trip stays lossless.
 			for (auto it = a_scenario.begin(); it != a_scenario.end(); ++it)
-				if (it.key() != "meta" && it.key() != "steps")
+				if (it.key() != "meta" && it.key() != "steps" && it.key() != "activityEvents" &&
+					it.key() != "trackingSamples")
 					s += ",\n" + json(it.key()).dump() + ": " + it->dump(2);
+			if (a_scenario.contains("activityEvents")) {
+				s += ",\n\"activityEvents\": [\n";
+				const json& events = a_scenario["activityEvents"];
+				for (size_t i = 0; i < events.size(); ++i)
+					s += events[i].dump() + (i + 1 < events.size() ? ",\n" : "\n");
+				s += "]";
+			}
+			if (a_scenario.contains("trackingSamples")) {
+				s += ",\n\"trackingSamples\": [\n";
+				const json& samples = a_scenario["trackingSamples"];
+				for (size_t i = 0; i < samples.size(); ++i)
+					s += samples[i].dump() + (i + 1 < samples.size() ? ",\n" : "\n");
+				s += "]";
+			}
 			s += ",\n\"steps\": [\n";
 			const json& steps = a_scenario.value("steps", json::array());
 			for (size_t i = 0; i < steps.size(); ++i)
@@ -351,11 +639,18 @@ namespace dvb::Recording
 				Notify("devbench: can't record — load a game first");
 				return json{ { "error", "could not read scene — is a game loaded?" }, { "detail", e.what() } };
 			}
-			if (!manifest.contains("anchor")) {
+			const bool allowNoPlayer = a_args.value("allowNoPlayer", false);
+			if (!manifest.contains("anchor") && !allowNoPlayer) {
 				logs::warn("devbench: record start failed — player not loaded");
-				Notify("devbench: can't record — load a game first");
-				return json{ { "error", "player not loaded — load a game before recording" } };
+				Notify("devbench: can't record — load a game or use allowNoPlayer");
+				return json{ { "error", "player not loaded — load a game or pass allowNoPlayer=true to capture main-menu/new-game activity" } };
 			}
+			const bool anchored = manifest.contains("anchor");
+			json       openMenus = json::array();
+			for (const auto& menu : GetOpenMenus())
+				openMenus.push_back(menu);
+			manifest["openMenusAtStart"] = std::move(openMenus);
+			manifest["startState"] = anchored ? "playerLoaded" : "noPlayer";
 			if (manifest.value("entryPoint", json::object()).value("kind", std::string{}) == "unknown")
 				logs::info(
 					"devbench: recording with UNKNOWN entry point — replay won't restore the "
@@ -366,6 +661,9 @@ namespace dvb::Recording
 				rec.samples.clear();
 				rec.commands.clear();
 				rec.checkpoints.clear();
+				rec.activityEvents.clear();
+				rec.trackingSamples.clear();
+				rec.nextActivitySeq = 1;
 				rec.manifest = std::move(manifest);
 				rec.intervalMs = interval;
 			}
@@ -374,10 +672,12 @@ namespace dvb::Recording
 			rec.running.store(true);
 			rec.worker = std::thread([&rec] { rec.Sample(); });
 
-			a_events.Publish("record.started", json{ { "intervalMs", interval } });
+			a_events.Publish("record.started", json{ { "intervalMs", interval },
+				{ "anchored", anchored }, { "activityCapture", ActivityCaptureContract() } });
 			Notify("devbench: recording started");
 			logs::info("devbench: recording started (interval {}ms)", interval);
-			return json{ { "action", "start" }, { "recording", true }, { "intervalMs", interval } };
+			return json{ { "action", "start" }, { "recording", true }, { "intervalMs", interval },
+				{ "anchored", anchored }, { "activityCapture", ActivityCaptureContract() } };
 		}
 
 		if (action == "checkpoint") {
@@ -431,13 +731,18 @@ namespace dvb::Recording
 			// slashes verbatim, so string() mixed both in one path — fragile for callers that
 			// split on '/'. generic_string() normalizes the whole path to forward slashes.
 			const std::string pathStr = path.generic_string();
-			a_events.Publish("record.stopped", json{ { "sampleCount", rec.samples.size() }, { "path", pathStr } });
+			const json activityCounts = SummarizeActivity(rec.activityEvents);
+			a_events.Publish("record.stopped", json{ { "sampleCount", rec.samples.size() },
+				{ "trackingSampleCount", rec.trackingSamples.size() },
+				{ "activityCounts", activityCounts }, { "path", pathStr } });
 			Notify(std::format("devbench: recording stopped — {} samples, {:.1f}s", rec.samples.size(), recordedMs / 1000.0));
 			logs::info("devbench: recording stopped — {} samples, {}ms -> {}", rec.samples.size(), recordedMs, pathStr);
 			return json{
 				{ "action", "stop" },
 				{ "sampleCount", rec.samples.size() },
+				{ "trackingSampleCount", rec.trackingSamples.size() },
 				{ "checkpointCount", rec.checkpoints.size() },
+				{ "activityCounts", activityCounts },
 				{ "recordedMs", recordedMs },
 				{ "path", pathStr },
 				{ "meta", scenario["meta"] },
@@ -449,8 +754,10 @@ namespace dvb::Recording
 			return json{
 				{ "recording", rec.running.load() },
 				{ "sampleCount", rec.samples.size() },
+				{ "trackingSampleCount", rec.trackingSamples.size() },
 				{ "intervalMs", rec.intervalMs },
 				{ "checkpointCount", rec.checkpoints.size() },
+				{ "activityCounts", SummarizeActivity(rec.activityEvents) },
 			};
 		}
 
@@ -490,8 +797,12 @@ namespace dvb::Recording
 			(a_command[0] | 0x20) == 'c' && (a_command[1] | 0x20) == 'o' &&
 			((a_command[2] | 0x20) == 'c' || (a_command[2] | 0x20) == 'w'))
 			g_userCocPending.store(true, std::memory_order_relaxed);
-		std::lock_guard lock(rec.mtx);
-		rec.commands.push_back(json{ { "command", a_command }, { "frame", game::CurrentFrame() } });
+		{
+			std::lock_guard lock(rec.mtx);
+			rec.commands.push_back(json{ { "command", a_command }, { "frame", game::CurrentFrame() },
+				{ "tMs", duration_cast<milliseconds>(steady_clock::now() - rec.startTick).count() } });
+		}
+		AppendActivity(json{ { "kind", "console" }, { "command", a_command } });
 	}
 
 	void NoteCellChange(const std::string& a_command)
@@ -502,15 +813,41 @@ namespace dvb::Recording
 		// If the player commanded this transition (a coc/cow was just captured), their own command
 		// already reproduces it — consume the flag and skip, so we don't double it. A door issues
 		// no console command, so the flag is clear and we capture the transition here.
-		if (g_userCocPending.exchange(false, std::memory_order_relaxed))
+		if (g_userCocPending.exchange(false, std::memory_order_relaxed)) {
+			AppendActivity(json{ { "kind", "cell" }, { "command", a_command },
+				{ "commandAlreadyCaptured", true } });
 			return;
+		}
 		// A mid-recording cell transition with no commanding console input (door / fast-travel).
 		// The caller built the reproducible command — `coc <interior>` (unique editor id) or
 		// `cow <worldspace> <gx> <gy>` for exteriors (whose editor ids are NOT unique across
 		// worldspaces). The trajectory's setpos then refines to the exact spot.
-		std::lock_guard lock(rec.mtx);
-		rec.commands.push_back(json{ { "command", a_command }, { "frame", game::CurrentFrame() } });
+		{
+			std::lock_guard lock(rec.mtx);
+			rec.commands.push_back(json{ { "command", a_command }, { "frame", game::CurrentFrame() } });
+		}
+		AppendActivity(json{ { "kind", "cell" }, { "command", a_command } });
 		logs::info("devbench: recorded cell transition — {}", a_command);
+	}
+
+	void NoteInputEvents(RE::InputEvent* const* a_events)
+	{
+		auto& rec = Get();
+		if (!a_events || !rec.running.load(std::memory_order_relaxed) ||
+			g_replaying.load(std::memory_order_relaxed))
+			return;
+		for (const auto* event = *a_events; event; event = event->next)
+			AppendActivity(SerializeInputEvent(*event));
+	}
+
+	void NoteMenuState(const std::string& a_menuName, bool a_opening)
+	{
+		AppendActivity(json{ { "kind", "menu" }, { "name", a_menuName }, { "opening", a_opening } });
+	}
+
+	void NoteLifecycleEvent(const std::string& a_event)
+	{
+		AppendActivity(json{ { "kind", "lifecycle" }, { "event", a_event } });
 	}
 
 	void SetReplaying(bool a_replaying)
@@ -859,9 +1196,13 @@ namespace dvb::Recording
 			});
 		}
 
-		// Fail fast if a menu/modal is open before the trajectory plays: its setpos/setangle would
-		// otherwise run while the menu eats control, producing a silent no-op replay (issue #63).
-		steps.push_back(json{ { "assert", "noBlockingMenu" } });
+		// Fail fast if a menu/modal is open before an in-game trajectory plays: its
+		// setpos/setangle would otherwise be eaten. A recording explicitly started without a
+		// player is a main-menu/new-game trace; its initial menus are the subject, not a blocker
+		// (the in-game guard fixed the silent no-op replay from issue #63).
+		const bool allowsInitialMenus = meta.value("startState", std::string{}) == "noPlayer";
+		if (!allowsInitialMenus)
+			steps.push_back(json{ { "assert", "noBlockingMenu" } });
 
 		// Copy the trajectory, injecting a load-settle after any captured cell transition (coc/cow):
 		// the destination cell must finish loading before the following setpos teleports the player,
@@ -879,9 +1220,13 @@ namespace dvb::Recording
 		const long        txnSettleMs = a_args.value("settleMs", static_cast<long>(g_loadSettleMs));
 		const json        checkpoints = captureCheckpoints ? SortedCheckpoints(meta) : json::array();
 		const std::string recordingStem = fs::path(path).stem().string();
+		const bool        replayInputs = a_args.value("replayInputs", true);
+		const json        activityPlan = InterleaveReplayableActivity(rec["steps"],
+			rec.value("activityEvents", json::array()), "recording:" + recordingStem, replayInputs);
+		const json&       trajectory = activityPlan["steps"];
 		long              cumMs = 0;
 		size_t            cpIdx = 0;
-		for (const auto& s : rec["steps"]) {
+		for (const auto& s : trajectory) {
 			steps.push_back(s);
 			if (s.contains("wait"))
 				cumMs += s["wait"].get<long>();
@@ -905,7 +1250,10 @@ namespace dvb::Recording
 		// actually did (which tier ran, whether the consumer overrode the producer's signal).
 		return json{
 			{ "steps", std::move(steps) },
+			{ "activity", activityPlan.value("report", json::object()) },
+			{ "inputOwner", activityPlan.value("inputOwner", std::string{}) },
 			{ "restored", restored },  // handler's sync menu pre-check skips restore plans (the load clears menus)
+			{ "allowsInitialMenus", allowsInitialMenus },
 			{ "coupling", json{
 							  { "tier", tier },
 							  { "producer", producerTier },

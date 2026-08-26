@@ -3,6 +3,11 @@
 #include "EventBus.h"
 #include "Json.h"
 
+namespace RE
+{
+	class InputEvent;
+}
+
 // record: capture a manual play-through as a replayable scenario. `start` samples the
 // player pose every intervalMs on a background thread (marshaling the read to the main
 // thread) and captures a one-time scene manifest — the worldspace/cell, time of day, and
@@ -35,6 +40,15 @@ namespace dvb::Recording
 	/// unique across worldspaces, so coc is ambiguous). The trajectory's setpos refines the spot.
 	/// Single source of truth for transitions (door, coc, fast-travel). No-op unless recording.
 	void NoteCellChange(const std::string& a_command);
+
+	/// Capture the complete normalized Skyrim input chain delivered by BSInputDeviceManager.
+	/// Every event is serialized while it is valid and stamped onto the recorder's monotonic
+	/// activity clock. No-op unless a recording is active or while DevBench is replaying.
+	void NoteInputEvents(RE::InputEvent* const* a_events);
+
+	/// Capture observable UI/lifecycle state changes on the same clock as input and pose.
+	void NoteMenuState(const std::string& a_menuName, bool a_opening);
+	void NoteLifecycleEvent(const std::string& a_event);
 
 	/// Mark whether devbench is currently replaying (teleporting the player). While true, the
 	/// pose sampler skips ticks — the replay's own setpos commands (captured via the console
