@@ -96,8 +96,8 @@ TEST_CASE("VR tracked-set replay rejects malformed source samples before returni
 TEST_CASE("trajectory atMs preserves an initial no-player recording delay")
 {
 	const json   steps = json::array({
-        json{ { "atMs", 125 }, { "pose", json::array({ 1, 2, 3, 4, 5 }) }, { "wait", 25 } },
-    });
+		json{ { "atMs", 125 }, { "pose", json::array({ 1, 2, 3, 4, 5 }) }, { "wait", 25 } },
+	});
 	const json   plan = InterleaveReplayableActivity(steps, json::array(), "recording:test", true);
 	std::int64_t totalWait = 0;
 	for (const auto& step : plan["steps"])
