@@ -5,9 +5,8 @@ namespace dvb
 	class EventBus;
 	class ToolRegistry;
 
-	// Register the versioned `input` tool. The keyboard capability is advertised from
-	// kPostLoad, but mutation reports 503 until MarkKeyboardInputReady() is called at
-	// kInputLoaded and Skyrim's native input queue exists.
+	// Register the versioned `input` tool. Keyboard and the atomic VR tracked-set capability
+	// are advertised from kPostLoad; mutation reports 503 until their kInputLoaded seams exist.
 	void RegisterInputTool(ToolRegistry& a_registry, EventBus& a_events);
 	void MarkKeyboardInputReady();
 

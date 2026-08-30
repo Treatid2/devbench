@@ -151,7 +151,8 @@ namespace dvb::Recording
 				out["value"] = button->Value();
 				out["heldSeconds"] = button->HeldDuration();
 				out["state"] = button->IsDown() ? "down" : button->IsHeld() ? "held" :
-					button->IsUp() ? "up" : "changed";
+				                                       button->IsUp()       ? "up" :
+				                                                              "changed";
 				if (REL::Module::IsVR())
 					if (const auto* wand = button->AsVRWandEvent())
 						out["wandIndex"] = wand->unkVR28;
@@ -233,10 +234,18 @@ namespace dvb::Recording
 						return nullptr;
 					const auto& t = a_node->world;
 					return json::array({
-						t.translate.x, t.translate.y, t.translate.z,
-						t.rotate.entry[0][0], t.rotate.entry[0][1], t.rotate.entry[0][2],
-						t.rotate.entry[1][0], t.rotate.entry[1][1], t.rotate.entry[1][2],
-						t.rotate.entry[2][0], t.rotate.entry[2][1], t.rotate.entry[2][2],
+						t.translate.x,
+						t.translate.y,
+						t.translate.z,
+						t.rotate.entry[0][0],
+						t.rotate.entry[0][1],
+						t.rotate.entry[0][2],
+						t.rotate.entry[1][0],
+						t.rotate.entry[1][1],
+						t.rotate.entry[1][2],
+						t.rotate.entry[2][0],
+						t.rotate.entry[2][1],
+						t.rotate.entry[2][2],
 						t.scale,
 					});
 				};
@@ -264,10 +273,11 @@ namespace dvb::Recording
 				compositor = openvr->vrContext.vrCompositor;
 			if (!system || !compositor)
 				return nullptr;
-			const auto trackingOrigin = compositor->GetTrackingSpace();
-			const char* trackingOriginName = trackingOrigin == vr::TrackingUniverseSeated ? "seated" :
-				trackingOrigin == vr::TrackingUniverseStanding ? "standing" :
-				trackingOrigin == vr::TrackingUniverseRawAndUncalibrated ? "rawAndUncalibrated" : "unknown";
+			const auto  trackingOrigin = compositor->GetTrackingSpace();
+			const char* trackingOriginName = trackingOrigin == vr::TrackingUniverseSeated             ? "seated" :
+			                                 trackingOrigin == vr::TrackingUniverseStanding           ? "standing" :
+			                                 trackingOrigin == vr::TrackingUniverseRawAndUncalibrated ? "rawAndUncalibrated" :
+			                                                                                            "unknown";
 
 			std::array<vr::TrackedDevicePose_t, vr::k_unMaxTrackedDeviceCount> poses{};
 			if (compositor->GetLastPoses(poses.data(), static_cast<std::uint32_t>(poses.size()),
@@ -279,8 +289,11 @@ namespace dvb::Recording
 					return json{ { "role", a_role }, { "available", false } };
 				const auto& p = poses[a_index];
 				json        out{
-					{ "role", a_role }, { "available", true }, { "index", a_index },
-					{ "connected", p.bDeviceIsConnected }, { "valid", p.bPoseIsValid },
+					{ "role", a_role },
+					{ "available", true },
+					{ "index", a_index },
+					{ "connected", p.bDeviceIsConnected },
+					{ "valid", p.bPoseIsValid },
 					{ "trackingResult", static_cast<int>(p.eTrackingResult) },
 					{ "velocity", json::array({ p.vVelocity.v[0], p.vVelocity.v[1], p.vVelocity.v[2] }) },
 					{ "angularVelocity", json::array({ p.vAngularVelocity.v[0], p.vAngularVelocity.v[1], p.vAngularVelocity.v[2] }) },
@@ -292,6 +305,19 @@ namespace dvb::Recording
 							matrix.push_back(p.mDeviceToAbsoluteTracking.m[row][col]);
 					out["matrix"] = std::move(matrix);
 				}
+				out["deviceClass"] = static_cast<int>(system->GetTrackedDeviceClass(a_index));
+				if (std::string_view(a_role) != "hmd") {
+					vr::VRControllerState_t state{};
+					if (system->GetControllerState(a_index, &state, sizeof(state))) {
+						json axes = json::array();
+						for (std::uint32_t axis = 0; axis < 5; ++axis) {
+							axes.push_back(json::array({ state.rAxis[axis].x, state.rAxis[axis].y }));
+						}
+						out["controller"] = json{ { "packetNumber", state.unPacketNum },
+							{ "pressed", state.ulButtonPressed }, { "touched", state.ulButtonTouched },
+							{ "axes", std::move(axes) } };
+					}
+				}
 				return out;
 			};
 
@@ -300,9 +326,11 @@ namespace dvb::Recording
 				{ "originCode", static_cast<int>(trackingOrigin) },
 				{ "hmd", encode(vr::k_unTrackedDeviceIndex_Hmd, "hmd") },
 				{ "left", encode(system->GetTrackedDeviceIndexForControllerRole(
-					vr::TrackedControllerRole_LeftHand), "left") },
+									 vr::TrackedControllerRole_LeftHand),
+							  "left") },
 				{ "right", encode(system->GetTrackedDeviceIndexForControllerRole(
-					vr::TrackedControllerRole_RightHand), "right") },
+									  vr::TrackedControllerRole_RightHand),
+							   "right") },
 			};
 		}
 
@@ -370,9 +398,9 @@ namespace dvb::Recording
 			std::thread              worker;
 			std::mutex               mtx;
 			std::vector<json>        samples;
-			std::vector<json>        commands;     // console commands seen mid-recording: { command, frame }
-			std::vector<json>        checkpoints;  // screenshot checkpoints marked mid-recording: { id, atMs, excludeUi }
-			std::vector<json>        activityEvents;  // input/menu/lifecycle/cell on the same monotonic clock
+			std::vector<json>        commands;         // console commands seen mid-recording: { command, frame }
+			std::vector<json>        checkpoints;      // screenshot checkpoints marked mid-recording: { id, atMs, excludeUi }
+			std::vector<json>        activityEvents;   // input/menu/lifecycle/cell on the same monotonic clock
 			std::vector<json>        trackingSamples;  // raw OpenVR tracking space; available before player load
 			std::uint64_t            nextActivitySeq = 1;
 			json                     manifest;
@@ -532,15 +560,18 @@ namespace dvb::Recording
 			meta["activityCapture"] = ActivityCaptureContract();
 			meta["trackingCapture"] = json{
 				{ "name", "devbench.recording.openvrTracking" },
-				{ "version", json{ { "major", 1 }, { "minor", 0 } } },
+				{ "version", json{ { "major", 2 }, { "minor", 0 } } },
 				{ "source", "IVRCompositor.GetLastPoses" },
 				{ "origin", "captured per sample from IVRCompositor.GetTrackingSpace" },
 				{ "devices", json::array({ "hmd", "left", "right" }) },
 				{ "transformEncoding", "OpenVR device-to-absolute 3x4 row-major" },
 				{ "velocityEncoding", "tracking-space metres/second" },
 				{ "angularVelocityEncoding", "tracking-space radians/second" },
+				{ "controllerEncoding", "OpenVR packetNumber/pressed/touched/five axes" },
+				{ "identity", json::array({ "device index", "class", "role" }) },
 				{ "availableBeforePlayerLoad", true },
-				{ "replay", false },
+				{ "replay", true },
+				{ "replayDevice", "input.vrTrackedSet" },
 			};
 			meta["poseCapture"] = json{
 				{ "name", "devbench.recording.pose" },
@@ -646,6 +677,11 @@ namespace dvb::Recording
 				return json{ { "error", "player not loaded — load a game or pass allowNoPlayer=true to capture main-menu/new-game activity" } };
 			}
 			const bool anchored = manifest.contains("anchor");
+			const std::string correlationId = a_args.value("correlationId", std::string{});
+			if (correlationId.size() > 128)
+				return json{ { "error", "correlationId must contain at most 128 characters" } };
+			if (!correlationId.empty())
+				manifest["correlationId"] = correlationId;
 			json       openMenus = json::array();
 			for (const auto& menu : GetOpenMenus())
 				openMenus.push_back(menu);
@@ -673,11 +709,12 @@ namespace dvb::Recording
 			rec.worker = std::thread([&rec] { rec.Sample(); });
 
 			a_events.Publish("record.started", json{ { "intervalMs", interval },
-				{ "anchored", anchored }, { "activityCapture", ActivityCaptureContract() } });
+												   { "anchored", anchored }, { "activityCapture", ActivityCaptureContract() } });
 			Notify("devbench: recording started");
 			logs::info("devbench: recording started (interval {}ms)", interval);
 			return json{ { "action", "start" }, { "recording", true }, { "intervalMs", interval },
-				{ "anchored", anchored }, { "activityCapture", ActivityCaptureContract() } };
+				{ "anchored", anchored }, { "correlationId", correlationId },
+				{ "activityCapture", ActivityCaptureContract() } };
 		}
 
 		if (action == "checkpoint") {
@@ -731,10 +768,10 @@ namespace dvb::Recording
 			// slashes verbatim, so string() mixed both in one path — fragile for callers that
 			// split on '/'. generic_string() normalizes the whole path to forward slashes.
 			const std::string pathStr = path.generic_string();
-			const json activityCounts = SummarizeActivity(rec.activityEvents);
+			const json        activityCounts = SummarizeActivity(rec.activityEvents);
 			a_events.Publish("record.stopped", json{ { "sampleCount", rec.samples.size() },
-				{ "trackingSampleCount", rec.trackingSamples.size() },
-				{ "activityCounts", activityCounts }, { "path", pathStr } });
+												   { "trackingSampleCount", rec.trackingSamples.size() },
+												   { "activityCounts", activityCounts }, { "path", pathStr } });
 			Notify(std::format("devbench: recording stopped — {} samples, {:.1f}s", rec.samples.size(), recordedMs / 1000.0));
 			logs::info("devbench: recording stopped — {} samples, {}ms -> {}", rec.samples.size(), recordedMs, pathStr);
 			return json{
@@ -753,6 +790,7 @@ namespace dvb::Recording
 			std::lock_guard lock(rec.mtx);
 			return json{
 				{ "recording", rec.running.load() },
+				{ "correlationId", rec.manifest.value("correlationId", std::string{}) },
 				{ "sampleCount", rec.samples.size() },
 				{ "trackingSampleCount", rec.trackingSamples.size() },
 				{ "intervalMs", rec.intervalMs },
@@ -1221,11 +1259,16 @@ namespace dvb::Recording
 		const json        checkpoints = captureCheckpoints ? SortedCheckpoints(meta) : json::array();
 		const std::string recordingStem = fs::path(path).stem().string();
 		const bool        replayInputs = a_args.value("replayInputs", true);
+		const std::string inputOwner = "recording:" + recordingStem;
 		const json        activityPlan = InterleaveReplayableActivity(rec["steps"],
-			rec.value("activityEvents", json::array()), "recording:" + recordingStem, replayInputs);
+			rec.value("activityEvents", json::array()), inputOwner, replayInputs);
+		const json        vrPlan = BuildVRTrackedSetReplay(rec.value("trackingSamples", json::array()),
+			rec.value("activityEvents", json::array()), inputOwner, replayInputs);
 		const json&       trajectory = activityPlan["steps"];
 		long              cumMs = 0;
 		size_t            cpIdx = 0;
+		if (!vrPlan.value("step", json(nullptr)).is_null())
+			steps.push_back(vrPlan["step"]);
 		for (const auto& s : trajectory) {
 			steps.push_back(s);
 			if (s.contains("wait"))
@@ -1242,16 +1285,28 @@ namespace dvb::Recording
 			while (cpIdx < checkpoints.size() && checkpoints[cpIdx].value("atMs", 0LL) <= cumMs)
 				AppendCheckpointSteps(steps, checkpoints[cpIdx++], captureCap, recordingStem, a_args, cumMs, g_captureSettleMs);
 		}
+		// A main-menu/new-game trace may have no player trajectory for its opening portion. Keep the
+		// scenario alive until the atomic VR stream finishes instead of immediately cleaning it up.
+		const long vrDurationMs = vrPlan.value("durationMs", 0L);
+		if (vrDurationMs > cumMs) {
+			steps.push_back(json{ { "wait", vrDurationMs - cumMs } });
+			cumMs = vrDurationMs;
+		}
 		// Checkpoints anchored past the end of the trajectory still fire, at the end.
 		while (cpIdx < checkpoints.size())
 			AppendCheckpointSteps(steps, checkpoints[cpIdx++], captureCap, recordingStem, a_args, cumMs, g_captureSettleMs);
 
 		// Return the steps plus the effective coupling so the caller can surface what it
 		// actually did (which tier ran, whether the consumer overrode the producer's signal).
+		json activity = activityPlan.value("report", json::object());
+		activity["vrTrackedSet"] = vrPlan.value("report", json::object());
 		return json{
 			{ "steps", std::move(steps) },
-			{ "activity", activityPlan.value("report", json::object()) },
-			{ "inputOwner", activityPlan.value("inputOwner", std::string{}) },
+			{ "activity", std::move(activity) },
+			{ "inputOwner", (!activityPlan.value("inputOwner", std::string{}).empty() ||
+								!vrPlan.value("inputOwner", std::string{}).empty()) ?
+								inputOwner :
+								std::string{} },
 			{ "restored", restored },  // handler's sync menu pre-check skips restore plans (the load clears menus)
 			{ "allowsInitialMenus", allowsInitialMenus },
 			{ "coupling", json{

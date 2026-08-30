@@ -4,6 +4,7 @@
 
 using dvb::json;
 using dvb::Recording::ActivityCaptureContract;
+using dvb::Recording::BuildVRTrackedSetReplay;
 using dvb::Recording::InterleaveReplayableActivity;
 using dvb::Recording::SummarizeActivity;
 
@@ -24,7 +25,8 @@ TEST_CASE("activity contract declares capture-all and partial replay honestly")
 	CHECK(contract["version"]["major"] == 1);
 	CHECK(contract["inputLayer"] == "Skyrim.BSInputDeviceManager");
 	CHECK(contract["replay"]["keyboardButtonTransitions"] == true);
-	CHECK(contract["replay"]["controllerButtonTransitions"] == false);
+	CHECK(contract["replay"]["vrTrackedInputFrames"] == true);
+	CHECK(contract["replay"]["controllerButtonTransitions"] == true);
 }
 
 TEST_CASE("activity summary separates replayable keyboard transitions from preserved input")
@@ -40,7 +42,58 @@ TEST_CASE("activity summary separates replayable keyboard transitions from prese
 	CHECK(summary["input"] == 3);
 	CHECK(summary["menu"] == 1);
 	CHECK(summary["keyboardTransitions"] == 1);
-	CHECK(summary["unsupportedInput"] == 2);
+	CHECK(summary["vrControllerEvents"] == 1);
+	CHECK(summary["unsupportedInput"] == 1);
+}
+
+TEST_CASE("legacy controller events become atomic tracked-set frames without losing short presses")
+{
+	const auto pose = [](int index) {
+		return json{ { "available", true }, { "connected", true }, { "valid", true },
+			{ "index", index }, { "trackingResult", 200 },
+			{ "matrix", json::array({ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 }) },
+			{ "velocity", json::array({ 0, 0, 0 }) },
+			{ "angularVelocity", json::array({ 0, 0, 0 }) } };
+	};
+	const json samples = json::array({
+		json{ { "tMs", 20 }, { "originCode", 1 }, { "hmd", pose(0) },
+			{ "left", pose(1) }, { "right", pose(2) } },
+		json{ { "tMs", 100 }, { "originCode", 1 }, { "hmd", pose(0) },
+			{ "left", pose(1) }, { "right", pose(2) } },
+	});
+	json       down = Button(40, 1, "oculusPrimary", "down", 33);
+	down["wandIndex"] = 2;
+	json up = Button(60, 2, "oculusPrimary", "up", 33);
+	up["wandIndex"] = 2;
+	const json plan = BuildVRTrackedSetReplay(samples, json::array({ down, up }),
+		"recording:test", true);
+
+	CHECK(plan["step"]["tool"] == "input");
+	CHECK(plan["step"]["args"]["device"] == "vrTrackedSet");
+	CHECK(plan["step"]["args"]["surviveLifecycle"] == true);
+	const auto& frames = plan["step"]["args"]["frames"];
+	CHECK(frames.size() == 5);
+	CHECK(frames[0]["tMs"] == 0);
+	CHECK(frames[2]["tMs"] == 40);
+	CHECK(frames[2]["right"]["controller"]["pressed"].get<std::uint64_t>() == (std::uint64_t{ 1 } << 33));
+	CHECK(frames[3]["tMs"] == 60);
+	CHECK(frames[3]["right"]["controller"]["pressed"] == 0);
+	CHECK(plan["durationMs"] == 100);
+	CHECK(plan["report"]["convertedControllerEvents"] == 2);
+	CHECK(plan["report"]["roleFallbackEvents"] == 0);
+}
+
+TEST_CASE("trajectory atMs preserves an initial no-player recording delay")
+{
+	const json   steps = json::array({
+		json{ { "atMs", 125 }, { "pose", json::array({ 1, 2, 3, 4, 5 }) }, { "wait", 25 } },
+	});
+	const json   plan = InterleaveReplayableActivity(steps, json::array(), "recording:test", true);
+	std::int64_t totalWait = 0;
+	for (const auto& step : plan["steps"])
+		if (step.contains("wait"))
+			totalWait += step["wait"].get<std::int64_t>();
+	CHECK(totalWait == 150);
 }
 
 TEST_CASE("keyboard transitions interleave without changing the original trajectory clock")

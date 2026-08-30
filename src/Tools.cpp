@@ -2287,12 +2287,13 @@ namespace dvb
 			"replay.finished on GET /api/events (both carry runId; the runId space is shared with "
 			"scenario, so a replay's runId also resolves via scenario{action:'status'}). Pass "
 			"async:false to block the request for the run's duration and get the result object "
-			"directly. On VR, raw OpenVR HMD/controller tracking is sampled even before a player exists "
-			"and preserved as a versioned non-replayable trackingSamples stream. "
-			"replayInputs=true (default) interleaves the input classes the current contract "
-			"can reproduce: keyboard button down/up transitions. Controller, analog, pointer, menu, "
-			"and lifecycle events remain explicitly reported as skipped until their injection contract "
-			"exists; replay never claims they ran. Set replayInputs=false for the old pose-only behavior. "
+			"directly. On VR, OpenVR HMD/controller poses and complete controller packet/button/touch/axis "
+			"state are sampled even before a player exists. replayInputs=true (default) starts one atomic "
+			"HMD+left+right tracked-set sequence and interleaves keyboard transitions on the same recording "
+			"clock. Legacy recording-3 files without exact controller packets are upgraded from their "
+			"wand-indexed normalized events using previous-pose hold; the replay report identifies fallback "
+			"or unsupported events. Mouse/gamepad/menu/lifecycle events remain observational and explicitly "
+			"reported rather than silently approximated. Set replayInputs=false for pose-only behavior. "
 			"If the recording has meta.checkpoints, each expands into a `capture` step "
 			"at the point in the trajectory its atMs was recorded, tagged with 'variant' for "
 			"correlation (default 'default') — see the `capture` tool. Pass "
@@ -2311,11 +2312,12 @@ namespace dvb
 								{ "action", json{ { "type", "string" }, { "enum", json::array({ "start", "stop", "status", "replay", "checkpoint" }) }, { "description", "start | stop | status | replay | checkpoint" } } },
 								{ "intervalMs", json{ { "type", "integer" }, { "description", "start: player-pose and raw-VR-tracking sample period in ms (default = config recordIntervalMs, min 10)" } } },
 								{ "allowNoPlayer", json{ { "type", "boolean" }, { "description", "start: permit a main-menu/new-game recording before a PlayerCharacter is loaded (default false)" } } },
+								{ "correlationId", json{ { "type", "string" }, { "maxLength", 128 }, { "description", "start: caller correlation identifier retained in status and recording metadata" } } },
 								{ "id", json{ { "type", "string" }, { "description", "checkpoint: unique id for this checkpoint (required)" } } },
 								{ "excludeUi", json{ { "type", "boolean" }, { "description", "checkpoint: request a pre-UI capture source at replay (default true) — see the `capture` tool" } } },
 								{ "path", json{ { "type", "string" }, { "description", "replay: recording file to play back (from stop's 'path')" } } },
 								{ "restoreScene", json{ { "type", "boolean" }, { "description", "replay: re-establish the recorded entryPoint + wait for load before the trajectory (default false)" } } },
-								{ "replayInputs", json{ { "type", "boolean" }, { "description", "replay: interleave declared-replayable activity input (currently keyboard down/up only; default true); false replays pose/commands only" } } },
+								{ "replayInputs", json{ { "type", "boolean" }, { "description", "replay: run the atomic OpenVR HMD+both-controller stream and interleave keyboard transitions (default true); false replays pose/commands only" } } },
 								{ "variant", json{ { "type", "string" }, { "description", "replay: tag for any meta.checkpoints captures, for correlation (default 'default')" } } },
 								{ "captureCheckpoints", json{ { "type", "boolean" }, { "description", "replay: expand meta.checkpoints into capture steps (default true) — pass false for a plain trajectory-only replay of a checkpoint-bearing recording (no provider required, nothing captured)" } } },
 								{ "goldens", json{ { "type", "object" }, { "description", "replay: per-checkpoint SSIM comparison config, keyed by checkpoint id — {\"<id>\": {golden, threshold?, regions?}} — see the `capture` tool. Never stored in the recording itself; supply it fresh per replay so the same recording can check against different variants' goldens." } } },
@@ -2363,14 +2365,14 @@ namespace dvb
 					for (const auto& s : steps)
 						if (s.contains("wait"))
 							estMs += s["wait"].get<long>();
-					const uint64_t runId = RunRegistry::Get().NextId();
-					const json activity = plan.value("activity", json::object());
+					const uint64_t    runId = RunRegistry::Get().NextId();
+					const json        activity = plan.value("activity", json::object());
 					const std::string inputOwner = plan.value("inputOwner", std::string{});
 					Recording::Notify(std::format("devbench: replaying {} steps (~{:.1f}s)", steps.size(), estMs / 1000.0));
 					logs::info("devbench: replay starting — {} steps, ~{}ms", steps.size(), estMs);
 					a_events.Publish("replay.started", json{ { "runId", runId }, { "steps", steps.size() },
-						{ "estMs", estMs }, { "path", a_args.value("path", std::string{}) },
-						{ "activity", activity } });
+														   { "estMs", estMs }, { "path", a_args.value("path", std::string{}) },
+														   { "activity", activity } });
 
 					// Captured by value: a_ctx is request-scoped and this may run on a detached
 					// thread past this handler's return; steps/coupling are already independent
@@ -2378,20 +2380,32 @@ namespace dvb
 					// it would otherwise hang when a step throws.
 					const json coupling = plan.value("coupling", json::object());
 					auto       runReplay = [&a_registry, &a_events, a_ctx, steps, runId, coupling,
-						activity, inputOwner]() -> json {
+											   activity, inputOwner]() -> json {
 						const auto releaseRecordedInput = [&]() -> json {
 							if (inputOwner.empty())
 								return json{ { "needed", false } };
 							ToolContext inputCtx = a_ctx;
 							inputCtx.internal = true;
-							const ToolResult released = a_registry.Invoke("input", json{
-								{ "action", "releaseAll" }, { "device", "keyboard" },
-								{ "owner", inputOwner },
-							}, inputCtx);
-							if (released.ok)
-								return json{ { "needed", true }, { "ok", true }, { "result", released.value } };
-							return json{ { "needed", true }, { "ok", false },
-								{ "errorCode", released.errorCode }, { "error", released.errorMessage } };
+							json results = json::array();
+							bool ok = true;
+							for (const char* device : { "keyboard", "vrTrackedSet" }) {
+								const ToolResult released = a_registry.Invoke("input", json{
+																						   { "action", "releaseAll" },
+																						   { "device", device },
+																						   { "owner", inputOwner },
+																					   },
+									inputCtx);
+								json             item{ { "device", device }, { "ok", released.ok } };
+								if (released.ok)
+									item["result"] = released.value;
+								else {
+									ok = false;
+									item["errorCode"] = released.errorCode;
+									item["error"] = released.errorMessage;
+								}
+								results.push_back(std::move(item));
+							}
+							return json{ { "needed", true }, { "ok", ok }, { "results", std::move(results) } };
 						};
 						// Clear a same-owner lease left by an interrupted prior replay before injecting.
 						releaseRecordedInput();

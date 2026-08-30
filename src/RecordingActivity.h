@@ -13,9 +13,17 @@ namespace dvb::Recording
 	json ActivityCaptureContract();
 	json SummarizeActivity(const json& a_events);
 
-	// Returns { steps, report, inputOwner }. Only keyboard button down/up transitions are
-	// currently replayable. All other captured input remains in the recording and is counted
-	// explicitly in report.skippedInput; it is never silently approximated.
+	// Convert the synchronized OpenVR tracking stream plus legacy normalized controller events
+	// into one coherent tracked-set sequence step. New recordings already carry exact controller
+	// state in each tracking sample; older recording-3 captures are upgraded by inserting frames at
+	// controller event timestamps and carrying the most recent pose forward.
+	// Returns { step|null, report, inputOwner, durationMs }.
+	json BuildVRTrackedSetReplay(const json& a_trackingSamples, const json& a_events,
+		const std::string& a_inputOwner, bool a_replayInputs);
+
+	// Returns { steps, report, inputOwner }. Keyboard button down/up transitions are interleaved
+	// here. The synchronized VR tracked-set stream is assembled separately by
+	// BuildVRTrackedSetReplay so both device families retain their own atomic timing contract.
 	json InterleaveReplayableActivity(const json& a_steps, const json& a_events,
 		const std::string& a_inputOwner, bool a_replayInputs);
 }
