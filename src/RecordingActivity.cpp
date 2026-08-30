@@ -1,8 +1,12 @@
 #include "RecordingActivity.h"
 
+#include "VRInputState.h"
+
 #include <algorithm>
 #include <cstdint>
+#include <format>
 #include <map>
+#include <stdexcept>
 #include <vector>
 
 namespace dvb::Recording
@@ -189,27 +193,31 @@ namespace dvb::Recording
 	json BuildVRTrackedSetReplay(const json& a_trackingSamples, const json& a_events,
 		const std::string& a_inputOwner, bool a_replayInputs)
 	{
-		json report{
-			{ "enabled", a_replayInputs },
-			{ "sourceTrackingSamples", 0 },
-			{ "emittedFrames", 0 },
-			{ "convertedControllerEvents", 0 },
-			{ "unsupportedControllerEvents", 0 },
-			{ "roleFallbackEvents", 0 },
-			{ "exactControllerStateSamples", 0 },
+		constexpr int kReplayTailMs = 50;
+		json          report{
+					 { "enabled", a_replayInputs },
+					 { "sourceTrackingSamples", 0 },
+					 { "emittedFrames", 0 },
+					 { "convertedControllerEvents", 0 },
+					 { "unsupportedControllerEvents", 0 },
+					 { "roleFallbackEvents", 0 },
+					 { "exactControllerStateSamples", 0 },
 		};
 		if (!a_replayInputs || !a_trackingSamples.is_array() || a_trackingSamples.empty())
 			return json{ { "step", nullptr }, { "report", std::move(report) },
 				{ "inputOwner", "" }, { "durationMs", 0 } };
 
 		std::map<std::int64_t, json> timeline;
-		for (const auto& sample : a_trackingSamples) {
+		for (std::size_t sampleIndex = 0; sampleIndex < a_trackingSamples.size(); ++sampleIndex) {
+			const auto& sample = a_trackingSamples[sampleIndex];
 			if (!sample.is_object() || !sample.contains("tMs") || !sample["tMs"].is_number_integer())
-				continue;
+				throw std::invalid_argument(std::format("trackingSamples[{}].tMs must be an integer", sampleIndex));
 			const auto tMs = sample["tMs"].get<std::int64_t>();
 			if (tMs < 0)
-				continue;
-			timeline[tMs] = sample;
+				throw std::invalid_argument(std::format("trackingSamples[{}].tMs must be non-negative", sampleIndex));
+			if (timeline.contains(tMs))
+				throw std::invalid_argument(std::format("trackingSamples[{}].tMs duplicates {}", sampleIndex, tMs));
+			timeline.emplace(tMs, sample);
 			report["sourceTrackingSamples"] = report["sourceTrackingSamples"].get<std::size_t>() + 1;
 			if (sample.value("left", json::object()).contains("controller") &&
 				sample.value("right", json::object()).contains("controller"))
@@ -229,9 +237,16 @@ namespace dvb::Recording
 
 		std::vector<json> controllerEvents;
 		if (a_events.is_array())
-			for (const auto& event : a_events)
-				if (IsVRControllerEvent(event) && event.contains("tMs") && event["tMs"].is_number_integer())
-					controllerEvents.push_back(event);
+			for (std::size_t eventIndex = 0; eventIndex < a_events.size(); ++eventIndex) {
+				const auto& event = a_events[eventIndex];
+				if (!IsVRControllerEvent(event))
+					continue;
+				if (!event.contains("tMs") || !event["tMs"].is_number_integer())
+					throw std::invalid_argument(std::format("activityEvents[{}].tMs must be an integer", eventIndex));
+				if (event["tMs"].get<std::int64_t>() < 0)
+					throw std::invalid_argument(std::format("activityEvents[{}].tMs must be non-negative", eventIndex));
+				controllerEvents.push_back(event);
+			}
 		std::stable_sort(controllerEvents.begin(), controllerEvents.end(), [](const json& a, const json& b) {
 			const auto at = a.value("tMs", std::int64_t{ 0 });
 			const auto bt = b.value("tMs", std::int64_t{ 0 });
@@ -265,7 +280,7 @@ namespace dvb::Recording
 		json          frames = json::array();
 		for (auto& [tMs, frame] : timeline) {
 			if (!frame.contains("hmd") || !frame.contains("left") || !frame.contains("right"))
-				continue;
+				throw std::invalid_argument(std::format("tracking sample at {}ms must contain hmd, left, and right", tMs));
 			if (frame["left"].contains("controller"))
 				leftState = frame["left"]["controller"];
 			if (frame["right"].contains("controller"))
@@ -290,7 +305,14 @@ namespace dvb::Recording
 			frame["right"]["controller"] = rightState;
 			frames.push_back(std::move(frame));
 		}
-		const auto durationMs = frames.empty() ? 0 : frames.back().value("tMs", std::int64_t{ 0 });
+		if (!frames.empty()) {
+			const auto validated = ParseVRTrackedInputFrames(frames);
+			frames = json::array();
+			for (const auto& frame : validated)
+				frames.push_back(VRTrackedInputFrameJson(frame));
+		}
+		const auto durationMs = frames.empty() ? 0 :
+		                                         frames.back().value("tMs", std::int64_t{ 0 }) + kReplayTailMs;
 		report["emittedFrames"] = frames.size();
 		report["convertedControllerEvents"] = converted;
 		report["unsupportedControllerEvents"] = unsupported;
@@ -305,6 +327,7 @@ namespace dvb::Recording
 													  { "device", "vrTrackedSet" },
 													  { "owner", a_inputOwner },
 													  { "surviveLifecycle", true },
+													  { "tailMs", kReplayTailMs },
 													  { "frames", std::move(frames) },
 												  } },
 			{ "label", "recorded atomic HMD and controller input" } };
@@ -337,16 +360,16 @@ namespace dvb::Recording
 		std::size_t  eventIndex = 0;
 		std::int64_t clockMs = 0;
 		const auto   emitThrough = [&](std::int64_t a_endMs, json& a_out, std::int64_t& a_clock,
-									   std::size_t& a_index) {
-			while (a_index < replayable.size() &&
-				   replayable[a_index].value("tMs", static_cast<std::int64_t>(0)) <= a_endMs) {
-				const auto eventMs = std::max(a_clock,
-					replayable[a_index].value("tMs", static_cast<std::int64_t>(0)));
-				AppendWait(a_out, eventMs - a_clock);
-				a_clock = eventMs;
-				a_out.push_back(InputStep(replayable[a_index], a_inputOwner));
-				++a_index;
-			}
+                                     std::size_t& a_index) {
+            while (a_index < replayable.size() &&
+                   replayable[a_index].value("tMs", static_cast<std::int64_t>(0)) <= a_endMs) {
+                const auto eventMs = std::max(a_clock,
+					  replayable[a_index].value("tMs", static_cast<std::int64_t>(0)));
+                AppendWait(a_out, eventMs - a_clock);
+                a_clock = eventMs;
+                a_out.push_back(InputStep(replayable[a_index], a_inputOwner));
+                ++a_index;
+            }
 		};
 
 		if (a_steps.is_array()) {

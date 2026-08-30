@@ -1,6 +1,7 @@
 #include "VRInput.h"
 
 #include "EventBus.h"
+#include "MainThread.h"
 #include "ToolRegistry.h"
 #include "VRInputState.h"
 
@@ -25,6 +26,24 @@ namespace dvb
 		constexpr int         kMaximumTailMs = 1000;
 
 		std::atomic<bool> g_vrReady{ false };
+
+		bool BooleanArgument(const json& a_args, const char* a_name, bool a_default)
+		{
+			if (!a_args.contains(a_name))
+				return a_default;
+			if (!a_args.at(a_name).is_boolean())
+				throw ToolError(400, std::format("'{}' must be a boolean", a_name));
+			return a_args.at(a_name).get<bool>();
+		}
+
+		int IntegerArgument(const json& a_args, const char* a_name, int a_default)
+		{
+			if (!a_args.contains(a_name))
+				return a_default;
+			if (!a_args.at(a_name).is_number_integer())
+				throw ToolError(400, std::format("'{}' must be an integer", a_name));
+			return a_args.at(a_name).get<int>();
+		}
 
 		std::string ResolveOwner(const json& a_args, const ToolContext& a_ctx)
 		{
@@ -99,11 +118,13 @@ namespace dvb
 			{
 				std::lock_guard lock(m_mutex);
 				json            out{
-					{ "contract", ContractJson() },
-					{ "device", kDevice },
-					{ "ready", g_vrReady.load(std::memory_order_relaxed) },
-					{ "active", m_active },
-					{ "generation", m_generation },
+							   { "contract", ContractJson() },
+							   { "device", kDevice },
+							   { "ready", g_vrReady.load(std::memory_order_relaxed) },
+							   { "active", m_active },
+							   { "starting", m_starting },
+							   { "restoring", m_restoring },
+							   { "generation", m_generation },
 				};
 				if (m_active) {
 					out["owner"] = m_owner;
@@ -130,43 +151,62 @@ namespace dvb
 				std::vector<VRTrackedInputFrame> frames;
 				try {
 					frames = ParseVRTrackedInputFrames(a_args["frames"]);
-				} catch (const std::invalid_argument& e) {
+				} catch (const std::exception& e) {
 					throw ToolError(400, e.what());
 				}
-				const int tailMs = a_args.value("tailMs", kDefaultTailMs);
+				const int tailMs = IntegerArgument(a_args, "tailMs", kDefaultTailMs);
 				if (tailMs < 10 || tailMs > kMaximumTailMs)
 					throw ToolError(400, std::format("'tailMs' must be between 10 and {}", kMaximumTailMs));
-				const bool surviveLifecycle = a_args.value("surviveLifecycle", false);
+				const bool surviveLifecycle = BooleanArgument(a_args, "surviveLifecycle", false);
+				auto*      compositor = RE::BSOpenVR::GetIVRCompositor();
+				if (!compositor)
+					throw ToolError(503, "OpenVR compositor is unavailable");
+				const auto requestedOrigin = static_cast<vr::ETrackingUniverseOrigin>(frames.front().originCode);
+				if (compositor->GetTrackingSpace() != requestedOrigin)
+					throw ToolError(409, "recorded OpenVR origin does not match the compositor tracking space; select a compatible capture instead of mutating global tracking state");
 
 				std::uint64_t generation;
 				const auto    frameCount = frames.size();
 				const auto    durationMs = frames.back().tMs + tailMs;
+				const auto    started = steady_clock::now();
 				{
 					std::lock_guard lock(m_mutex);
-					if (m_active)
+					if (m_active || m_starting || m_restoring)
 						throw ToolError(409, std::format("VR tracked-set sequence is owned by '{}'", m_owner));
-					m_active = true;
+					m_starting = true;
 					m_owner = a_owner;
 					generation = ++m_generation;
-					m_frameIndex = 0;
-					m_frameCount = frameCount;
-					m_durationMs = durationMs;
-					m_surviveLifecycle = surviveLifecycle;
-					m_started = steady_clock::now();
-					m_current = frames.front();
-					m_lastCompletion = json::object();
 				}
 
-				QueueControllerIndices(frames);
-				if (auto* compositor = RE::BSOpenVR::GetIVRCompositor())
-					compositor->SetTrackingSpace(static_cast<vr::ETrackingUniverseOrigin>(frames.front().originCode));
+				try {
+					ApplyControllerIndices(generation, frames.front().left.pose.index,
+						frames.front().right.pose.index);
+					{
+						std::lock_guard lock(m_mutex);
+						if (!m_starting || m_generation != generation)
+							throw ToolError(409, "VR tracked-set activation was superseded");
+						m_starting = false;
+						m_active = true;
+						m_frameIndex = 0;
+						m_frameCount = frameCount;
+						m_durationMs = durationMs;
+						m_surviveLifecycle = surviveLifecycle;
+						m_started = started;
+						m_current = frames.front();
+						m_lastCompletion = json::object();
+					}
+					std::thread worker([this, generation, owner = a_owner,
+										   frames = std::move(frames), tailMs, started]() mutable {
+						Playback(generation, owner, std::move(frames), tailMs, started);
+					});
+					worker.detach();
+				} catch (...) {
+					AbortActivation(generation);
+					throw;
+				}
 				Publish("started", json{ { "owner", a_owner }, { "generation", generation },
 									   { "frameCount", frameCount }, { "durationMs", durationMs },
 									   { "surviveLifecycle", surviveLifecycle } });
-
-				std::thread([this, generation, owner = a_owner, frames = std::move(frames), tailMs]() mutable {
-					Playback(generation, owner, std::move(frames), tailMs);
-				}).detach();
 				return json{ { "contract", ContractJson() }, { "device", kDevice },
 					{ "action", "sequence" }, { "queued", true }, { "owner", a_owner },
 					{ "generation", generation }, { "frameCount", frameCount },
@@ -189,14 +229,10 @@ namespace dvb
 					}
 					owner = m_owner;
 					generation = m_generation;
-					m_active = false;
-					m_current.reset();
 					completion = json{ { "owner", owner }, { "generation", generation },
 						{ "reason", a_reason }, { "completed", false } };
-					m_lastCompletion = completion;
 				}
-				m_cv.notify_all();
-				Publish("stopped", std::move(completion));
+				Finish(generation, "stopped", std::move(completion));
 			}
 
 			json Stop(const std::string& a_owner, bool a_force, std::string_view a_reason)
@@ -213,17 +249,14 @@ namespace dvb
 						throw ToolError(409, std::format("VR tracked-set sequence is owned by '{}' (not '{}')", m_owner, a_owner));
 					owner = m_owner;
 					generation = m_generation;
-					m_active = false;
-					m_current.reset();
 					completion = json{ { "owner", owner }, { "generation", generation },
 						{ "reason", a_reason }, { "completed", false } };
-					m_lastCompletion = completion;
 				}
-				m_cv.notify_all();
-				Publish("stopped", std::move(completion));
+				const bool restored = Finish(generation, "stopped", std::move(completion));
 				return json{ { "contract", ContractJson() }, { "device", kDevice },
-					{ "action", "stop" }, { "stopped", true }, { "owner", owner },
-					{ "generation", generation }, { "reason", a_reason } };
+					{ "action", "stop" }, { "stopRequested", true }, { "stopped", restored }, { "owner", owner },
+					{ "generation", generation }, { "reason", a_reason },
+					{ "restored", restored }, { "restorationPending", !restored } };
 			}
 
 			std::optional<VRTrackedInputFrame> Current() const
@@ -234,12 +267,12 @@ namespace dvb
 
 		private:
 			void Playback(std::uint64_t a_generation, const std::string& a_owner,
-				std::vector<VRTrackedInputFrame> a_frames, int a_tailMs)
+				std::vector<VRTrackedInputFrame> a_frames, int a_tailMs,
+				steady_clock::time_point a_started)
 			{
-				const auto started = steady_clock::now();
 				for (std::size_t i = 1; i < a_frames.size(); ++i) {
 					std::unique_lock lock(m_mutex);
-					const auto       due = started + milliseconds(a_frames[i].tMs);
+					const auto       due = a_started + milliseconds(a_frames[i].tMs);
 					if (m_cv.wait_until(lock, due, [&] { return !m_active || m_generation != a_generation; }))
 						return;
 					m_current = a_frames[i];
@@ -249,62 +282,140 @@ namespace dvb
 				json completion;
 				{
 					std::unique_lock lock(m_mutex);
-					const auto       due = started + milliseconds(a_frames.back().tMs + a_tailMs);
+					const auto       due = a_started + milliseconds(a_frames.back().tMs + a_tailMs);
 					if (m_cv.wait_until(lock, due, [&] { return !m_active || m_generation != a_generation; }))
 						return;
-					m_active = false;
-					m_current.reset();
 					completion = json{ { "owner", a_owner }, { "generation", a_generation },
 						{ "reason", "complete" }, { "completed", true }, { "frameCount", a_frames.size() } };
-					m_lastCompletion = completion;
 				}
-				Publish("finished", std::move(completion));
+				Finish(a_generation, "finished", std::move(completion));
 			}
 
-			void QueueControllerIndices(const std::vector<VRTrackedInputFrame>& a_frames)
+			void ApplyControllerIndices(std::uint64_t a_generation, std::uint32_t a_left,
+				std::uint32_t a_right)
 			{
-				// BSOpenVRControllerDevice caches its index. Refresh the two existing device objects so
-				// a null-HMD runtime can consume the synthetic role indices returned by our IVRSystem hook.
-				// The objects are game-owned, so mutate them only on Skyrim's main thread. Validation makes
-				// each role's index invariant for the sequence; one queued refresh is sufficient.
-				std::optional<std::uint32_t> leftIndex;
-				std::optional<std::uint32_t> rightIndex;
-				for (const auto& frame : a_frames) {
-					if (!leftIndex && frame.left.pose.available)
-						leftIndex = frame.left.pose.index;
-					if (!rightIndex && frame.right.pose.available)
-						rightIndex = frame.right.pose.index;
-					if (leftIndex && rightIndex)
-						break;
-				}
-				if (auto* tasks = SKSE::GetTaskInterface())
-					tasks->AddTask([leftIndex, rightIndex]() {
-						if (auto* manager = RE::BSInputDeviceManager::GetSingleton()) {
-							if (auto* left = manager->GetVRControllerLeft(); left && leftIndex)
-								left->GetRuntimeData().trackedDeviceIndex = *leftIndex;
-							if (auto* right = manager->GetVRControllerRight(); right && rightIndex)
-								right->GetRuntimeData().trackedDeviceIndex = *rightIndex;
-						}
-					});
+				MainThread::RunAndWait([this, a_generation, a_left, a_right]() -> json {
+					std::lock_guard lock(m_mutex);
+					if (!m_starting || m_generation != a_generation)
+						return json{ { "applied", false }, { "superseded", true } };
+					auto* manager = RE::BSInputDeviceManager::GetSingleton();
+					auto* left = manager ? manager->GetVRControllerLeft() : nullptr;
+					auto* right = manager ? manager->GetVRControllerRight() : nullptr;
+					if (!left || !right)
+						throw ToolError(503, "Skyrim VR controller devices are unavailable");
+					m_previousLeftIndex = left->GetRuntimeData().trackedDeviceIndex;
+					m_previousRightIndex = right->GetRuntimeData().trackedDeviceIndex;
+					left->GetRuntimeData().trackedDeviceIndex = a_left;
+					right->GetRuntimeData().trackedDeviceIndex = a_right;
+					m_indicesApplied = true;
+					return json{ { "applied", true } };
+				});
 			}
 
-			void Publish(const char* a_state, json a_payload)
+			bool RestoreControllerIndices(std::uint64_t a_generation, std::string a_event,
+				json a_completion)
+			{
+				try {
+					const json result = MainThread::RunAndWait([this, a_generation,
+																   a_event = std::move(a_event), a_completion = std::move(a_completion)]() mutable -> json {
+						{
+							std::lock_guard lock(m_mutex);
+							if (!m_restoring || m_generation != a_generation)
+								return json{ { "restored", false }, { "superseded", true } };
+							if (m_indicesApplied) {
+								auto* manager = RE::BSInputDeviceManager::GetSingleton();
+								auto* left = manager ? manager->GetVRControllerLeft() : nullptr;
+								auto* right = manager ? manager->GetVRControllerRight() : nullptr;
+								if (!left || !right)
+									throw ToolError(503, "Skyrim VR controller devices are unavailable during restoration");
+								left->GetRuntimeData().trackedDeviceIndex = m_previousLeftIndex;
+								right->GetRuntimeData().trackedDeviceIndex = m_previousRightIndex;
+								m_indicesApplied = false;
+							}
+							m_restoring = false;
+							a_completion["controllerIndicesRestored"] = true;
+							m_lastCompletion = a_completion;
+						}
+						if (!a_event.empty())
+							Publish(a_event.c_str(), std::move(a_completion));
+						return json{ { "restored", true } };
+					});
+					return result.value("restored", false);
+				} catch (const std::exception& e) {
+					logs::warn("devbench: VR tracked-set controller restoration pending: {}", e.what());
+					return false;
+				}
+			}
+
+			void AbortActivation(std::uint64_t a_generation)
+			{
+				bool restore = false;
+				{
+					std::lock_guard lock(m_mutex);
+					if (m_generation != a_generation)
+						return;
+					m_starting = false;
+					m_active = false;
+					m_current.reset();
+					m_restoring = m_indicesApplied;
+					restore = m_indicesApplied;
+				}
+				m_cv.notify_all();
+				if (restore)
+					RestoreControllerIndices(a_generation, {}, json::object());
+			}
+
+			bool Finish(std::uint64_t a_generation, const char* a_event, json a_completion)
+			{
+				bool restore = false;
+				{
+					std::lock_guard lock(m_mutex);
+					if (m_generation != a_generation)
+						return false;
+					m_active = false;
+					m_current.reset();
+					m_restoring = m_indicesApplied;
+					restore = m_indicesApplied;
+					a_completion["controllerIndicesRestored"] = !restore;
+					m_lastCompletion = a_completion;
+				}
+				m_cv.notify_all();
+				if (restore)
+					return RestoreControllerIndices(a_generation, a_event, std::move(a_completion));
+				a_completion["controllerIndicesRestored"] = true;
+				{
+					std::lock_guard lock(m_mutex);
+					m_lastCompletion = a_completion;
+				}
+				Publish(a_event, std::move(a_completion));
+				return true;
+			}
+
+			void Publish(const char* a_state, json a_payload) noexcept
 			{
 				EventBus* events = nullptr;
 				{
 					std::lock_guard lock(m_mutex);
 					events = m_events;
 				}
-				if (events) {
-					a_payload["state"] = a_state;
-					events->Publish("input.vrTrackedSet", std::move(a_payload));
-				}
+				if (events)
+					try {
+						a_payload["state"] = a_state;
+						events->Publish("input.vrTrackedSet", std::move(a_payload));
+					} catch (const std::exception& e) {
+						logs::warn("devbench: VR tracked-set event publish failed: {}", e.what());
+					}
 			}
 
 			mutable std::mutex                 m_mutex;
 			std::condition_variable            m_cv;
 			EventBus*                          m_events = nullptr;
 			bool                               m_active = false;
+			bool                               m_starting = false;
+			bool                               m_restoring = false;
+			bool                               m_indicesApplied = false;
+			std::uint32_t                      m_previousLeftIndex = vr::k_unTrackedDeviceIndexInvalid;
+			std::uint32_t                      m_previousRightIndex = vr::k_unTrackedDeviceIndexInvalid;
 			bool                               m_surviveLifecycle = false;
 			std::string                        m_owner;
 			std::uint64_t                      m_generation = 0;
@@ -316,20 +427,29 @@ namespace dvb
 			json                               m_lastCompletion = json::object();
 		};
 
-		void OverridePoseArray(vr::TrackedDevicePose_t* a_poses, std::uint32_t a_count)
+		bool CanOverridePoseArray(const VRTrackedInputFrame& a_frame,
+			vr::TrackedDevicePose_t* a_poses, std::uint32_t a_count)
 		{
+			if (a_count == 0)
+				return true;
 			if (!a_poses)
-				return;
-			const auto frame = VRTrackedSetManager::Get().Current();
-			if (!frame)
+				return false;
+			return a_frame.hmd.index < a_count && a_frame.left.pose.index < a_count &&
+			       a_frame.right.pose.index < a_count;
+		}
+
+		void OverridePoseArray(const VRTrackedInputFrame& a_frame,
+			vr::TrackedDevicePose_t* a_poses, std::uint32_t a_count)
+		{
+			if (a_count == 0)
 				return;
 			const auto apply = [&](const VRTrackedPoseState& a_pose) {
-				if (a_pose.available && a_pose.index < a_count)
+				if (a_pose.index < a_count)
 					a_poses[a_pose.index] = OpenVRPose(a_pose);
 			};
-			apply(frame->hmd);
-			apply(frame->left.pose);
-			apply(frame->right.pose);
+			apply(a_frame.hmd);
+			apply(a_frame.left.pose);
+			apply(a_frame.right.pose);
 		}
 
 		using WaitGetPosesFn = vr::EVRCompositorError (*)(vr::IVRCompositor*,
@@ -436,10 +556,16 @@ namespace dvb
 			vr::TrackedDevicePose_t* a_game, std::uint32_t a_gameCount)
 		{
 			const auto result = g_waitGetPoses(a_self, a_render, a_renderCount, a_game, a_gameCount);
-			const bool active = VRTrackedSetManager::Get().Current().has_value();
-			OverridePoseArray(a_render, a_renderCount);
-			OverridePoseArray(a_game, a_gameCount);
-			return active ? vr::VRCompositorError_None : result;
+			if (result != vr::VRCompositorError_None)
+				return result;
+			const auto frame = VRTrackedSetManager::Get().Current();
+			if (!frame || a_self->GetTrackingSpace() != static_cast<vr::ETrackingUniverseOrigin>(frame->originCode) ||
+				!CanOverridePoseArray(*frame, a_render, a_renderCount) ||
+				!CanOverridePoseArray(*frame, a_game, a_gameCount))
+				return result;
+			OverridePoseArray(*frame, a_render, a_renderCount);
+			OverridePoseArray(*frame, a_game, a_gameCount);
+			return vr::VRCompositorError_None;
 		}
 
 		vr::EVRCompositorError GetLastPosesHook(vr::IVRCompositor* a_self,
@@ -447,17 +573,26 @@ namespace dvb
 			vr::TrackedDevicePose_t* a_game, std::uint32_t a_gameCount)
 		{
 			const auto result = g_getLastPoses(a_self, a_render, a_renderCount, a_game, a_gameCount);
-			const bool active = VRTrackedSetManager::Get().Current().has_value();
-			OverridePoseArray(a_render, a_renderCount);
-			OverridePoseArray(a_game, a_gameCount);
-			return active ? vr::VRCompositorError_None : result;
+			if (result != vr::VRCompositorError_None)
+				return result;
+			const auto frame = VRTrackedSetManager::Get().Current();
+			if (!frame || a_self->GetTrackingSpace() != static_cast<vr::ETrackingUniverseOrigin>(frame->originCode) ||
+				!CanOverridePoseArray(*frame, a_render, a_renderCount) ||
+				!CanOverridePoseArray(*frame, a_game, a_gameCount))
+				return result;
+			OverridePoseArray(*frame, a_render, a_renderCount);
+			OverridePoseArray(*frame, a_game, a_gameCount);
+			return vr::VRCompositorError_None;
 		}
 
 		void GetTrackingPoseHook(vr::IVRSystem* a_self, vr::ETrackingUniverseOrigin a_origin,
 			float a_prediction, vr::TrackedDevicePose_t* a_poses, std::uint32_t a_count)
 		{
 			g_getTrackingPose(a_self, a_origin, a_prediction, a_poses, a_count);
-			OverridePoseArray(a_poses, a_count);
+			const auto frame = VRTrackedSetManager::Get().Current();
+			if (frame && a_origin == static_cast<vr::ETrackingUniverseOrigin>(frame->originCode) &&
+				CanOverridePoseArray(*frame, a_poses, a_count))
+				OverridePoseArray(*frame, a_poses, a_count);
 		}
 
 		vr::TrackedDeviceIndex_t RoleIndexHook(vr::IVRSystem* a_self, vr::ETrackedControllerRole a_role)
@@ -537,8 +672,11 @@ namespace dvb
 			vr::TrackedDeviceIndex_t a_index, vr::VRControllerState_t* a_state,
 			std::uint32_t a_size, vr::TrackedDevicePose_t* a_pose)
 		{
-			return SyntheticController(a_index, a_state, a_size, a_pose) ||
-			       g_controllerStatePose(a_self, a_origin, a_index, a_state, a_size, a_pose);
+			const auto frame = VRTrackedSetManager::Get().Current();
+			if (frame && a_origin == static_cast<vr::ETrackingUniverseOrigin>(frame->originCode) &&
+				SyntheticController(a_index, a_state, a_size, a_pose))
+				return true;
+			return g_controllerStatePose(a_self, a_origin, a_index, a_state, a_size, a_pose);
 		}
 
 		bool InstallHooks()
@@ -558,13 +696,13 @@ namespace dvb
 			g_getLastPoses = compositorVtable.write_vfunc(3, GetLastPosesHook);
 
 			REL::Relocation<std::uintptr_t> systemVtable{ *reinterpret_cast<std::uintptr_t*>(system) };
-			g_getTrackingPose = systemVtable.write_vfunc(12, GetTrackingPoseHook);
-			g_roleIndex = systemVtable.write_vfunc(19, RoleIndexHook);
-			g_indexRole = systemVtable.write_vfunc(20, IndexRoleHook);
-			g_deviceClass = systemVtable.write_vfunc(21, DeviceClassHook);
-			g_connected = systemVtable.write_vfunc(22, ConnectedHook);
-			g_controllerState = systemVtable.write_vfunc(35, ControllerStateHook);
-			g_controllerStatePose = systemVtable.write_vfunc(36, ControllerStatePoseHook);
+			g_getTrackingPose = systemVtable.write_vfunc(11, GetTrackingPoseHook);
+			g_roleIndex = systemVtable.write_vfunc(18, RoleIndexHook);
+			g_indexRole = systemVtable.write_vfunc(19, IndexRoleHook);
+			g_deviceClass = systemVtable.write_vfunc(20, DeviceClassHook);
+			g_connected = systemVtable.write_vfunc(21, ConnectedHook);
+			g_controllerState = systemVtable.write_vfunc(34, ControllerStateHook);
+			g_controllerStatePose = systemVtable.write_vfunc(35, ControllerStatePoseHook);
 			return true;
 		}
 	}
@@ -599,18 +737,24 @@ namespace dvb
 
 	json HandleVRInput(const json& a_args, const ToolContext& a_ctx)
 	{
-		const std::string action = a_args.value("action", std::string("status"));
-		if (action == "status")
-			return VRTrackedSetManager::Get().Status();
-		if (action == "observe")
-			return ObservePhysicalTrackedSet();
-		const std::string owner = ResolveOwner(a_args, a_ctx);
-		if (action == "sequence")
-			return VRTrackedSetManager::Get().Start(a_args, owner);
-		if (action == "stop" || action == "releaseAll")
-			return VRTrackedSetManager::Get().Stop(owner, a_args.value("all", false),
-				action == "releaseAll" ? "releaseAll" : "request");
-		throw ToolError(400, std::format("unknown vrTrackedSet action '{}' (status|observe|sequence|stop|releaseAll)", action));
+		try {
+			if (a_args.contains("action") && !a_args["action"].is_string())
+				throw ToolError(400, "'action' must be a string");
+			const std::string action = a_args.value("action", std::string("status"));
+			if (action == "status")
+				return VRTrackedSetManager::Get().Status();
+			if (action == "observe")
+				return ObservePhysicalTrackedSet();
+			const std::string owner = ResolveOwner(a_args, a_ctx);
+			if (action == "sequence")
+				return VRTrackedSetManager::Get().Start(a_args, owner);
+			if (action == "stop" || action == "releaseAll")
+				return VRTrackedSetManager::Get().Stop(owner, BooleanArgument(a_args, "all", false),
+					action == "releaseAll" ? "releaseAll" : "request");
+			throw ToolError(400, std::format("unknown vrTrackedSet action '{}' (status|observe|sequence|stop|releaseAll)", action));
+		} catch (const json::exception& e) {
+			throw ToolError(400, std::format("invalid VR tracked-set JSON: {}", e.what()));
+		}
 	}
 
 	void MarkVRInputReady(EventBus& a_events)
