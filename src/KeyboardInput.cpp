@@ -5,6 +5,7 @@
 #include "KeyboardInputState.h"
 #include "MainThread.h"
 #include "ToolRegistry.h"
+#include "VRInput.h"
 
 #include <RE/B/BSInputEventQueue.h>
 
@@ -88,7 +89,8 @@ namespace dvb
 
 		json ContractJson()
 		{
-			return json{ { "name", "devbench.input" }, { "version", kKeyboardContractVersion } };
+			return json{ { "name", "devbench.input" },
+				{ "version", json{ { "major", 2 }, { "minor", 0 } } } };
 		}
 
 		struct QueueResult
@@ -122,22 +124,23 @@ namespace dvb
 				return json{
 					{ "contract", ContractJson() },
 					{ "capabilities", json{
-						{ "keyboard", json{
-							{ "version", kKeyboardContractVersion },
-							{ "available", true },
-							{ "ready", g_inputReady.load(std::memory_order_relaxed) },
-							{ "injection", "Skyrim.BSInputEventQueue" },
-							{ "encoding", "DirectInputScanCode" },
-							{ "actions", json::array({ "status", "down", "up", "tap", "sequence", "releaseAll" }) },
-							{ "defaultTapMs", kDefaultTapMs },
-							{ "defaultMaxHoldMs", kDefaultMaxHoldMs },
-							{ "maximumMaxHoldMs", kMaximumMaxHoldMs },
-							{ "maximumHeldKeys", kMaximumHeldKeys },
-							{ "maximumSequenceEvents", kMaximumSequenceEvents },
-							{ "maximumSequenceMs", kMaximumSequenceMs },
-							{ "keys", std::move(keys) },
-						} },
-					} },
+										  { "keyboard", json{
+															{ "version", kKeyboardContractVersion },
+															{ "available", true },
+															{ "ready", g_inputReady.load(std::memory_order_relaxed) },
+															{ "injection", "Skyrim.BSInputEventQueue" },
+															{ "encoding", "DirectInputScanCode" },
+															{ "actions", json::array({ "status", "down", "up", "tap", "sequence", "releaseAll" }) },
+															{ "defaultTapMs", kDefaultTapMs },
+															{ "defaultMaxHoldMs", kDefaultMaxHoldMs },
+															{ "maximumMaxHoldMs", kMaximumMaxHoldMs },
+															{ "maximumHeldKeys", kMaximumHeldKeys },
+															{ "maximumSequenceEvents", kMaximumSequenceEvents },
+															{ "maximumSequenceMs", kMaximumSequenceMs },
+															{ "keys", std::move(keys) },
+														} },
+										  { "vrTrackedSet", VRInputCapabilities() },
+									  } },
 				};
 			}
 
@@ -202,7 +205,7 @@ namespace dvb
 			{
 				RequireReady();
 				std::lock_guard lock(m_mutex);
-				const auto current = m_leases.Find(a_key.scancode);
+				const auto      current = m_leases.Find(a_key.scancode);
 				if (!current) {
 					json result{ { "contract", ContractJson() }, { "device", "keyboard" },
 						{ "action", "up" }, { "released", false }, { "notHeld", true } };
@@ -211,7 +214,7 @@ namespace dvb
 				}
 				if (!a_force && current->owner != a_owner)
 					throw ToolError(409, std::format("key '{}' is held by owner '{}' (not '{}')", a_key.name, current->owner, a_owner));
-				const float heldSecs = std::max(0.001F,
+				const float       heldSecs = std::max(0.001F,
 					static_cast<float>(NowMs() - current->pressedAtMs) / 1000.0F);
 				const QueueResult queued = QueueButton(a_key, false, heldSecs);
 				m_leases.RemoveExact(a_key.scancode, current->generation);
@@ -231,8 +234,12 @@ namespace dvb
 					throw;
 				}
 				json result{
-					{ "contract", ContractJson() }, { "device", "keyboard" }, { "action", "tap" },
-					{ "durationMs", a_durationMs }, { "down", std::move(down) }, { "up", std::move(up) },
+					{ "contract", ContractJson() },
+					{ "device", "keyboard" },
+					{ "action", "tap" },
+					{ "durationMs", a_durationMs },
+					{ "down", std::move(down) },
+					{ "up", std::move(up) },
 				};
 				result.update(KeyJson(a_key));
 				return result;
@@ -255,7 +262,7 @@ namespace dvb
 					if (!event.is_object())
 						throw ToolError(400, "each sequence event must be an object");
 					const std::string action = event.value("action", std::string("tap"));
-					const int afterMs = BoundedInteger(event, "afterMs", 0, 0, 10000);
+					const int         afterMs = BoundedInteger(event, "afterMs", 0, 0, 10000);
 					totalMs += afterMs;
 					if (action == "wait") {
 						totalMs += BoundedInteger(event, "durationMs", 0, 0, 10000);
@@ -279,12 +286,12 @@ namespace dvb
 				if (totalMs > kMaximumSequenceMs)
 					throw ToolError(400, std::format("sequence duration {}ms exceeds the {}ms limit", totalMs, kMaximumSequenceMs));
 
-				json results = json::array();
+				json                       results = json::array();
 				std::vector<KeyboardLease> opened;
 				try {
 					for (const auto& event : events) {
 						const std::string action = event.value("action", std::string("tap"));
-						json result;
+						json              result;
 						if (action == "wait") {
 							const int durationMs = BoundedInteger(event, "durationMs", 0, 0, 10000);
 							std::this_thread::sleep_for(milliseconds(durationMs));
@@ -313,8 +320,12 @@ namespace dvb
 				}
 
 				return json{
-					{ "contract", ContractJson() }, { "device", "keyboard" }, { "action", "sequence" },
-					{ "owner", a_owner }, { "durationMs", totalMs }, { "eventsRun", results.size() },
+					{ "contract", ContractJson() },
+					{ "device", "keyboard" },
+					{ "action", "sequence" },
+					{ "owner", a_owner },
+					{ "durationMs", totalMs },
+					{ "eventsRun", results.size() },
 					{ "results", std::move(results) },
 				};
 			}
@@ -342,8 +353,11 @@ namespace dvb
 					}
 				}
 				return json{
-					{ "contract", ContractJson() }, { "device", "keyboard" }, { "action", "releaseAll" },
-					{ "owner", a_all ? "*" : a_owner }, { "released", std::move(released) },
+					{ "contract", ContractJson() },
+					{ "device", "keyboard" },
+					{ "action", "releaseAll" },
+					{ "owner", a_all ? "*" : a_owner },
+					{ "released", std::move(released) },
 					{ "failed", std::move(failed) },
 				};
 			}
@@ -383,10 +397,15 @@ namespace dvb
 				bool a_pending, bool a_released, int a_frame = -1) const
 			{
 				json result{
-					{ "contract", ContractJson() }, { "device", "keyboard" },
-					{ "action", a_action }, { "owner", a_lease.owner },
-					{ "generation", a_lease.generation }, { "accepted", true },
-					{ "pending", a_pending }, { "released", a_released }, { "frame", a_frame },
+					{ "contract", ContractJson() },
+					{ "device", "keyboard" },
+					{ "action", a_action },
+					{ "owner", a_lease.owner },
+					{ "generation", a_lease.generation },
+					{ "accepted", true },
+					{ "pending", a_pending },
+					{ "released", a_released },
+					{ "frame", a_frame },
 				};
 				result.update(KeyJson(a_lease.key));
 				return result;
@@ -398,9 +417,13 @@ namespace dvb
 				if (!m_events)
 					return;
 				json payload{
-					{ "contractVersion", kKeyboardContractVersion }, { "device", "keyboard" },
-					{ "action", a_action }, { "owner", a_lease.owner },
-					{ "generation", a_lease.generation }, { "reason", a_reason }, { "pending", a_pending },
+					{ "contractVersion", kKeyboardContractVersion },
+					{ "device", "keyboard" },
+					{ "action", a_action },
+					{ "owner", a_lease.owner },
+					{ "generation", a_lease.generation },
+					{ "reason", a_reason },
+					{ "pending", a_pending },
 				};
 				payload.update(KeyJson(a_lease.key));
 				m_events->Publish("input.keyboard", std::move(payload));
@@ -424,10 +447,10 @@ namespace dvb
 				std::string_view a_reason)
 			{
 				std::lock_guard lock(m_mutex);
-				const auto current = m_leases.Find(a_scancode);
+				const auto      current = m_leases.Find(a_scancode);
 				if (!current || current->generation != a_generation)
 					return false;
-				const float heldSecs = std::max(0.001F,
+				const float       heldSecs = std::max(0.001F,
 					static_cast<float>(NowMs() - current->pressedAtMs) / 1000.0F);
 				const QueueResult queued = QueueButton(current->key, false, heldSecs);
 				m_leases.RemoveExact(a_scancode, a_generation);
@@ -447,8 +470,13 @@ namespace dvb
 			const std::string action = a_args.value("action", std::string("capabilities"));
 			if (action == "capabilities")
 				return KeyboardManager::Get().Capabilities();
-			if (a_args.contains("device") && (!a_args["device"].is_string() || a_args["device"] != "keyboard"))
-				throw ToolError(400, "only device='keyboard' is implemented in input contract v1; inspect action='capabilities' before using later devices");
+			if (a_args.contains("device") && !a_args["device"].is_string())
+				throw ToolError(400, "'device' must be a string");
+			const std::string device = a_args.value("device", std::string("keyboard"));
+			if (IsVRInputDevice(device))
+				return HandleVRInput(a_args, a_ctx);
+			if (device != "keyboard")
+				throw ToolError(400, "input contract v2 supports device='keyboard' or device='vrTrackedSet'");
 			if (action == "status")
 				return KeyboardManager::Get().Status();
 
@@ -490,21 +518,32 @@ namespace dvb
 			"failure. 'releaseAll' releases this owner only, or all=true releases every DevBench-owned "
 			"synthetic key. owner defaults to the MCP session id or rest:anonymous; automation should "
 			"supply a stable task owner. DevBench also releases owned keys on load/new-game and emits "
-			"input.keyboard events for accepted down/up transitions. This input namespace is designed "
-			"to add a coherent HMD+left/right-controller capability in a later contract version.";
+			"input.keyboard events for accepted down/up transitions. Contract v2 also implements "
+			"device='vrTrackedSet': read-only observe returns the current physical OpenVR HMD and both controllers; "
+			"one prevalidated timestamped sequence whose every frame atomically "
+			"contains HMD, left-controller, and right-controller pose plus both controllers' complete "
+			"OpenVR button/touch/axis state. It is applied at the OpenVR compositor/system boundary, is "
+			"always asynchronous, has one owner, passes the real runtime through when inactive, and "
+			"stops as a whole on cleanup. Ad-hoc sequences stop on lifecycle boundaries; recording replay "
+			"may explicitly survive the load/new-game events it is reproducing. There are deliberately no per-device or "
+			"per-button VR mutation actions: submit the coherent tracked set so poses and controls cannot "
+			"come from different clocks.";
 		input.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
-				{ "action", json{ { "type", "string" }, { "enum", json::array({ "capabilities", "status", "down", "up", "tap", "sequence", "releaseAll" }) } } },
-				{ "device", json{ { "type", "string" }, { "enum", json::array({ "keyboard" }) }, { "description", "v1 mutation/status device; omit for capabilities" } } },
-				{ "key", json{ { "oneOf", json::array({ json{ { "type", "string" } }, json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 255 } } }) }, { "description", "down/up/tap: documented key name or raw DirectInput scancode" } } },
-				{ "owner", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "stable task/session owner; defaults to MCP session id or rest:anonymous" } } },
-				{ "durationMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", 5000 }, { "description", "tap duration (default 50); sequence tap/wait event duration" } } },
-				{ "maxHoldMs", json{ { "type", "integer" }, { "minimum", 100 }, { "maximum", kMaximumMaxHoldMs }, { "description", "down safety lease (default 5000); automatic up at expiry" } } },
-				{ "force", json{ { "type", "boolean" }, { "description", "up: override owner mismatch (default false)" } } },
-				{ "all", json{ { "type", "boolean" }, { "description", "releaseAll: release all owners, not only this caller (default false)" } } },
-				{ "events", json{ { "type", "array" }, { "minItems", 1 }, { "maxItems", kMaximumSequenceEvents }, { "description", "sequence: balanced [{action:tap|down|up|wait,key?,durationMs?,afterMs?}]" }, { "items", json{ { "type", "object" } } } } },
-			} },
+								{ "action", json{ { "type", "string" }, { "enum", json::array({ "capabilities", "status", "down", "up", "tap", "sequence", "stop", "releaseAll" }) } } },
+								{ "device", json{ { "type", "string" }, { "enum", json::array({ "keyboard", "vrTrackedSet" }) }, { "description", "mutation/status device; omit for capabilities" } } },
+								{ "key", json{ { "oneOf", json::array({ json{ { "type", "string" } }, json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 255 } } }) }, { "description", "down/up/tap: documented key name or raw DirectInput scancode" } } },
+								{ "owner", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "stable task/session owner; defaults to MCP session id or rest:anonymous" } } },
+								{ "durationMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", 5000 }, { "description", "tap duration (default 50); sequence tap/wait event duration" } } },
+								{ "maxHoldMs", json{ { "type", "integer" }, { "minimum", 100 }, { "maximum", kMaximumMaxHoldMs }, { "description", "down safety lease (default 5000); automatic up at expiry" } } },
+								{ "force", json{ { "type", "boolean" }, { "description", "up: override owner mismatch (default false)" } } },
+								{ "all", json{ { "type", "boolean" }, { "description", "releaseAll: release all owners, not only this caller (default false)" } } },
+								{ "events", json{ { "type", "array" }, { "minItems", 1 }, { "maxItems", kMaximumSequenceEvents }, { "description", "sequence: balanced [{action:tap|down|up|wait,key?,durationMs?,afterMs?}]" }, { "items", json{ { "type", "object" } } } } },
+								{ "frames", json{ { "type", "array" }, { "minItems", 1 }, { "maxItems", 60000 }, { "description", "vrTrackedSet sequence: monotonic atomic frames; each requires tMs, originCode, hmd, left, right; controller objects carry packetNumber/pressed/touched/five axes" }, { "items", json{ { "type", "object" } } } } },
+								{ "tailMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", 1000 }, { "description", "vrTrackedSet sequence: final-state visibility before automatic release (default 50ms)" } } },
+								{ "surviveLifecycle", json{ { "type", "boolean" }, { "description", "vrTrackedSet sequence: keep this owned stream active across recorded load/new-game boundaries (default false; record replay sets true)" } } },
+							} },
 		};
 		a_registry.Register(std::move(input), &HandleInput);
 	}

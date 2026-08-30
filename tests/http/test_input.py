@@ -13,7 +13,10 @@ def test_keyboard_input_capability_contract(client, tool_schema):
     desc = require_tool(tool_schema, "input")
     require_enum(desc, "action", "capabilities")
     body = client.ok("input", {"action": "capabilities"})
-    assert body.get("contract") == {"name": "devbench.input", "version": 1}, body
+    assert body.get("contract") == {
+        "name": "devbench.input",
+        "version": {"major": 2, "minor": 0},
+    }, body
     keyboard = body.get("capabilities", {}).get("keyboard", {})
     assert keyboard.get("available") is True, body
     assert keyboard.get("encoding") == "DirectInputScanCode", body
@@ -24,12 +27,19 @@ def test_keyboard_input_capability_contract(client, tool_schema):
     keys = keyboard.get("keys")
     assert isinstance(keys, list) and keys, body
     assert {"key": "enter", "scancode": 0x1C} in keys, body
+    vr_set = body.get("capabilities", {}).get("vrTrackedSet", {})
+    assert vr_set.get("atomicDevices") == ["hmd", "left", "right"], body
+    assert vr_set.get("passThroughWhenInactive") is True, body
+    assert "observe" in vr_set.get("actions", []), body
 
 
 def test_keyboard_input_status_is_safe_without_player(client, tool_schema):
     desc = require_tool(tool_schema, "input")
     require_enum(desc, "action", "status")
     body = client.ok("input", {"action": "status", "device": "keyboard"})
-    assert body.get("contract") == {"name": "devbench.input", "version": 1}, body
+    assert body.get("contract") == {
+        "name": "devbench.input",
+        "version": {"major": 2, "minor": 0},
+    }, body
     assert isinstance(body.get("ready"), bool), body
     assert isinstance(body.get("held"), list), body

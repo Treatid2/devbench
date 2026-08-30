@@ -12,6 +12,7 @@
 #include "Server.h"
 #include "StallWatchdog.h"
 #include "Tools.h"
+#include "VRInput.h"
 #include "Version.h"
 
 #include <cstring>
@@ -105,6 +106,7 @@ namespace
 		// so registering then silently no-ops. kInputLoaded fires once the input subsystem is up.
 		if (a_msg->type == SKSE::MessagingInterface::kInputLoaded && g_server) {
 			dvb::MarkKeyboardInputReady();
+			dvb::MarkVRInputReady(g_server->Events());
 			dvb::InstallInputHotkeys(g_server->Tools(), g_config);
 		}
 
@@ -119,10 +121,13 @@ namespace
 		if (g_server) {
 			// Never carry a synthetic held key across a scene reset. This callback is on Skyrim's
 			// main thread, so the keyboard layer hands cleanup to a worker and returns immediately.
-			if (a_msg->type == SKSE::MessagingInterface::kPreLoadGame)
+			if (a_msg->type == SKSE::MessagingInterface::kPreLoadGame) {
 				dvb::ReleaseKeyboardInputForLifecycle("preLoadGame");
-			else if (a_msg->type == SKSE::MessagingInterface::kNewGame)
+				dvb::ReleaseVRInputForLifecycle("preLoadGame");
+			} else if (a_msg->type == SKSE::MessagingInterface::kNewGame) {
 				dvb::ReleaseKeyboardInputForLifecycle("newGame");
+				dvb::ReleaseVRInputForLifecycle("newGame");
+			}
 
 			// Publish lifecycle events (dataLoaded and later load/save/new-game).
 			dvb::OnSKSEMessage(a_msg->type);
