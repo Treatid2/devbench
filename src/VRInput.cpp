@@ -357,7 +357,7 @@ namespace dvb
 		REL::Relocation<ControllerStatePoseFn> g_controllerStatePose;
 
 		VRTrackedPoseState ReadPose(const vr::TrackedDevicePose_t& a_pose,
-			vr::TrackedDeviceIndex_t a_index)
+			vr::TrackedDeviceIndex_t                               a_index)
 		{
 			VRTrackedPoseState out;
 			out.available = a_index != vr::k_unTrackedDeviceIndexInvalid;
@@ -378,7 +378,7 @@ namespace dvb
 		}
 
 		VRControllerState ReadController(vr::IVRSystem* a_system,
-			vr::TrackedDeviceIndex_t a_index)
+			vr::TrackedDeviceIndex_t                    a_index)
 		{
 			VRControllerState out;
 			if (a_index == vr::k_unTrackedDeviceIndexInvalid)
@@ -408,7 +408,7 @@ namespace dvb
 			auto* compositor = RE::BSOpenVR::GetIVRCompositor();
 			if (!compositor && openvr)
 				compositor = openvr->vrContext.vrCompositor;
-			const auto origin = compositor ? compositor->GetTrackingSpace() : vr::TrackingUniverseStanding;
+			const auto                                                         origin = compositor ? compositor->GetTrackingSpace() : vr::TrackingUniverseStanding;
 			std::array<vr::TrackedDevicePose_t, vr::k_unMaxTrackedDeviceCount> poses{};
 			g_getTrackingPose(system, origin, 0.0f, poses.data(), static_cast<std::uint32_t>(poses.size()));
 			const auto leftIndex = g_roleIndex(system, vr::TrackedControllerRole_LeftHand);
