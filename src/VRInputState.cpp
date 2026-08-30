@@ -14,6 +14,15 @@ namespace dvb
 		constexpr std::size_t kMaximumFrames = 60000;
 		constexpr auto        kMaximumDurationMs = 30 * 60 * 1000;
 
+		bool Boolean(const json& a_parent, const char* a_name, bool a_default)
+		{
+			if (!a_parent.contains(a_name))
+				return a_default;
+			if (!a_parent.at(a_name).is_boolean())
+				throw std::invalid_argument(std::format("'{}' must be a boolean", a_name));
+			return a_parent.at(a_name).get<bool>();
+		}
+
 		template <std::size_t N>
 		std::array<float, N> FloatArray(const json& a_parent, const char* a_name,
 			bool a_required = true)
@@ -44,9 +53,9 @@ namespace dvb
 			if (!a_value.is_object())
 				throw std::invalid_argument(std::format("'{}' must be an object", a_role));
 			VRTrackedPoseState out;
-			out.available = a_value.value("available", false);
-			out.connected = a_value.value("connected", out.available);
-			out.valid = a_value.value("valid", false);
+			out.available = Boolean(a_value, "available", false);
+			out.connected = Boolean(a_value, "connected", out.available);
+			out.valid = Boolean(a_value, "valid", false);
 			if (!out.available) {
 				if (out.connected || out.valid)
 					throw std::invalid_argument(std::format("'{}' cannot be connected/valid when unavailable", a_role));
@@ -58,6 +67,8 @@ namespace dvb
 			if (index < 0 || index >= 64)
 				throw std::invalid_argument(std::format("'{}.index' must be below 64", a_role));
 			out.index = static_cast<std::uint32_t>(index);
+			if (a_value.contains("trackingResult") && !a_value["trackingResult"].is_number_integer())
+				throw std::invalid_argument(std::format("'{}.trackingResult' must be an integer", a_role));
 			out.trackingResult = a_value.value("trackingResult", 0);
 			if (out.trackingResult < 0 || out.trackingResult > 300)
 				throw std::invalid_argument(std::format("'{}.trackingResult' is outside the OpenVR enum range", a_role));
@@ -75,6 +86,10 @@ namespace dvb
 			const json state = a_value.value("controller", json::object());
 			if (!state.is_object())
 				throw std::invalid_argument(std::format("'{}.controller' must be an object", a_role));
+			for (const char* name : { "packetNumber", "pressed", "touched" })
+				if (state.contains(name) && (!state[name].is_number_integer() ||
+												(state[name].type() == json::value_t::number_integer && state[name].get<std::int64_t>() < 0)))
+					throw std::invalid_argument(std::format("'{}.controller.{}' must be a non-negative integer", a_role, name));
 			out.controller.packetNumber = state.value("packetNumber", 0u);
 			out.controller.pressed = state.value("pressed", std::uint64_t{ 0 });
 			out.controller.touched = state.value("touched", std::uint64_t{ 0 });
@@ -123,6 +138,7 @@ namespace dvb
 		std::vector<VRTrackedInputFrame> out;
 		out.reserve(a_frames.size());
 		std::int64_t                 previous = -1;
+		std::uint64_t                previousSeq = 0;
 		std::optional<std::uint32_t> leftIndex;
 		std::optional<std::uint32_t> rightIndex;
 		std::optional<std::int32_t>  originCode;
@@ -134,12 +150,20 @@ namespace dvb
 			if (!item.contains("tMs") || !item["tMs"].is_number_integer())
 				throw std::invalid_argument(std::format("frames[{}].tMs must be an integer", i));
 			frame.tMs = item["tMs"].get<std::int64_t>();
-			if (frame.tMs < 0 || frame.tMs > kMaximumDurationMs || frame.tMs < previous)
-				throw std::invalid_argument(std::format("frames[{}].tMs must be monotonic in [0,{}]", i, kMaximumDurationMs));
+			if (frame.tMs < 0 || frame.tMs > kMaximumDurationMs || (i > 0 && frame.tMs <= previous))
+				throw std::invalid_argument(std::format("frames[{}].tMs must be strictly increasing in [0,{}]", i, kMaximumDurationMs));
 			if (i == 0 && frame.tMs != 0)
 				throw std::invalid_argument("frames[0].tMs must be 0 so the complete tracked set is defined immediately");
 			previous = frame.tMs;
+			if (item.contains("seq") && (!item["seq"].is_number_integer() ||
+											(item["seq"].type() == json::value_t::number_integer && item["seq"].get<std::int64_t>() < 0)))
+				throw std::invalid_argument(std::format("frames[{}].seq must be a non-negative integer", i));
 			frame.seq = item.value("seq", static_cast<std::uint64_t>(i + 1));
+			if (frame.seq == 0 || (i > 0 && frame.seq <= previousSeq))
+				throw std::invalid_argument(std::format("frames[{}].seq must be strictly increasing and non-zero", i));
+			previousSeq = frame.seq;
+			if (item.contains("originCode") && !item["originCode"].is_number_integer())
+				throw std::invalid_argument(std::format("frames[{}].originCode must be an integer", i));
 			frame.originCode = item.value("originCode", 1);
 			if (frame.originCode < 0 || frame.originCode > 2)
 				throw std::invalid_argument(std::format("frames[{}].originCode must be 0, 1, or 2", i));
@@ -151,11 +175,13 @@ namespace dvb
 			frame.hmd = Pose(item["hmd"], "hmd");
 			frame.left = Controller(item["left"], "left");
 			frame.right = Controller(item["right"], "right");
-			if (frame.hmd.available && frame.hmd.index != 0)
+			if (!frame.hmd.available || !frame.left.pose.available || !frame.right.pose.available)
+				throw std::invalid_argument(std::format("frames[{}] must make hmd, left, and right available", i));
+			if (frame.hmd.index != 0)
 				throw std::invalid_argument(std::format("frames[{}].hmd.index must be OpenVR HMD index 0", i));
-			if (frame.left.pose.available && frame.right.pose.available &&
+			if (frame.left.pose.index == 0 || frame.right.pose.index == 0 ||
 				frame.left.pose.index == frame.right.pose.index)
-				throw std::invalid_argument(std::format("frames[{}] left/right indices must be distinct", i));
+				throw std::invalid_argument(std::format("frames[{}] hmd/left/right indices must be pairwise distinct", i));
 			const auto stableRoleIndex = [i](const char* a_role, const VRTrackedPoseState& a_pose,
 											 std::optional<std::uint32_t>& a_index) {
 				if (!a_pose.available)

@@ -51,6 +51,7 @@ TEST_CASE("atomic VR tracked-set validation rejects incomplete or incoherent seq
 	CHECK_THROWS(ParseVRTrackedInputFrames(json::array({ missing })));
 	CHECK_THROWS(ParseVRTrackedInputFrames(json::array({ Frame(10) })));
 	CHECK_THROWS(ParseVRTrackedInputFrames(json::array({ Frame(0), Frame(20), Frame(10) })));
+	CHECK_THROWS(ParseVRTrackedInputFrames(json::array({ Frame(0), Frame(0) })));
 
 	json duplicate = Frame(0);
 	duplicate["right"]["index"] = 1;
@@ -67,4 +68,22 @@ TEST_CASE("atomic VR tracked-set validation rejects incomplete or incoherent seq
 	json changedOrigin = Frame(20);
 	changedOrigin["originCode"] = 0;
 	CHECK_THROWS(ParseVRTrackedInputFrames(json::array({ Frame(0), changedOrigin })));
+
+	json unavailable = Frame(0);
+	unavailable["right"] = json{ { "available", false }, { "connected", false }, { "valid", false } };
+	CHECK_THROWS(ParseVRTrackedInputFrames(json::array({ unavailable })));
+
+	json hmdAlias = Frame(0);
+	hmdAlias["left"]["index"] = 0;
+	CHECK_THROWS(ParseVRTrackedInputFrames(json::array({ hmdAlias })));
+
+	json badBoolean = Frame(0);
+	badBoolean["hmd"]["available"] = "yes";
+	CHECK_THROWS(ParseVRTrackedInputFrames(json::array({ badBoolean })));
+
+	json badSeq = Frame(20);
+	badSeq["seq"] = 1;
+	json first = Frame(0);
+	first["seq"] = 1;
+	CHECK_THROWS(ParseVRTrackedInputFrames(json::array({ first, badSeq })));
 }

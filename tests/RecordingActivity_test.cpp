@@ -78,16 +78,26 @@ TEST_CASE("legacy controller events become atomic tracked-set frames without los
 	CHECK(frames[2]["right"]["controller"]["pressed"].get<std::uint64_t>() == (std::uint64_t{ 1 } << 33));
 	CHECK(frames[3]["tMs"] == 60);
 	CHECK(frames[3]["right"]["controller"]["pressed"] == 0);
-	CHECK(plan["durationMs"] == 100);
+	CHECK(plan["durationMs"] == 150);
+	CHECK(plan["step"]["args"]["tailMs"] == 50);
 	CHECK(plan["report"]["convertedControllerEvents"] == 2);
 	CHECK(plan["report"]["roleFallbackEvents"] == 0);
+}
+
+TEST_CASE("VR tracked-set replay rejects malformed source samples before returning steps")
+{
+	json malformed = json::array({ json{ { "tMs", 20 }, { "hmd", json::object() } } });
+	CHECK_THROWS(BuildVRTrackedSetReplay(malformed, json::array(), "recording:test", true));
+
+	json duplicate = json::array({ json{ { "tMs", 20 } }, json{ { "tMs", 20 } } });
+	CHECK_THROWS(BuildVRTrackedSetReplay(duplicate, json::array(), "recording:test", true));
 }
 
 TEST_CASE("trajectory atMs preserves an initial no-player recording delay")
 {
 	const json   steps = json::array({
-		json{ { "atMs", 125 }, { "pose", json::array({ 1, 2, 3, 4, 5 }) }, { "wait", 25 } },
-	});
+        json{ { "atMs", 125 }, { "pose", json::array({ 1, 2, 3, 4, 5 }) }, { "wait", 25 } },
+    });
 	const json   plan = InterleaveReplayableActivity(steps, json::array(), "recording:test", true);
 	std::int64_t totalWait = 0;
 	for (const auto& step : plan["steps"])

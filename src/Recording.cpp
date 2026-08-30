@@ -132,11 +132,11 @@ namespace dvb::Recording
 			const int type = static_cast<int>(a_event.GetEventType());
 			const int device = static_cast<int>(a_event.GetDevice());
 			json      out{
-				{ "kind", "input" },
-				{ "eventType", InputEventTypeName(type) },
-				{ "eventTypeCode", type },
-				{ "device", InputDeviceName(a_event.GetDevice()) },
-				{ "deviceCode", device },
+					 { "kind", "input" },
+					 { "eventType", InputEventTypeName(type) },
+					 { "eventTypeCode", type },
+					 { "device", InputDeviceName(a_event.GetDevice()) },
+					 { "deviceCode", device },
 			};
 			if (const auto* id = a_event.AsIDEvent()) {
 				out["idCode"] = id->GetIDCode();
@@ -194,12 +194,12 @@ namespace dvb::Recording
 				return json(nullptr);
 			const auto pos = pc->GetPosition();
 			json       s{
-				{ "x", pos.x },
-				{ "y", pos.y },
-				{ "z", pos.z },
-				{ "angleZ", pc->GetAngleZ() },  // yaw (radians) — captures rotation-in-place
-				{ "angleX", pc->GetAngleX() },  // pitch (radians) — look up/down (sky vs ground)
-				{ "frame", game::CurrentFrame() },
+					  { "x", pos.x },
+					  { "y", pos.y },
+					  { "z", pos.z },
+					  { "angleZ", pc->GetAngleZ() },  // yaw (radians) — captures rotation-in-place
+					  { "angleX", pc->GetAngleX() },  // pitch (radians) — look up/down (sky vs ground)
+					  { "frame", game::CurrentFrame() },
 			};
 			if (auto* cam = RE::PlayerCamera::GetSingleton(); cam) {
 				// Point of view, normalized to the three states the camera tool can restore.
@@ -289,14 +289,14 @@ namespace dvb::Recording
 					return json{ { "role", a_role }, { "available", false } };
 				const auto& p = poses[a_index];
 				json        out{
-					{ "role", a_role },
-					{ "available", true },
-					{ "index", a_index },
-					{ "connected", p.bDeviceIsConnected },
-					{ "valid", p.bPoseIsValid },
-					{ "trackingResult", static_cast<int>(p.eTrackingResult) },
-					{ "velocity", json::array({ p.vVelocity.v[0], p.vVelocity.v[1], p.vVelocity.v[2] }) },
-					{ "angularVelocity", json::array({ p.vAngularVelocity.v[0], p.vAngularVelocity.v[1], p.vAngularVelocity.v[2] }) },
+						   { "role", a_role },
+						   { "available", true },
+						   { "index", a_index },
+						   { "connected", p.bDeviceIsConnected },
+						   { "valid", p.bPoseIsValid },
+						   { "trackingResult", static_cast<int>(p.eTrackingResult) },
+						   { "velocity", json::array({ p.vVelocity.v[0], p.vVelocity.v[1], p.vVelocity.v[2] }) },
+						   { "angularVelocity", json::array({ p.vAngularVelocity.v[0], p.vAngularVelocity.v[1], p.vAngularVelocity.v[2] }) },
 				};
 				if (p.bPoseIsValid) {
 					json matrix = json::array();
@@ -392,11 +392,35 @@ namespace dvb::Recording
 		// Background activity recorder. One instance (function-local static). start() spawns the
 		// sampler; stop() joins and serializes. Sample streams/manifest/intervalMs are guarded
 		// by `mtx` (sampler appends, status reads); the thread lifecycle is gated by `running`.
+		enum class RecorderState
+		{
+			idle,
+			starting,
+			running,
+			stopping,
+		};
+
+		const char* RecorderStateName(RecorderState a_state)
+		{
+			switch (a_state) {
+			case RecorderState::idle:
+				return "idle";
+			case RecorderState::starting:
+				return "starting";
+			case RecorderState::running:
+				return "running";
+			case RecorderState::stopping:
+				return "stopping";
+			}
+			return "unknown";
+		}
+
 		struct Recorder
 		{
 			std::atomic<bool>        running{ false };
 			std::thread              worker;
 			std::mutex               mtx;
+			RecorderState            state = RecorderState::idle;
 			std::vector<json>        samples;
 			std::vector<json>        commands;         // console commands seen mid-recording: { command, frame }
 			std::vector<json>        checkpoints;      // screenshot checkpoints marked mid-recording: { id, atMs, excludeUi }
@@ -435,7 +459,8 @@ namespace dvb::Recording
 						tracking["tMs"] = tMs;
 						tracking["frame"] = frameSample.value("frame", 0u);
 						std::lock_guard lock(mtx);
-						trackingSamples.push_back(std::move(tracking));
+						if (state == RecorderState::running)
+							trackingSamples.push_back(std::move(tracking));
 					}
 					if (pose.is_null() || g_replaying.load(std::memory_order_relaxed))
 						continue;  // raw tracking is still sampled, but replay's teleported player pose is not
@@ -461,7 +486,8 @@ namespace dvb::Recording
 					// wait values — RunAndWait latency inflates actual intervals above intervalMs.
 					pose["tMs"] = tMs;
 					std::lock_guard lock(mtx);
-					samples.push_back(std::move(pose));
+					if (state == RecorderState::running)
+						samples.push_back(std::move(pose));
 				}
 			}
 		};
@@ -480,7 +506,7 @@ namespace dvb::Recording
 			a_event["tMs"] = duration_cast<milliseconds>(steady_clock::now() - rec.startTick).count();
 			a_event["frame"] = game::CurrentFrame();
 			std::lock_guard lock(rec.mtx);
-			if (!rec.running.load(std::memory_order_relaxed))
+			if (!rec.running.load(std::memory_order_relaxed) || rec.state != RecorderState::running)
 				return;
 			a_event["seq"] = rec.nextActivitySeq++;
 			rec.activityEvents.push_back(std::move(a_event));
@@ -637,10 +663,26 @@ namespace dvb::Recording
 			const fs::path  dir = "Data/SKSE/Plugins/devbench/recordings";
 			std::error_code ec;
 			fs::create_directories(dir, ec);
-			const auto     stamp = static_cast<long long>(std::time(nullptr));
-			const fs::path path = dir / std::format("recording_{}.json", stamp);
-			if (std::ofstream out(path, std::ios::trunc); out)
-				out << SerializeRecording(a_scenario);
+			if (ec)
+				throw std::runtime_error(std::format("could not create recording directory: {}", ec.message()));
+			const auto        stamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+			const fs::path    path = dir / std::format("recording_{}.json", stamp);
+			const fs::path    temporary = path.string() + ".tmp";
+			const std::string serialized = SerializeRecording(a_scenario);
+			{
+				std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+				if (!out)
+					throw std::runtime_error(std::format("could not open temporary recording file: {}", temporary.string()));
+				out.write(serialized.data(), static_cast<std::streamsize>(serialized.size()));
+				out.flush();
+				if (!out)
+					throw std::runtime_error(std::format("could not flush temporary recording file: {}", temporary.string()));
+			}
+			fs::rename(temporary, path, ec);
+			if (ec)
+				throw std::runtime_error(std::format("could not publish recording file: {}", ec.message()));
+			if (!fs::exists(path, ec) || ec || fs::file_size(path, ec) != serialized.size() || ec)
+				throw std::runtime_error("recording file verification failed after publication");
 			return path;
 		}
 	}
@@ -653,9 +695,23 @@ namespace dvb::Recording
 			action = rec.running.load() ? "stop" : "start";
 
 		if (action == "start") {
-			if (rec.running.load())
-				return json{ { "error", "already recording — stop first" } };
+			{
+				std::lock_guard lock(rec.mtx);
+				if (rec.state != RecorderState::idle)
+					return json{ { "error", "recorder is not idle — stop or wait for the current operation" },
+						{ "state", RecorderStateName(rec.state) } };
+				rec.state = RecorderState::starting;
+			}
+			const auto cancelStart = [&rec]() {
+				std::lock_guard lock(rec.mtx);
+				rec.running.store(false, std::memory_order_relaxed);
+				rec.state = RecorderState::idle;
+			};
 
+			if (a_args.contains("intervalMs") && !a_args["intervalMs"].is_number_integer()) {
+				cancelStart();
+				return json{ { "error", "intervalMs must be an integer" } };
+			}
 			long interval = a_args.value("intervalMs", g_defaultIntervalMs);  // config default; arg overrides
 			if (interval < kMinIntervalMs)
 				interval = kMinIntervalMs;
@@ -666,20 +722,32 @@ namespace dvb::Recording
 			try {
 				manifest = MainThread::RunAndWait(&ReadManifest, milliseconds(3000));
 			} catch (const std::exception& e) {
+				cancelStart();
 				logs::warn("devbench: record start failed — scene read timed out ({})", e.what());
 				Notify("devbench: can't record — load a game first");
 				return json{ { "error", "could not read scene — is a game loaded?" }, { "detail", e.what() } };
 			}
+			if (a_args.contains("allowNoPlayer") && !a_args["allowNoPlayer"].is_boolean()) {
+				cancelStart();
+				return json{ { "error", "allowNoPlayer must be a boolean" } };
+			}
 			const bool allowNoPlayer = a_args.value("allowNoPlayer", false);
 			if (!manifest.contains("anchor") && !allowNoPlayer) {
+				cancelStart();
 				logs::warn("devbench: record start failed — player not loaded");
 				Notify("devbench: can't record — load a game or use allowNoPlayer");
 				return json{ { "error", "player not loaded — load a game or pass allowNoPlayer=true to capture main-menu/new-game activity" } };
 			}
-			const bool        anchored = manifest.contains("anchor");
+			const bool anchored = manifest.contains("anchor");
+			if (a_args.contains("correlationId") && !a_args["correlationId"].is_string()) {
+				cancelStart();
+				return json{ { "error", "correlationId must be a string" } };
+			}
 			const std::string correlationId = a_args.value("correlationId", std::string{});
-			if (correlationId.size() > 128)
+			if (correlationId.size() > 128) {
+				cancelStart();
 				return json{ { "error", "correlationId must contain at most 128 characters" } };
+			}
 			if (!correlationId.empty())
 				manifest["correlationId"] = correlationId;
 			json openMenus = json::array();
@@ -692,6 +760,7 @@ namespace dvb::Recording
 					"devbench: recording with UNKNOWN entry point — replay won't restore the "
 					"scene (load via the game tool or `coc` so devbench can capture it)");
 
+			g_userCocPending.store(false, std::memory_order_relaxed);  // don't leak across sessions
 			{
 				std::lock_guard lock(rec.mtx);
 				rec.samples.clear();
@@ -702,14 +771,24 @@ namespace dvb::Recording
 				rec.nextActivitySeq = 1;
 				rec.manifest = std::move(manifest);
 				rec.intervalMs = interval;
+				rec.startTick = steady_clock::now();
+				rec.running.store(true, std::memory_order_relaxed);
+				rec.state = RecorderState::running;
+				try {
+					rec.worker = std::thread([&rec] { rec.Sample(); });
+				} catch (...) {
+					rec.running.store(false, std::memory_order_relaxed);
+					rec.state = RecorderState::idle;
+					throw;
+				}
 			}
-			g_userCocPending.store(false, std::memory_order_relaxed);  // don't leak across sessions
-			rec.startTick = steady_clock::now();
-			rec.running.store(true);
-			rec.worker = std::thread([&rec] { rec.Sample(); });
 
-			a_events.Publish("record.started", json{ { "intervalMs", interval },
-												   { "anchored", anchored }, { "activityCapture", ActivityCaptureContract() } });
+			try {
+				a_events.Publish("record.started", json{ { "intervalMs", interval },
+													   { "anchored", anchored }, { "activityCapture", ActivityCaptureContract() } });
+			} catch (const std::exception& e) {
+				logs::warn("devbench: record.started event publish failed: {}", e.what());
+			}
 			Notify("devbench: recording started");
 			logs::info("devbench: recording started (interval {}ms)", interval);
 			return json{ { "action", "start" }, { "recording", true }, { "intervalMs", interval },
@@ -738,6 +817,8 @@ namespace dvb::Recording
 			size_t count = 0;
 			{
 				std::lock_guard lock(rec.mtx);
+				if (rec.state != RecorderState::running)
+					return json{ { "error", "not recording — call action=start first" } };
 				if (std::any_of(rec.checkpoints.begin(), rec.checkpoints.end(),
 						[&](const json& c) { return c.value("id", std::string{}) == id; }))
 					return json{ { "error", std::format("checkpoint id '{}' already marked this recording", id) } };
@@ -751,17 +832,28 @@ namespace dvb::Recording
 		}
 
 		if (action == "stop") {
-			// exchange, not load-then-store: two concurrent stops must not both reach join()
-			// (the second join on an already-joined thread throws std::system_error).
-			if (!rec.running.exchange(false))
-				return json{ { "error", "not recording" } };
+			{
+				std::lock_guard lock(rec.mtx);
+				if (rec.state != RecorderState::running)
+					return json{ { "error", "not recording" }, { "state", RecorderStateName(rec.state) } };
+				rec.state = RecorderState::stopping;
+				rec.running.store(false, std::memory_order_relaxed);
+			}
 			if (rec.worker.joinable())
 				rec.worker.join();  // sampler done → samples are stable, no lock needed below
 
 			const long recordedMs = static_cast<long>(
 				duration_cast<milliseconds>(steady_clock::now() - rec.startTick).count());
-			const json     scenario = BuildScenario(rec, recordedMs);
-			const fs::path path = WriteScenarioFile(scenario);
+			json     scenario;
+			fs::path path;
+			try {
+				scenario = BuildScenario(rec, recordedMs);
+				path = WriteScenarioFile(scenario);
+			} catch (const std::exception& e) {
+				std::lock_guard lock(rec.mtx);
+				rec.state = RecorderState::idle;
+				throw ToolError(500, std::format("recording stopped but could not be persisted: {}", e.what()));
+			}
 
 			// generic_string(), not string(): a bare `dir / filename` join uses the native
 			// separator (backslash on Windows) while the `dir` literal above keeps its forward
@@ -769,12 +861,16 @@ namespace dvb::Recording
 			// split on '/'. generic_string() normalizes the whole path to forward slashes.
 			const std::string pathStr = path.generic_string();
 			const json        activityCounts = SummarizeActivity(rec.activityEvents);
-			a_events.Publish("record.stopped", json{ { "sampleCount", rec.samples.size() },
-												   { "trackingSampleCount", rec.trackingSamples.size() },
-												   { "activityCounts", activityCounts }, { "path", pathStr } });
+			try {
+				a_events.Publish("record.stopped", json{ { "sampleCount", rec.samples.size() },
+													   { "trackingSampleCount", rec.trackingSamples.size() },
+													   { "activityCounts", activityCounts }, { "path", pathStr } });
+			} catch (const std::exception& e) {
+				logs::warn("devbench: record.stopped event publish failed: {}", e.what());
+			}
 			Notify(std::format("devbench: recording stopped — {} samples, {:.1f}s", rec.samples.size(), recordedMs / 1000.0));
 			logs::info("devbench: recording stopped — {} samples, {}ms -> {}", rec.samples.size(), recordedMs, pathStr);
-			return json{
+			json response{
 				{ "action", "stop" },
 				{ "sampleCount", rec.samples.size() },
 				{ "trackingSampleCount", rec.trackingSamples.size() },
@@ -784,12 +880,18 @@ namespace dvb::Recording
 				{ "path", pathStr },
 				{ "meta", scenario["meta"] },
 			};
+			{
+				std::lock_guard lock(rec.mtx);
+				rec.state = RecorderState::idle;
+			}
+			return response;
 		}
 
 		if (action == "status") {
 			std::lock_guard lock(rec.mtx);
 			return json{
 				{ "recording", rec.running.load() },
+				{ "state", RecorderStateName(rec.state) },
 				{ "correlationId", rec.manifest.value("correlationId", std::string{}) },
 				{ "sampleCount", rec.samples.size() },
 				{ "trackingSampleCount", rec.trackingSamples.size() },
@@ -837,6 +939,8 @@ namespace dvb::Recording
 			g_userCocPending.store(true, std::memory_order_relaxed);
 		{
 			std::lock_guard lock(rec.mtx);
+			if (rec.state != RecorderState::running || !rec.running.load(std::memory_order_relaxed))
+				return;
 			rec.commands.push_back(json{ { "command", a_command }, { "frame", game::CurrentFrame() },
 				{ "tMs", duration_cast<milliseconds>(steady_clock::now() - rec.startTick).count() } });
 		}
@@ -862,6 +966,8 @@ namespace dvb::Recording
 		// worldspaces). The trajectory's setpos then refines to the exact spot.
 		{
 			std::lock_guard lock(rec.mtx);
+			if (rec.state != RecorderState::running || !rec.running.load(std::memory_order_relaxed))
+				return;
 			rec.commands.push_back(json{ { "command", a_command }, { "frame", game::CurrentFrame() } });
 		}
 		AppendActivity(json{ { "kind", "cell" }, { "command", a_command } });
@@ -1261,9 +1367,9 @@ namespace dvb::Recording
 		const bool        replayInputs = a_args.value("replayInputs", true);
 		const std::string inputOwner = "recording:" + recordingStem;
 		const json        activityPlan = InterleaveReplayableActivity(rec["steps"],
-			rec.value("activityEvents", json::array()), inputOwner, replayInputs);
+				   rec.value("activityEvents", json::array()), inputOwner, replayInputs);
 		const json        vrPlan = BuildVRTrackedSetReplay(rec.value("trackingSamples", json::array()),
-			rec.value("activityEvents", json::array()), inputOwner, replayInputs);
+				   rec.value("activityEvents", json::array()), inputOwner, replayInputs);
 		const json&       trajectory = activityPlan["steps"];
 		long              cumMs = 0;
 		size_t            cpIdx = 0;
