@@ -36,10 +36,10 @@ TEST_CASE("raw DirectInput scancodes preserve unknown but valid keys")
 TEST_CASE("keyboard leases are idempotent for their owner and reject another owner")
 {
 	KeyboardLeaseTable leases;
-	const KeyboardKey   w = *ResolveKeyboardKey("w");
-	const auto          first = leases.Acquire(w, "task-a", 1000, 5000);
-	const auto          retry = leases.Acquire(w, "task-a", 2000, 5000);
-	const auto          conflict = leases.Acquire(w, "task-b", 2000, 5000);
+	const KeyboardKey  w = *ResolveKeyboardKey("w");
+	const auto         first = leases.Acquire(w, "task-a", 1000, 5000);
+	const auto         retry = leases.Acquire(w, "task-a", 2000, 5000);
+	const auto         conflict = leases.Acquire(w, "task-b", 2000, 5000);
 	CHECK(first.status == KeyboardAcquireStatus::kAcquired);
 	CHECK(retry.status == KeyboardAcquireStatus::kAlreadyOwned);
 	CHECK(retry.lease.generation == first.lease.generation);
@@ -52,7 +52,7 @@ TEST_CASE("keyboard leases are idempotent for their owner and reject another own
 TEST_CASE("keyboard lease release enforces owner unless explicitly forced")
 {
 	KeyboardLeaseTable leases;
-	const KeyboardKey   key = *ResolveKeyboardKey("enter");
+	const KeyboardKey  key = *ResolveKeyboardKey("enter");
 	leases.Acquire(key, "task-a", 100, 5000);
 	CHECK(!leases.Remove(key.scancode, "task-b").has_value());
 	CHECK(leases.Size() == 1);
@@ -65,8 +65,8 @@ TEST_CASE("keyboard lease release enforces owner unless explicitly forced")
 TEST_CASE("generation-qualified cleanup cannot release a newer hold")
 {
 	KeyboardLeaseTable leases;
-	const KeyboardKey   key = *ResolveKeyboardKey("space");
-	const auto          oldLease = leases.Acquire(key, "task-a", 100, 5000).lease;
+	const KeyboardKey  key = *ResolveKeyboardKey("space");
+	const auto         oldLease = leases.Acquire(key, "task-a", 100, 5000).lease;
 	CHECK(leases.RemoveExact(key.scancode, oldLease.generation).has_value());
 	const auto newLease = leases.Acquire(key, "task-a", 200, 5000).lease;
 	CHECK(newLease.generation != oldLease.generation);

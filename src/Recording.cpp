@@ -676,13 +676,13 @@ namespace dvb::Recording
 				Notify("devbench: can't record — load a game or use allowNoPlayer");
 				return json{ { "error", "player not loaded — load a game or pass allowNoPlayer=true to capture main-menu/new-game activity" } };
 			}
-			const bool anchored = manifest.contains("anchor");
+			const bool        anchored = manifest.contains("anchor");
 			const std::string correlationId = a_args.value("correlationId", std::string{});
 			if (correlationId.size() > 128)
 				return json{ { "error", "correlationId must contain at most 128 characters" } };
 			if (!correlationId.empty())
 				manifest["correlationId"] = correlationId;
-			json       openMenus = json::array();
+			json openMenus = json::array();
 			for (const auto& menu : GetOpenMenus())
 				openMenus.push_back(menu);
 			manifest["openMenusAtStart"] = std::move(openMenus);

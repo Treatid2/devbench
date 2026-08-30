@@ -16,17 +16,17 @@ namespace dvb
 		std::string   name;
 	};
 
-	std::optional<KeyboardKey> ResolveKeyboardKey(std::string_view a_name);
-	std::optional<KeyboardKey> ResolveKeyboardKey(int a_scancode);
+	std::optional<KeyboardKey>      ResolveKeyboardKey(std::string_view a_name);
+	std::optional<KeyboardKey>      ResolveKeyboardKey(int a_scancode);
 	const std::vector<KeyboardKey>& KeyboardKeyCatalog();
 
 	struct KeyboardLease
 	{
-		KeyboardKey  key;
-		std::string  owner;
+		KeyboardKey   key;
+		std::string   owner;
 		std::uint64_t generation = 0;
-		std::int64_t pressedAtMs = 0;
-		std::int64_t expiresAtMs = 0;
+		std::int64_t  pressedAtMs = 0;
+		std::int64_t  expiresAtMs = 0;
 	};
 
 	enum class KeyboardAcquireStatus
@@ -54,10 +54,10 @@ namespace dvb
 		std::optional<KeyboardLease> Remove(std::uint16_t a_scancode,
 			std::string_view a_owner, bool a_force = false);
 		std::optional<KeyboardLease> RemoveExact(std::uint16_t a_scancode,
-			std::uint64_t a_generation);
-		std::vector<KeyboardLease> RemoveAll(std::optional<std::string_view> a_owner = std::nullopt);
-		std::vector<KeyboardLease> Snapshot() const;
-		std::size_t Size() const noexcept { return m_leases.size(); }
+			std::uint64_t                                      a_generation);
+		std::vector<KeyboardLease>   RemoveAll(std::optional<std::string_view> a_owner = std::nullopt);
+		std::vector<KeyboardLease>   Snapshot() const;
+		std::size_t                  Size() const noexcept { return m_leases.size(); }
 
 	private:
 		std::vector<KeyboardLease> m_leases;
