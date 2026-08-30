@@ -118,13 +118,13 @@ namespace dvb
 			{
 				std::lock_guard lock(m_mutex);
 				json            out{
-							   { "contract", ContractJson() },
-							   { "device", kDevice },
-							   { "ready", g_vrReady.load(std::memory_order_relaxed) },
-							   { "active", m_active },
-							   { "starting", m_starting },
-							   { "restoring", m_restoring },
-							   { "generation", m_generation },
+					{ "contract", ContractJson() },
+					{ "device", kDevice },
+					{ "ready", g_vrReady.load(std::memory_order_relaxed) },
+					{ "active", m_active },
+					{ "starting", m_starting },
+					{ "restoring", m_restoring },
+					{ "generation", m_generation },
 				};
 				if (m_active) {
 					out["owner"] = m_owner;

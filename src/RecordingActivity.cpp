@@ -195,13 +195,13 @@ namespace dvb::Recording
 	{
 		constexpr int kReplayTailMs = 50;
 		json          report{
-					 { "enabled", a_replayInputs },
-					 { "sourceTrackingSamples", 0 },
-					 { "emittedFrames", 0 },
-					 { "convertedControllerEvents", 0 },
-					 { "unsupportedControllerEvents", 0 },
-					 { "roleFallbackEvents", 0 },
-					 { "exactControllerStateSamples", 0 },
+			{ "enabled", a_replayInputs },
+			{ "sourceTrackingSamples", 0 },
+			{ "emittedFrames", 0 },
+			{ "convertedControllerEvents", 0 },
+			{ "unsupportedControllerEvents", 0 },
+			{ "roleFallbackEvents", 0 },
+			{ "exactControllerStateSamples", 0 },
 		};
 		if (!a_replayInputs || !a_trackingSamples.is_array() || a_trackingSamples.empty())
 			return json{ { "step", nullptr }, { "report", std::move(report) },
@@ -360,16 +360,16 @@ namespace dvb::Recording
 		std::size_t  eventIndex = 0;
 		std::int64_t clockMs = 0;
 		const auto   emitThrough = [&](std::int64_t a_endMs, json& a_out, std::int64_t& a_clock,
-                                     std::size_t& a_index) {
-            while (a_index < replayable.size() &&
-                   replayable[a_index].value("tMs", static_cast<std::int64_t>(0)) <= a_endMs) {
-                const auto eventMs = std::max(a_clock,
-					  replayable[a_index].value("tMs", static_cast<std::int64_t>(0)));
-                AppendWait(a_out, eventMs - a_clock);
-                a_clock = eventMs;
-                a_out.push_back(InputStep(replayable[a_index], a_inputOwner));
-                ++a_index;
-            }
+									   std::size_t& a_index) {
+			while (a_index < replayable.size() &&
+				   replayable[a_index].value("tMs", static_cast<std::int64_t>(0)) <= a_endMs) {
+				const auto eventMs = std::max(a_clock,
+					replayable[a_index].value("tMs", static_cast<std::int64_t>(0)));
+				AppendWait(a_out, eventMs - a_clock);
+				a_clock = eventMs;
+				a_out.push_back(InputStep(replayable[a_index], a_inputOwner));
+				++a_index;
+			}
 		};
 
 		if (a_steps.is_array()) {

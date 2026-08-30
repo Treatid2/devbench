@@ -132,11 +132,11 @@ namespace dvb::Recording
 			const int type = static_cast<int>(a_event.GetEventType());
 			const int device = static_cast<int>(a_event.GetDevice());
 			json      out{
-					 { "kind", "input" },
-					 { "eventType", InputEventTypeName(type) },
-					 { "eventTypeCode", type },
-					 { "device", InputDeviceName(a_event.GetDevice()) },
-					 { "deviceCode", device },
+				{ "kind", "input" },
+				{ "eventType", InputEventTypeName(type) },
+				{ "eventTypeCode", type },
+				{ "device", InputDeviceName(a_event.GetDevice()) },
+				{ "deviceCode", device },
 			};
 			if (const auto* id = a_event.AsIDEvent()) {
 				out["idCode"] = id->GetIDCode();
@@ -194,12 +194,12 @@ namespace dvb::Recording
 				return json(nullptr);
 			const auto pos = pc->GetPosition();
 			json       s{
-					  { "x", pos.x },
-					  { "y", pos.y },
-					  { "z", pos.z },
-					  { "angleZ", pc->GetAngleZ() },  // yaw (radians) — captures rotation-in-place
-					  { "angleX", pc->GetAngleX() },  // pitch (radians) — look up/down (sky vs ground)
-					  { "frame", game::CurrentFrame() },
+				{ "x", pos.x },
+				{ "y", pos.y },
+				{ "z", pos.z },
+				{ "angleZ", pc->GetAngleZ() },  // yaw (radians) — captures rotation-in-place
+				{ "angleX", pc->GetAngleX() },  // pitch (radians) — look up/down (sky vs ground)
+				{ "frame", game::CurrentFrame() },
 			};
 			if (auto* cam = RE::PlayerCamera::GetSingleton(); cam) {
 				// Point of view, normalized to the three states the camera tool can restore.
@@ -289,14 +289,14 @@ namespace dvb::Recording
 					return json{ { "role", a_role }, { "available", false } };
 				const auto& p = poses[a_index];
 				json        out{
-						   { "role", a_role },
-						   { "available", true },
-						   { "index", a_index },
-						   { "connected", p.bDeviceIsConnected },
-						   { "valid", p.bPoseIsValid },
-						   { "trackingResult", static_cast<int>(p.eTrackingResult) },
-						   { "velocity", json::array({ p.vVelocity.v[0], p.vVelocity.v[1], p.vVelocity.v[2] }) },
-						   { "angularVelocity", json::array({ p.vAngularVelocity.v[0], p.vAngularVelocity.v[1], p.vAngularVelocity.v[2] }) },
+					{ "role", a_role },
+					{ "available", true },
+					{ "index", a_index },
+					{ "connected", p.bDeviceIsConnected },
+					{ "valid", p.bPoseIsValid },
+					{ "trackingResult", static_cast<int>(p.eTrackingResult) },
+					{ "velocity", json::array({ p.vVelocity.v[0], p.vVelocity.v[1], p.vVelocity.v[2] }) },
+					{ "angularVelocity", json::array({ p.vAngularVelocity.v[0], p.vAngularVelocity.v[1], p.vAngularVelocity.v[2] }) },
 				};
 				if (p.bPoseIsValid) {
 					json matrix = json::array();
@@ -1367,9 +1367,9 @@ namespace dvb::Recording
 		const bool        replayInputs = a_args.value("replayInputs", true);
 		const std::string inputOwner = "recording:" + recordingStem;
 		const json        activityPlan = InterleaveReplayableActivity(rec["steps"],
-				   rec.value("activityEvents", json::array()), inputOwner, replayInputs);
+			rec.value("activityEvents", json::array()), inputOwner, replayInputs);
 		const json        vrPlan = BuildVRTrackedSetReplay(rec.value("trackingSamples", json::array()),
-				   rec.value("activityEvents", json::array()), inputOwner, replayInputs);
+			rec.value("activityEvents", json::array()), inputOwner, replayInputs);
 		const json&       trajectory = activityPlan["steps"];
 		long              cumMs = 0;
 		size_t            cpIdx = 0;
