@@ -24,6 +24,8 @@ namespace dvb
 		constexpr const char* kDevice = "vrTrackedSet";
 		constexpr int         kDefaultTailMs = 50;
 		constexpr int         kMaximumTailMs = 1000;
+		constexpr int         kControllerRestoreAttempts = 5;
+		constexpr auto        kControllerRestoreRetryDelay = std::chrono::milliseconds(200);
 
 		// Vtable slots from the pinned OpenVR IVRCompositor_022 and IVRSystem_019 ABIs.
 		constexpr std::size_t kIVRCompositorWaitGetPosesSlot = 2;
@@ -326,36 +328,48 @@ namespace dvb
 			bool RestoreControllerIndices(std::uint64_t a_generation, std::string a_event,
 				json a_completion)
 			{
-				try {
-					const json result = MainThread::RunAndWait([this, a_generation,
-																   a_event = std::move(a_event), a_completion = std::move(a_completion)]() mutable -> json {
-						{
-							std::lock_guard lock(m_mutex);
-							if (!m_restoring || m_generation != a_generation)
-								return json{ { "restored", false }, { "superseded", true } };
-							if (m_indicesApplied) {
-								auto* manager = RE::BSInputDeviceManager::GetSingleton();
-								auto* left = manager ? manager->GetVRControllerLeft() : nullptr;
-								auto* right = manager ? manager->GetVRControllerRight() : nullptr;
-								if (!left || !right)
-									throw ToolError(503, "Skyrim VR controller devices are unavailable during restoration");
-								left->GetRuntimeData().trackedDeviceIndex = m_previousLeftIndex;
-								right->GetRuntimeData().trackedDeviceIndex = m_previousRightIndex;
-								m_indicesApplied = false;
+				for (int attempt = 1; attempt <= kControllerRestoreAttempts; ++attempt) {
+					try {
+						const json result = MainThread::RunAndWait([this, a_generation,
+																	   a_event, a_completion]() mutable -> json {
+							{
+								std::lock_guard lock(m_mutex);
+								if (!m_restoring || m_generation != a_generation)
+									return json{ { "restored", false }, { "superseded", true } };
+								if (m_indicesApplied) {
+									auto* manager = RE::BSInputDeviceManager::GetSingleton();
+									auto* left = manager ? manager->GetVRControllerLeft() : nullptr;
+									auto* right = manager ? manager->GetVRControllerRight() : nullptr;
+									if (!left || !right)
+										throw ToolError(503, "Skyrim VR controller devices are unavailable during restoration");
+									left->GetRuntimeData().trackedDeviceIndex = m_previousLeftIndex;
+									right->GetRuntimeData().trackedDeviceIndex = m_previousRightIndex;
+									m_indicesApplied = false;
+								}
+								m_restoring = false;
+								a_completion["controllerIndicesRestored"] = true;
+								m_lastCompletion = a_completion;
 							}
-							m_restoring = false;
-							a_completion["controllerIndicesRestored"] = true;
-							m_lastCompletion = a_completion;
+							if (!a_event.empty())
+								Publish(a_event.c_str(), std::move(a_completion));
+							return json{ { "restored", true } };
+						});
+						return result.value("restored", false);
+					} catch (const ToolError& e) {
+						if (e.code != 503 || attempt == kControllerRestoreAttempts) {
+							logs::warn("devbench: VR tracked-set controller restoration pending after {} attempt(s): {}",
+								attempt, e.what());
+							return false;
 						}
-						if (!a_event.empty())
-							Publish(a_event.c_str(), std::move(a_completion));
-						return json{ { "restored", true } };
-					});
-					return result.value("restored", false);
-				} catch (const std::exception& e) {
-					logs::warn("devbench: VR tracked-set controller restoration pending: {}", e.what());
-					return false;
+						logs::warn("devbench: VR tracked-set controller restoration attempt {}/{} deferred: {}",
+							attempt, kControllerRestoreAttempts, e.what());
+						std::this_thread::sleep_for(kControllerRestoreRetryDelay);
+					} catch (const std::exception& e) {
+						logs::warn("devbench: VR tracked-set controller restoration pending: {}", e.what());
+						return false;
+					}
 				}
+				return false;
 			}
 
 			void AbortActivation(std::uint64_t a_generation)

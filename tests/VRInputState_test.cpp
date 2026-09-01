@@ -86,4 +86,15 @@ TEST_CASE("atomic VR tracked-set validation rejects incomplete or incoherent seq
 	json first = Frame(0);
 	first["seq"] = 1;
 	CHECK_THROWS(ParseVRTrackedInputFrames(json::array({ first, badSeq })));
+
+	for (const auto& field : { "trackingResult", "packetNumber", "originCode" }) {
+		json overflow = Frame(0);
+		if (std::string_view(field) == "trackingResult")
+			overflow["hmd"][field] = 4294967296ULL;
+		else if (std::string_view(field) == "packetNumber")
+			overflow["left"]["controller"][field] = 4294967296ULL;
+		else
+			overflow[field] = 4294967296ULL;
+		CHECK_THROWS(ParseVRTrackedInputFrames(json::array({ overflow })));
+	}
 }

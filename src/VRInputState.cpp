@@ -11,6 +11,23 @@ namespace dvb
 {
 	namespace
 	{
+		std::int64_t BoundedInteger(const json& a_value, std::string_view a_name,
+			std::int64_t a_minimum, std::int64_t a_maximum)
+		{
+			if (!a_value.is_number_integer())
+				throw std::invalid_argument(std::format("'{}' must be an integer", a_name));
+			if (a_value.is_number_unsigned()) {
+				const auto value = a_value.get<std::uint64_t>();
+				if (value > static_cast<std::uint64_t>(a_maximum))
+					throw std::invalid_argument(std::format("'{}' is outside [{},{}]", a_name, a_minimum, a_maximum));
+				return static_cast<std::int64_t>(value);
+			}
+			const auto value = a_value.get<std::int64_t>();
+			if (value < a_minimum || value > a_maximum)
+				throw std::invalid_argument(std::format("'{}' is outside [{},{}]", a_name, a_minimum, a_maximum));
+			return value;
+		}
+
 		bool Boolean(const json& a_parent, const char* a_name, bool a_default)
 		{
 			if (!a_parent.contains(a_name))
@@ -64,11 +81,9 @@ namespace dvb
 			if (index < 0 || index >= 64)
 				throw std::invalid_argument(std::format("'{}.index' must be below 64", a_role));
 			out.index = static_cast<std::uint32_t>(index);
-			if (a_value.contains("trackingResult") && !a_value["trackingResult"].is_number_integer())
-				throw std::invalid_argument(std::format("'{}.trackingResult' must be an integer", a_role));
-			out.trackingResult = a_value.value("trackingResult", 0);
-			if (out.trackingResult < 0 || out.trackingResult > 300)
-				throw std::invalid_argument(std::format("'{}.trackingResult' is outside the OpenVR enum range", a_role));
+			if (a_value.contains("trackingResult"))
+				out.trackingResult = static_cast<std::int32_t>(BoundedInteger(a_value["trackingResult"],
+					std::format("{}.trackingResult", a_role), 0, 300));
 			out.velocity = FloatArray<3>(a_value, "velocity", false);
 			out.angularVelocity = FloatArray<3>(a_value, "angularVelocity", false);
 			if (out.valid)
@@ -87,7 +102,10 @@ namespace dvb
 				if (state.contains(name) && (!state[name].is_number_integer() ||
 												(state[name].type() == json::value_t::number_integer && state[name].get<std::int64_t>() < 0)))
 					throw std::invalid_argument(std::format("'{}.controller.{}' must be a non-negative integer", a_role, name));
-			out.controller.packetNumber = state.value("packetNumber", 0u);
+			if (state.contains("packetNumber"))
+				out.controller.packetNumber = static_cast<std::uint32_t>(BoundedInteger(state["packetNumber"],
+					std::format("{}.controller.packetNumber", a_role), 0,
+					std::numeric_limits<std::uint32_t>::max()));
 			out.controller.pressed = state.value("pressed", std::uint64_t{ 0 });
 			out.controller.touched = state.value("touched", std::uint64_t{ 0 });
 			if (state.contains("axes")) {
@@ -159,11 +177,9 @@ namespace dvb
 			if (frame.seq == 0 || (i > 0 && frame.seq <= previousSeq))
 				throw std::invalid_argument(std::format("frames[{}].seq must be strictly increasing and non-zero", i));
 			previousSeq = frame.seq;
-			if (item.contains("originCode") && !item["originCode"].is_number_integer())
-				throw std::invalid_argument(std::format("frames[{}].originCode must be an integer", i));
-			frame.originCode = item.value("originCode", 1);
-			if (frame.originCode < 0 || frame.originCode > 2)
-				throw std::invalid_argument(std::format("frames[{}].originCode must be 0, 1, or 2", i));
+			if (item.contains("originCode"))
+				frame.originCode = static_cast<std::int32_t>(BoundedInteger(item["originCode"],
+					std::format("frames[{}].originCode", i), 0, 2));
 			if (originCode && frame.originCode != *originCode)
 				throw std::invalid_argument(std::format("frames[{}].originCode changed within one atomic sequence", i));
 			originCode = frame.originCode;
