@@ -628,7 +628,7 @@ namespace dvb::Recording
 		std::string SerializeRecording(const json& a_scenario)
 		{
 			std::string s = "{\n\"meta\": " + a_scenario.value("meta", json::object()).dump(2);
-			const auto isCompactArray = [](std::string_view a_key, const json& a_value) {
+			const auto  isCompactArray = [](std::string_view a_key, const json& a_value) {
 				return a_value.is_array() &&
 				       (a_key == "steps" || a_key == "activityEvents" || a_key == "trackingSamples");
 			};
