@@ -153,7 +153,6 @@ namespace dvb
 
 	std::optional<KeyboardKey> ResolveKeyboardKey(std::string_view a_name)
 	{
-		// Hyphens normally act as word separators, but the literal minus key is an advertised alias.
 		if (a_name == "-")
 			return KeyboardKey{ 0x0C, "minus" };
 		const std::string wanted = Normalize(a_name);

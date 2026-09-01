@@ -1370,13 +1370,19 @@ namespace dvb::Recording
 		const std::string recordingStem = fs::path(path).stem().string();
 		const bool        replayInputs = a_args.value("replayInputs", true);
 		const std::string inputOwner = "recording:" + recordingStem;
-		const json        activityPlan = InterleaveReplayableActivity(rec["steps"],
-			rec.value("activityEvents", json::array()), inputOwner, replayInputs);
-		const json        vrPlan = BuildVRTrackedSetReplay(rec.value("trackingSamples", json::array()),
-			rec.value("activityEvents", json::array()), inputOwner, replayInputs);
-		const json&       trajectory = activityPlan["steps"];
-		long              cumMs = 0;
-		size_t            cpIdx = 0;
+		json              activityPlan;
+		json              vrPlan;
+		try {
+			activityPlan = InterleaveReplayableActivity(rec["steps"],
+				rec.value("activityEvents", json::array()), inputOwner, replayInputs);
+			vrPlan = BuildVRTrackedSetReplay(rec.value("trackingSamples", json::array()),
+				rec.value("activityEvents", json::array()), inputOwner, replayInputs);
+		} catch (const std::invalid_argument& e) {
+			throw ToolError(400, std::format("invalid recording activity/tracking data: {}", e.what()));
+		}
+		const json& trajectory = activityPlan["steps"];
+		long        cumMs = 0;
+		size_t      cpIdx = 0;
 		if (!vrPlan.value("step", json(nullptr)).is_null())
 			steps.push_back(vrPlan["step"]);
 		for (const auto& s : trajectory) {
