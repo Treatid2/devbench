@@ -3,12 +3,16 @@
 #include "Json.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace dvb
 {
+	inline constexpr std::size_t  kMaximumVRTrackedFrames = 60000;
+	inline constexpr std::int64_t kMaximumVRTrackedDurationMs = 30 * 60 * 1000;
+
 	struct VRTrackedPoseState
 	{
 		bool                  available = false;

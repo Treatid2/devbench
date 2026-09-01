@@ -9,7 +9,7 @@ from __future__ import annotations
 from conftest import require_enum, require_tool
 
 
-def test_keyboard_input_capability_contract(client, tool_schema):
+def test_input_capability_contract(client, tool_schema):
     desc = require_tool(tool_schema, "input")
     require_enum(desc, "action", "capabilities")
     body = client.ok("input", {"action": "capabilities"})

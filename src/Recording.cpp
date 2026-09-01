@@ -74,6 +74,7 @@ namespace dvb::Recording
 
 		std::string InputDeviceName(RE::INPUT_DEVICE a_device)
 		{
+			// Raw device codes are intentional: code 3 identifies different devices in VR and flat runtimes.
 			const int code = static_cast<int>(a_device);
 			switch (code) {
 			case 0:
@@ -145,9 +146,6 @@ namespace dvb::Recording
 			}
 
 			if (const auto* button = a_event.AsButtonEvent()) {
-				out["idCode"] = button->GetIDCode();
-				if (const char* user = button->GetUserEvent().c_str(); user && *user)
-					out["userEvent"] = user;
 				out["value"] = button->Value();
 				out["heldSeconds"] = button->HeldDuration();
 				out["state"] = button->IsDown() ? "down" : button->IsHeld() ? "held" :
@@ -310,7 +308,7 @@ namespace dvb::Recording
 					vr::VRControllerState_t state{};
 					if (system->GetControllerState(a_index, &state, sizeof(state))) {
 						json axes = json::array();
-						for (std::uint32_t axis = 0; axis < 5; ++axis) {
+						for (std::uint32_t axis = 0; axis < vr::k_unControllerStateAxisCount; ++axis) {
 							axes.push_back(json::array({ state.rAxis[axis].x, state.rAxis[axis].y }));
 						}
 						out["controller"] = json{ { "packetNumber", state.unPacketNum },
@@ -630,31 +628,37 @@ namespace dvb::Recording
 		std::string SerializeRecording(const json& a_scenario)
 		{
 			std::string s = "{\n\"meta\": " + a_scenario.value("meta", json::object()).dump(2);
-			// Preserve any other top-level keys a consumer added (only meta/steps get special
-			// formatting) so a validate round-trip stays lossless.
+			const auto isCompactArray = [](std::string_view a_key, const json& a_value) {
+				return a_value.is_array() &&
+				       (a_key == "steps" || a_key == "activityEvents" || a_key == "trackingSamples");
+			};
+			// Preserve caller-added or wrong-typed top-level values verbatim. Only arrays with a
+			// known high-volume shape receive compact one-item-per-line formatting.
 			for (auto it = a_scenario.begin(); it != a_scenario.end(); ++it)
-				if (it.key() != "meta" && it.key() != "steps" && it.key() != "activityEvents" &&
-					it.key() != "trackingSamples")
+				if (it.key() != "meta" && !isCompactArray(it.key(), *it))
 					s += ",\n" + json(it.key()).dump() + ": " + it->dump(2);
-			if (a_scenario.contains("activityEvents")) {
+			if (a_scenario.contains("activityEvents") && a_scenario["activityEvents"].is_array()) {
 				s += ",\n\"activityEvents\": [\n";
 				const json& events = a_scenario["activityEvents"];
 				for (size_t i = 0; i < events.size(); ++i)
 					s += events[i].dump() + (i + 1 < events.size() ? ",\n" : "\n");
 				s += "]";
 			}
-			if (a_scenario.contains("trackingSamples")) {
+			if (a_scenario.contains("trackingSamples") && a_scenario["trackingSamples"].is_array()) {
 				s += ",\n\"trackingSamples\": [\n";
 				const json& samples = a_scenario["trackingSamples"];
 				for (size_t i = 0; i < samples.size(); ++i)
 					s += samples[i].dump() + (i + 1 < samples.size() ? ",\n" : "\n");
 				s += "]";
 			}
-			s += ",\n\"steps\": [\n";
-			const json& steps = a_scenario.value("steps", json::array());
-			for (size_t i = 0; i < steps.size(); ++i)
-				s += steps[i].dump() + (i + 1 < steps.size() ? ",\n" : "\n");
-			s += "]\n}\n";
+			if (!a_scenario.contains("steps") || a_scenario["steps"].is_array()) {
+				s += ",\n\"steps\": [\n";
+				const json steps = a_scenario.value("steps", json::array());
+				for (size_t i = 0; i < steps.size(); ++i)
+					s += steps[i].dump() + (i + 1 < steps.size() ? ",\n" : "\n");
+				s += "]";
+			}
+			s += "\n}\n";
 			return s;
 		}
 
@@ -1343,7 +1347,7 @@ namespace dvb::Recording
 		// Fail fast if a menu/modal is open before an in-game trajectory plays: its
 		// setpos/setangle would otherwise be eaten. A recording explicitly started without a
 		// player is a main-menu/new-game trace; its initial menus are the subject, not a blocker
-		// (the in-game guard fixed the silent no-op replay from issue #63).
+		// (without the in-game guard, such a replay silently no-ops).
 		const bool allowsInitialMenus = meta.value("startState", std::string{}) == "noPlayer";
 		if (!allowsInitialMenus)
 			steps.push_back(json{ { "assert", "noBlockingMenu" } });

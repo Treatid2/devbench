@@ -6,6 +6,7 @@
 #include "MainThread.h"
 #include "ToolRegistry.h"
 #include "VRInput.h"
+#include "VRInputState.h"
 
 #include <RE/B/BSInputEventQueue.h>
 
@@ -270,6 +271,8 @@ namespace dvb
 					}
 					const auto key = ParseKey(event);
 					if (action == "tap") {
+						if (balanced.contains(key.scancode))
+							throw ToolError(400, std::format("sequence taps key '{}' while it is held by an earlier sequence down", key.name));
 						totalMs += BoundedInteger(event, "durationMs", kDefaultTapMs, 10, 5000);
 					} else if (action == "down") {
 						if (!balanced.insert(key.scancode).second)
@@ -540,7 +543,7 @@ namespace dvb
 								{ "force", json{ { "type", "boolean" }, { "description", "up: override owner mismatch (default false)" } } },
 								{ "all", json{ { "type", "boolean" }, { "description", "releaseAll: release all owners, not only this caller (default false)" } } },
 								{ "events", json{ { "type", "array" }, { "minItems", 1 }, { "maxItems", kMaximumSequenceEvents }, { "description", "sequence: balanced [{action:tap|down|up|wait,key?,durationMs?,afterMs?}]" }, { "items", json{ { "type", "object" } } } } },
-								{ "frames", json{ { "type", "array" }, { "minItems", 1 }, { "maxItems", 60000 }, { "description", "vrTrackedSet sequence: monotonic atomic frames; each requires tMs, originCode, hmd, left, right; controller objects carry packetNumber/pressed/touched/five axes" }, { "items", json{ { "type", "object" } } } } },
+								{ "frames", json{ { "type", "array" }, { "minItems", 1 }, { "maxItems", kMaximumVRTrackedFrames }, { "description", "vrTrackedSet sequence: monotonic atomic frames; each requires tMs, originCode, hmd, left, right; controller objects carry packetNumber/pressed/touched/five axes" }, { "items", json{ { "type", "object" } } } } },
 								{ "tailMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", 1000 }, { "description", "vrTrackedSet sequence: final-state visibility before automatic release (default 50ms)" } } },
 								{ "surviveLifecycle", json{ { "type", "boolean" }, { "description", "vrTrackedSet sequence: keep this owned stream active across recorded load/new-game boundaries (default false; record replay sets true)" } } },
 							} },

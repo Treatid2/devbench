@@ -25,6 +25,17 @@ namespace dvb
 		constexpr int         kDefaultTailMs = 50;
 		constexpr int         kMaximumTailMs = 1000;
 
+		// Vtable slots from the pinned OpenVR IVRCompositor_022 and IVRSystem_019 ABIs.
+		constexpr std::size_t kIVRCompositorWaitGetPosesSlot = 2;
+		constexpr std::size_t kIVRCompositorGetLastPosesSlot = 3;
+		constexpr std::size_t kIVRSystemGetDeviceToAbsoluteTrackingPoseSlot = 11;
+		constexpr std::size_t kIVRSystemGetTrackedDeviceIndexForControllerRoleSlot = 18;
+		constexpr std::size_t kIVRSystemGetControllerRoleForTrackedDeviceIndexSlot = 19;
+		constexpr std::size_t kIVRSystemGetTrackedDeviceClassSlot = 20;
+		constexpr std::size_t kIVRSystemIsTrackedDeviceConnectedSlot = 21;
+		constexpr std::size_t kIVRSystemGetControllerStateSlot = 34;
+		constexpr std::size_t kIVRSystemGetControllerStateWithPoseSlot = 35;
+
 		std::atomic<bool> g_vrReady{ false };
 
 		bool BooleanArgument(const json& a_args, const char* a_name, bool a_default)
@@ -90,7 +101,7 @@ namespace dvb
 			out.unPacketNum = a_state.packetNumber;
 			out.ulButtonPressed = a_state.pressed;
 			out.ulButtonTouched = a_state.touched;
-			for (std::size_t i = 0; i < 5; ++i) {
+			for (std::size_t i = 0; i < vr::k_unControllerStateAxisCount; ++i) {
 				out.rAxis[i].x = a_state.axes[i * 2];
 				out.rAxis[i].y = a_state.axes[i * 2 + 1];
 			}
@@ -692,17 +703,17 @@ namespace dvb
 				return false;
 
 			REL::Relocation<std::uintptr_t> compositorVtable{ *reinterpret_cast<std::uintptr_t*>(compositor) };
-			g_waitGetPoses = compositorVtable.write_vfunc(2, WaitGetPosesHook);
-			g_getLastPoses = compositorVtable.write_vfunc(3, GetLastPosesHook);
+			g_waitGetPoses = compositorVtable.write_vfunc(kIVRCompositorWaitGetPosesSlot, WaitGetPosesHook);
+			g_getLastPoses = compositorVtable.write_vfunc(kIVRCompositorGetLastPosesSlot, GetLastPosesHook);
 
 			REL::Relocation<std::uintptr_t> systemVtable{ *reinterpret_cast<std::uintptr_t*>(system) };
-			g_getTrackingPose = systemVtable.write_vfunc(11, GetTrackingPoseHook);
-			g_roleIndex = systemVtable.write_vfunc(18, RoleIndexHook);
-			g_indexRole = systemVtable.write_vfunc(19, IndexRoleHook);
-			g_deviceClass = systemVtable.write_vfunc(20, DeviceClassHook);
-			g_connected = systemVtable.write_vfunc(21, ConnectedHook);
-			g_controllerState = systemVtable.write_vfunc(34, ControllerStateHook);
-			g_controllerStatePose = systemVtable.write_vfunc(35, ControllerStatePoseHook);
+			g_getTrackingPose = systemVtable.write_vfunc(kIVRSystemGetDeviceToAbsoluteTrackingPoseSlot, GetTrackingPoseHook);
+			g_roleIndex = systemVtable.write_vfunc(kIVRSystemGetTrackedDeviceIndexForControllerRoleSlot, RoleIndexHook);
+			g_indexRole = systemVtable.write_vfunc(kIVRSystemGetControllerRoleForTrackedDeviceIndexSlot, IndexRoleHook);
+			g_deviceClass = systemVtable.write_vfunc(kIVRSystemGetTrackedDeviceClassSlot, DeviceClassHook);
+			g_connected = systemVtable.write_vfunc(kIVRSystemIsTrackedDeviceConnectedSlot, ConnectedHook);
+			g_controllerState = systemVtable.write_vfunc(kIVRSystemGetControllerStateSlot, ControllerStateHook);
+			g_controllerStatePose = systemVtable.write_vfunc(kIVRSystemGetControllerStateWithPoseSlot, ControllerStatePoseHook);
 			return true;
 		}
 	}
@@ -725,8 +736,8 @@ namespace dvb
 			{ "ownership", "one bounded sequence owner; cleanup always stops the whole set" },
 			{ "lifecyclePolicy", "default stop; recording replay may explicitly survive recorded load/new-game boundaries" },
 			{ "passThroughWhenInactive", true },
-			{ "maximumFrames", 60000 },
-			{ "maximumDurationMs", 30 * 60 * 1000 },
+			{ "maximumFrames", kMaximumVRTrackedFrames },
+			{ "maximumDurationMs", kMaximumVRTrackedDurationMs },
 		};
 	}
 

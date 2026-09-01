@@ -82,6 +82,12 @@ TEST_CASE("legacy controller events become atomic tracked-set frames without los
 	CHECK(plan["step"]["args"]["tailMs"] == 50);
 	CHECK(plan["report"]["convertedControllerEvents"] == 2);
 	CHECK(plan["report"]["roleFallbackEvents"] == 0);
+
+	const json fallbackPlan = BuildVRTrackedSetReplay(samples,
+		json::array({ Button(40, 3, "oculusPrimary", "down", 33) }), "recording:test", true);
+	CHECK(fallbackPlan["report"]["roleFallbackEvents"] == 1);
+	CHECK(fallbackPlan["step"]["args"]["frames"][2]["right"]["controller"]["pressed"].get<std::uint64_t>() ==
+	      (std::uint64_t{ 1 } << 33));
 }
 
 TEST_CASE("VR tracked-set replay rejects malformed source samples before returning steps")

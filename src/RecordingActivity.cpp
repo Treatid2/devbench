@@ -13,6 +13,8 @@ namespace dvb::Recording
 {
 	namespace
 	{
+		constexpr std::int64_t kRecordedHoldCapMs = 60000;
+
 		bool IsKeyboardTransition(const json& a_event)
 		{
 			if (a_event.value("kind", std::string{}) != "input" ||
@@ -115,7 +117,7 @@ namespace dvb::Recording
 				{ "owner", a_owner },
 			};
 			if (args["action"] == "down")
-				args["maxHoldMs"] = 60000;
+				args["maxHoldMs"] = kRecordedHoldCapMs;
 			return json{ { "tool", "input" }, { "args", std::move(args) },
 				{ "label", "recorded keyboard input" } };
 		}

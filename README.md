@@ -202,10 +202,10 @@ The `record` tool captures a manual play-through as a replayable scenario file:
    player pose + point-of-view every `intervalMs` ms (default from `recordIntervalMs`, min 10),
    including HMD and left/right wand world transforms after the player loads. On VR it also
    samples raw OpenVR HMD/left/right tracking-space poses, velocities, validity, connection state,
-   device index/class/role, and both controllers' complete packet/button/touch/five-axis state. That stream
-   is available at the main menu before Skyrim creates the player,
-   on a background thread, captures a one-time scene manifest, and notes the entry point (the
-   save loaded or cell `coc`'d to — captured even for saves/loads you do through the menu).
+   device index/class/role, and both controllers' complete packet/button/touch/five-axis state. The
+   raw OpenVR stream is available at the main menu before Skyrim creates the player. A background
+   sampling thread captures that stream, a one-time scene manifest, and the entry point (the save
+   loaded or cell `coc`'d to — captured even for saves/loads you do through the menu).
 3. Play through the scene — movement, point-of-view changes, every normalized keyboard/mouse/
    gamepad/VR-controller event, menu and lifecycle transitions, cell transitions
    (doors/`coc`/`cow`), and console commands are captured on the same clock. Then call `record`
@@ -217,8 +217,9 @@ The `record` tool captures a manual play-through as a replayable scenario file:
 
    `meta.activityCapture` publishes the activity contract and replay matrix. The top-level
    `activityEvents` stream is capture-complete for the normalized Skyrim event types exposed by
-   CommonLib. Contract v2 replays keyboard transitions and one atomic OpenVR tracked set containing
-   HMD plus both controllers. New captures preserve exact controller state per tracking sample.
+   CommonLib. Activity contract v1.1 records exact controller state per tracking sample; input
+   contract v2 replays keyboard transitions and one atomic OpenVR tracked set containing the HMD
+   plus both controllers.
    Legacy captures are upgraded using wand indices and inserted transition frames; reports disclose
    any right-handed role fallback or unsupported event instead of pretending it was reproduced.
 

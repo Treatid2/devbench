@@ -115,7 +115,7 @@ namespace dvb
 			logs::info("devbench: input activity sink installed (record hotkey={} shift={}, replay hotkey={} shift={})",
 				g_recordKey.load(), g_recordShift.load(), g_replayKey.load(), g_replayShift.load());
 		} else {
-			logs::warn("devbench: BSInputDeviceManager unavailable — input hotkeys NOT installed");
+			logs::warn("devbench: BSInputDeviceManager unavailable — input activity sink NOT installed (no hotkeys or input capture)");
 		}
 	}
 
