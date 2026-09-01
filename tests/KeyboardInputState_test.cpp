@@ -12,6 +12,7 @@ TEST_CASE("keyboard aliases normalize case and separators to DirectInput scancod
 	const auto pageUp = ResolveKeyboardKey("Page_Up");
 	const auto arrow = ResolveKeyboardKey("arrow-up");
 	const auto enter = ResolveKeyboardKey("RETURN");
+	const auto minus = ResolveKeyboardKey("-");
 	CHECK(pageUp.has_value());
 	CHECK(pageUp->scancode == 0xC9);
 	CHECK(pageUp->name == "pageUp");
@@ -19,6 +20,9 @@ TEST_CASE("keyboard aliases normalize case and separators to DirectInput scancod
 	CHECK(arrow->scancode == 0xC8);
 	CHECK(enter.has_value());
 	CHECK(enter->scancode == 0x1C);
+	CHECK(minus.has_value());
+	CHECK(minus->scancode == 0x0C);
+	CHECK(minus->name == "minus");
 }
 
 TEST_CASE("raw DirectInput scancodes preserve unknown but valid keys")

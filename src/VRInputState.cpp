@@ -11,9 +11,6 @@ namespace dvb
 {
 	namespace
 	{
-		constexpr std::size_t kMaximumFrames = 60000;
-		constexpr auto        kMaximumDurationMs = 30 * 60 * 1000;
-
 		bool Boolean(const json& a_parent, const char* a_name, bool a_default)
 		{
 			if (!a_parent.contains(a_name))
@@ -133,8 +130,8 @@ namespace dvb
 
 	std::vector<VRTrackedInputFrame> ParseVRTrackedInputFrames(const json& a_frames)
 	{
-		if (!a_frames.is_array() || a_frames.empty() || a_frames.size() > kMaximumFrames)
-			throw std::invalid_argument(std::format("'frames' must contain 1..{} atomic VR frames", kMaximumFrames));
+		if (!a_frames.is_array() || a_frames.empty() || a_frames.size() > kMaximumVRTrackedFrames)
+			throw std::invalid_argument(std::format("'frames' must contain 1..{} atomic VR frames", kMaximumVRTrackedFrames));
 		std::vector<VRTrackedInputFrame> out;
 		out.reserve(a_frames.size());
 		std::int64_t                 previous = -1;
@@ -150,8 +147,8 @@ namespace dvb
 			if (!item.contains("tMs") || !item["tMs"].is_number_integer())
 				throw std::invalid_argument(std::format("frames[{}].tMs must be an integer", i));
 			frame.tMs = item["tMs"].get<std::int64_t>();
-			if (frame.tMs < 0 || frame.tMs > kMaximumDurationMs || (i > 0 && frame.tMs <= previous))
-				throw std::invalid_argument(std::format("frames[{}].tMs must be strictly increasing in [0,{}]", i, kMaximumDurationMs));
+			if (frame.tMs < 0 || frame.tMs > kMaximumVRTrackedDurationMs || (i > 0 && frame.tMs <= previous))
+				throw std::invalid_argument(std::format("frames[{}].tMs must be strictly increasing in [0,{}]", i, kMaximumVRTrackedDurationMs));
 			if (i == 0 && frame.tMs != 0)
 				throw std::invalid_argument("frames[0].tMs must be 0 so the complete tracked set is defined immediately");
 			previous = frame.tMs;
