@@ -2395,9 +2395,19 @@ namespace dvb
 																					   },
 									inputCtx);
 								json             item{ { "device", device }, { "ok", released.ok } };
-								if (released.ok)
+								if (released.ok) {
 									item["result"] = released.value;
-								else {
+									const bool semanticFailure =
+										(device == std::string_view("keyboard") &&
+											released.value.value("failed", json::array()).size() != 0) ||
+										(device == std::string_view("vrTrackedSet") &&
+											released.value.value("restorationPending", false));
+									if (semanticFailure) {
+										ok = false;
+										item["ok"] = false;
+										item["semanticFailure"] = true;
+									}
+								} else {
 									ok = false;
 									item["errorCode"] = released.errorCode;
 									item["error"] = released.errorMessage;
@@ -2407,16 +2417,24 @@ namespace dvb
 							return json{ { "needed", true }, { "ok", ok }, { "results", std::move(results) } };
 						};
 						// Clear a same-owner lease left by an interrupted prior replay before injecting.
-						releaseRecordedInput();
+						const json initialCleanup = releaseRecordedInput();
+						if (!initialCleanup.value("ok", true))
+							throw ToolError(409, "recorded input cleanup is still pending; retry after controller/key restoration succeeds");
 						json result;
 						try {
 							result = ScenarioHandler(json{ { "steps", steps }, { "runId", runId } }, a_ctx, a_registry, a_events);
 						} catch (const std::exception& e) {
-							releaseRecordedInput();
+							const json cleanup = releaseRecordedInput();
 							a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", false }, { "error", e.what() } });
+							if (!cleanup.value("ok", true))
+								logs::warn("devbench: replay failed and recorded input cleanup remains pending");
 							throw;
 						}
 						result["inputCleanup"] = releaseRecordedInput();
+						if (!result["inputCleanup"].value("ok", true)) {
+							result["ok"] = false;
+							result["inputCleanupFailed"] = true;
+						}
 						result["coupling"] = coupling;  // surface effective tier / override
 						result["activity"] = activity;
 						result["checkpoints"] = SummarizeCheckpoints(result);

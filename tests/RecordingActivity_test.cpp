@@ -99,6 +99,37 @@ TEST_CASE("VR tracked-set replay rejects malformed source samples before returni
 	CHECK_THROWS(BuildVRTrackedSetReplay(duplicate, json::array(), "recording:test", true));
 }
 
+TEST_CASE("same-millisecond controller transitions remain distinct atomic frames")
+{
+	const auto pose = [](int index) {
+		return json{ { "available", true }, { "connected", true }, { "valid", true },
+			{ "index", index }, { "trackingResult", 200 },
+			{ "matrix", json::array({ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 }) },
+			{ "velocity", json::array({ 0, 0, 0 }) },
+			{ "angularVelocity", json::array({ 0, 0, 0 }) } };
+	};
+	const json samples = json::array({
+		json{ { "tMs", 10 }, { "originCode", 1 }, { "hmd", pose(0) },
+			{ "left", pose(1) }, { "right", pose(2) } },
+		json{ { "tMs", 20 }, { "originCode", 1 }, { "hmd", pose(0) },
+			{ "left", pose(1) }, { "right", pose(2) } },
+	});
+	json       down = Button(10, 1, "oculusPrimary", "down", 33);
+	down["wandIndex"] = 2;
+	json up = Button(10, 2, "oculusPrimary", "up", 33);
+	up["wandIndex"] = 2;
+
+	const json  plan = BuildVRTrackedSetReplay(samples, json::array({ down, up }),
+		"recording:test", true);
+	const auto& frames = plan["step"]["args"]["frames"];
+	CHECK(frames[2]["tMs"] == 11);
+	CHECK(frames[2]["right"]["controller"]["pressed"].get<std::uint64_t>() ==
+		  (std::uint64_t{ 1 } << 33));
+	CHECK(frames[3]["tMs"] == 12);
+	CHECK(frames[3]["right"]["controller"]["pressed"] == 0);
+	CHECK(plan["report"]["timestampAdjustedControllerEvents"] == 2);
+}
+
 TEST_CASE("trajectory atMs preserves an initial no-player recording delay")
 {
 	const json   steps = json::array({

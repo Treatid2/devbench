@@ -3,7 +3,11 @@
 #include "VRInputState.h"
 
 using dvb::json;
+using dvb::ParseBoundedIntegerArgument;
 using dvb::ParseVRTrackedInputFrames;
+using dvb::VRSequenceFinishAction;
+using dvb::VRSequenceStopAccess;
+using dvb::VRSequenceTransaction;
 using dvb::VRTrackedInputFrameJson;
 
 namespace
@@ -42,6 +46,16 @@ TEST_CASE("atomic VR tracked-set frames validate and round trip")
 	const json encoded = VRTrackedInputFrameJson(frames[0]);
 	CHECK(encoded["hmd"]["index"] == 0);
 	CHECK(encoded["left"]["controller"]["axes"][0][0] == 0.25f);
+}
+
+TEST_CASE("bounded JSON integers reject overflow before narrowing")
+{
+	CHECK(ParseBoundedIntegerArgument(json::object(), "tailMs", 50, 10, 1000) == 50);
+	CHECK(ParseBoundedIntegerArgument(json{ { "tailMs", 1000 } }, "tailMs", 50, 10, 1000) == 1000);
+	CHECK_THROWS(ParseBoundedIntegerArgument(
+		json{ { "tailMs", 4294967306ULL } }, "tailMs", 50, 10, 1000));
+	CHECK_THROWS(ParseBoundedIntegerArgument(
+		json{ { "tailMs", -4294967306LL } }, "tailMs", 50, 10, 1000));
 }
 
 TEST_CASE("atomic VR tracked-set validation rejects incomplete or incoherent sequences")
@@ -97,4 +111,67 @@ TEST_CASE("atomic VR tracked-set validation rejects incomplete or incoherent seq
 			overflow[field] = 4294967296ULL;
 		CHECK_THROWS(ParseVRTrackedInputFrames(json::array({ overflow })));
 	}
+}
+
+TEST_CASE("VR sequence transaction cancels startup before mutation")
+{
+	VRSequenceTransaction state;
+	CHECK(state.Begin("owner", "secret", false));
+	const auto generation = state.Generation();
+	CHECK(state.Starting());
+
+	const auto decision = state.CancelForLifecycle();
+	CHECK(decision.present);
+	CHECK(!decision.preserved);
+	CHECK(decision.generation == generation);
+	CHECK(!state.CanApplyIndices(generation));
+	CHECK(state.ClaimFinish(generation) == VRSequenceFinishAction::kPublish);
+	CHECK(!state.Busy());
+}
+
+TEST_CASE("VR sequence restoration is retained and retryable")
+{
+	VRSequenceTransaction state;
+	CHECK(state.Begin("owner", "secret", false));
+	const auto generation = state.Generation();
+	CHECK(state.MarkIndicesApplied(generation));
+	CHECK(state.Commit(generation));
+	CHECK(state.ClaimFinish(generation) == VRSequenceFinishAction::kRestore);
+	CHECK(state.Restoring());
+	CHECK(state.RestoreAttemptActive());
+
+	state.RestoreFailed(generation);
+	CHECK(state.Restoring());
+	CHECK(!state.RestoreAttemptActive());
+	CHECK(state.ClaimFinish(generation) == VRSequenceFinishAction::kRestore);
+	CHECK(state.RestoreSucceeded(generation));
+	CHECK(!state.Busy());
+	CHECK(!state.IndicesApplied());
+	CHECK(state.ClaimFinish(generation) == VRSequenceFinishAction::kNone);
+}
+
+TEST_CASE("VR sequence stop authority is token and owner scoped")
+{
+	VRSequenceTransaction state;
+	CHECK(state.Begin("owner", "secret", false));
+	CHECK(state.AuthorizeStop("owner", "wrong", false, false) ==
+		  VRSequenceStopAccess::kControlTokenMismatch);
+	CHECK(state.AuthorizeStop("other", "secret", false, false) ==
+		  VRSequenceStopAccess::kOwnerMismatch);
+	CHECK(state.AuthorizeStop("owner", "secret", true, false) ==
+		  VRSequenceStopAccess::kForceRequiresInternal);
+	CHECK(state.AuthorizeStop("owner", "secret", false, false) ==
+		  VRSequenceStopAccess::kAllowed);
+	CHECK(state.AuthorizeStop("other", "", true, true) ==
+		  VRSequenceStopAccess::kAllowed);
+}
+
+TEST_CASE("only internal replay may survive lifecycle cleanup")
+{
+	VRSequenceTransaction state;
+	CHECK(state.Begin("replay", "secret", true));
+	const auto decision = state.CancelForLifecycle();
+	CHECK(decision.present);
+	CHECK(decision.preserved);
+	CHECK(state.Starting());
 }
