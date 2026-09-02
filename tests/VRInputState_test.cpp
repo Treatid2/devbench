@@ -52,10 +52,15 @@ TEST_CASE("bounded JSON integers reject overflow before narrowing")
 {
 	CHECK(ParseBoundedIntegerArgument(json::object(), "tailMs", 50, 10, 1000) == 50);
 	CHECK(ParseBoundedIntegerArgument(json{ { "tailMs", 1000 } }, "tailMs", 50, 10, 1000) == 1000);
-	CHECK_THROWS(ParseBoundedIntegerArgument(
-		json{ { "tailMs", 4294967306ULL } }, "tailMs", 50, 10, 1000));
-	CHECK_THROWS(ParseBoundedIntegerArgument(
-		json{ { "tailMs", -4294967306LL } }, "tailMs", 50, 10, 1000));
+	CHECK_THROWS_AS(ParseBoundedIntegerArgument(
+						json{ { "tailMs", 4294967306ULL } }, "tailMs", 50, 10, 1000),
+		std::invalid_argument);
+	CHECK_THROWS_AS(ParseBoundedIntegerArgument(
+						json{ { "tailMs", -4294967306LL } }, "tailMs", 50, 10, 1000),
+		std::invalid_argument);
+	CHECK_THROWS_AS(ParseBoundedIntegerArgument(
+						json::parse(R"({"tailMs":5})"), "tailMs", 50, 10, 1000),
+		std::invalid_argument);
 }
 
 TEST_CASE("atomic VR tracked-set validation rejects incomplete or incoherent sequences")

@@ -1420,6 +1420,8 @@ namespace dvb::Recording
 				rec.value("activityEvents", json::array()), inputOwner, replayInputs);
 			vrPlan = BuildVRTrackedSetReplay(rec.value("trackingSamples", json::array()),
 				rec.value("activityEvents", json::array()), inputOwner, replayInputs);
+		} catch (const json::exception& e) {
+			throw ToolError(400, std::format("invalid recording activity/tracking data: {}", e.what()));
 		} catch (const std::invalid_argument& e) {
 			throw ToolError(400, std::format("invalid recording activity/tracking data: {}", e.what()));
 		}

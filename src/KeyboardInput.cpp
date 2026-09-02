@@ -330,8 +330,14 @@ namespace dvb
 							std::this_thread::sleep_for(milliseconds(afterMs));
 					}
 				} catch (...) {
-					for (const auto& lease : opened)
-						ReleaseGenerationWithRetry(lease.key.scancode, lease.generation, "sequenceFailure");
+					for (const auto& lease : opened) {
+						try {
+							ReleaseGenerationWithRetry(lease.key.scancode, lease.generation, "sequenceFailure");
+						} catch (const std::exception& e) {
+							logs::warn("devbench: sequence cleanup could not release '{}' (generation {}): {}",
+								lease.key.name, lease.generation, e.what());
+						}
+					}
 					throw;
 				}
 
