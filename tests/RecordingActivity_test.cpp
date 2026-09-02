@@ -99,6 +99,25 @@ TEST_CASE("VR tracked-set replay rejects malformed source samples before returni
 	CHECK_THROWS(BuildVRTrackedSetReplay(duplicate, json::array(), "recording:test", true));
 }
 
+TEST_CASE("keyboard replay planning rejects wrong-typed ordering fields")
+{
+	const json badTime = json::array({
+		json{ { "kind", "input" }, { "eventType", "button" }, { "device", "keyboard" },
+			{ "state", "down" }, { "idCode", 30 }, { "tMs", "now" }, { "seq", 1 } },
+	});
+	CHECK_THROWS_AS(InterleaveReplayableActivity(json::array(), badTime, "recording:test", true),
+		json::type_error);
+
+	const json badSequence = json::array({
+		json{ { "kind", "input" }, { "eventType", "button" }, { "device", "keyboard" },
+			{ "state", "down" }, { "idCode", 30 }, { "tMs", 1 }, { "seq", "first" } },
+		json{ { "kind", "input" }, { "eventType", "button" }, { "device", "keyboard" },
+			{ "state", "up" }, { "idCode", 30 }, { "tMs", 1 }, { "seq", 2 } },
+	});
+	CHECK_THROWS_AS(InterleaveReplayableActivity(json::array(), badSequence, "recording:test", true),
+		json::type_error);
+}
+
 TEST_CASE("same-millisecond controller transitions remain distinct atomic frames")
 {
 	const auto pose = [](int index) {

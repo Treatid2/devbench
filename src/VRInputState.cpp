@@ -123,7 +123,8 @@ namespace dvb
 				throw std::invalid_argument(std::format("'{}' must be an integer", a_name));
 			if (a_value.is_number_unsigned()) {
 				const auto value = a_value.get<std::uint64_t>();
-				if (value > static_cast<std::uint64_t>(a_maximum))
+				if ((a_minimum > 0 && value < static_cast<std::uint64_t>(a_minimum)) ||
+					(a_maximum < 0 || value > static_cast<std::uint64_t>(a_maximum)))
 					throw std::invalid_argument(std::format("'{}' is outside [{},{}]", a_name, a_minimum, a_maximum));
 				return static_cast<std::int64_t>(value);
 			}

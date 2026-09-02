@@ -2416,12 +2416,12 @@ namespace dvb
 							}
 							return json{ { "needed", true }, { "ok", ok }, { "results", std::move(results) } };
 						};
-						// Clear a same-owner lease left by an interrupted prior replay before injecting.
-						const json initialCleanup = releaseRecordedInput();
-						if (!initialCleanup.value("ok", true))
-							throw ToolError(409, "recorded input cleanup is still pending; retry after controller/key restoration succeeds");
 						json result;
 						try {
+							// Clear a same-owner lease left by an interrupted prior replay before injecting.
+							const json initialCleanup = releaseRecordedInput();
+							if (!initialCleanup.value("ok", true))
+								throw ToolError(409, "recorded input cleanup is still pending; retry after controller/key restoration succeeds");
 							result = ScenarioHandler(json{ { "steps", steps }, { "runId", runId } }, a_ctx, a_registry, a_events);
 						} catch (const std::exception& e) {
 							const json cleanup = releaseRecordedInput();
