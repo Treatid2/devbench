@@ -6,6 +6,7 @@
 #include "RecordingActivity.h"
 #include "ToolExtensions.h"
 #include "ToolRegistry.h"
+#include "VRInputState.h"
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
@@ -31,9 +32,11 @@ namespace dvb::Recording
 		using namespace std::chrono;
 		namespace fs = std::filesystem;
 
-		constexpr long   kDefaultIntervalMs = 10;
-		constexpr long   kMinIntervalMs = 10;
-		constexpr double kRadToDeg = 57.295779513082323;  // 180/pi — console setangle is degrees, data.angle is radians
+		constexpr long        kDefaultIntervalMs = 10;
+		constexpr long        kMinIntervalMs = 10;
+		constexpr std::size_t kMaximumRetainedActivityEvents = kMaximumVRTrackedFrames;
+		constexpr std::size_t kMaximumRetainedPoseSamples = kMaximumVRTrackedFrames;
+		constexpr double      kRadToDeg = 57.295779513082323;  // 180/pi — console setangle is degrees, data.angle is radians
 
 		// Last entry point devbench brokered into the current scene (a save load or a coc),
 		// so a recording can stamp a reproducible "how to get here" into its manifest. Guarded
@@ -425,6 +428,8 @@ namespace dvb::Recording
 			std::vector<json>        activityEvents;   // input/menu/lifecycle/cell on the same monotonic clock
 			std::vector<json>        trackingSamples;  // raw OpenVR tracking space; available before player load
 			std::uint64_t            nextActivitySeq = 1;
+			bool                     limitReached = false;
+			std::string              limitReason;
 			json                     manifest;
 			long                     intervalMs = kDefaultIntervalMs;
 			steady_clock::time_point startTick;
@@ -453,13 +458,29 @@ namespace dvb::Recording
 						continue;  // player not loaded (or the wait was aborted by stop)
 					}
 					const auto tMs = duration_cast<milliseconds>(steady_clock::now() - startTick).count();
+					if (tMs > kMaximumVRTrackedDurationMs) {
+						std::lock_guard lock(mtx);
+						limitReached = true;
+						limitReason = "maximum replayable duration reached";
+						running.store(false, std::memory_order_relaxed);
+						break;
+					}
 					if (!tracking.is_null()) {
 						tracking["tMs"] = tMs;
 						tracking["frame"] = frameSample.value("frame", 0u);
 						std::lock_guard lock(mtx);
-						if (state == RecorderState::running)
-							trackingSamples.push_back(std::move(tracking));
+						if (state == RecorderState::running) {
+							if (trackingSamples.size() + activityEvents.size() >= kMaximumVRTrackedFrames) {
+								limitReached = true;
+								limitReason = "maximum replayable tracking/activity frame budget reached";
+								running.store(false, std::memory_order_relaxed);
+							} else {
+								trackingSamples.push_back(std::move(tracking));
+							}
+						}
 					}
+					if (!running.load(std::memory_order_relaxed))
+						break;
 					if (pose.is_null() || g_replaying.load(std::memory_order_relaxed))
 						continue;  // raw tracking is still sampled, but replay's teleported player pose is not
 					// A main-menu-start recording has no anchor. Preserve its initial state and
@@ -484,8 +505,15 @@ namespace dvb::Recording
 					// wait values — RunAndWait latency inflates actual intervals above intervalMs.
 					pose["tMs"] = tMs;
 					std::lock_guard lock(mtx);
-					if (state == RecorderState::running)
-						samples.push_back(std::move(pose));
+					if (state == RecorderState::running) {
+						if (samples.size() >= kMaximumRetainedPoseSamples) {
+							limitReached = true;
+							limitReason = "maximum retained trajectory sample budget reached";
+							running.store(false, std::memory_order_relaxed);
+						} else {
+							samples.push_back(std::move(pose));
+						}
+					}
 				}
 			}
 		};
@@ -506,6 +534,13 @@ namespace dvb::Recording
 			std::lock_guard lock(rec.mtx);
 			if (!rec.running.load(std::memory_order_relaxed) || rec.state != RecorderState::running)
 				return;
+			if (rec.activityEvents.size() >= kMaximumRetainedActivityEvents ||
+				rec.trackingSamples.size() + rec.activityEvents.size() >= kMaximumVRTrackedFrames) {
+				rec.limitReached = true;
+				rec.limitReason = "maximum replayable activity/tracking frame budget reached";
+				rec.running.store(false, std::memory_order_relaxed);
+				return;
+			}
 			a_event["seq"] = rec.nextActivitySeq++;
 			rec.activityEvents.push_back(std::move(a_event));
 		}
@@ -773,6 +808,8 @@ namespace dvb::Recording
 				rec.activityEvents.clear();
 				rec.trackingSamples.clear();
 				rec.nextActivitySeq = 1;
+				rec.limitReached = false;
+				rec.limitReason.clear();
 				rec.manifest = std::move(manifest);
 				rec.intervalMs = interval;
 				rec.startTick = steady_clock::now();
@@ -881,6 +918,8 @@ namespace dvb::Recording
 				{ "checkpointCount", rec.checkpoints.size() },
 				{ "activityCounts", activityCounts },
 				{ "recordedMs", recordedMs },
+				{ "limitReached", rec.limitReached },
+				{ "limitReason", rec.limitReason },
 				{ "path", pathStr },
 				{ "meta", scenario["meta"] },
 			};
@@ -899,6 +938,10 @@ namespace dvb::Recording
 				{ "correlationId", rec.manifest.value("correlationId", std::string{}) },
 				{ "sampleCount", rec.samples.size() },
 				{ "trackingSampleCount", rec.trackingSamples.size() },
+				{ "limitReached", rec.limitReached },
+				{ "limitReason", rec.limitReason },
+				{ "maximumReplayableFrames", kMaximumVRTrackedFrames },
+				{ "maximumReplayableDurationMs", kMaximumVRTrackedDurationMs },
 				{ "intervalMs", rec.intervalMs },
 				{ "checkpointCount", rec.checkpoints.size() },
 				{ "activityCounts", SummarizeActivity(rec.activityEvents) },

@@ -204,6 +204,7 @@ namespace dvb::Recording
 			{ "unsupportedControllerEvents", 0 },
 			{ "roleFallbackEvents", 0 },
 			{ "exactControllerStateSamples", 0 },
+			{ "timestampAdjustedControllerEvents", 0 },
 		};
 		if (!a_replayInputs || !a_trackingSamples.is_array() || a_trackingSamples.empty())
 			return json{ { "step", nullptr }, { "report", std::move(report) },
@@ -255,22 +256,32 @@ namespace dvb::Recording
 			return at != bt ? at < bt : a.value("seq", 0ull) < b.value("seq", 0ull);
 		});
 
-		// Every transition receives a frame. Its pose is the most recent complete tracked set (zero
-		// order hold); this preserves short down/up gestures that would disappear between sampler ticks.
-		for (const auto& event : controllerEvents) {
-			const auto tMs = std::max<std::int64_t>(0, event.value("tMs", std::int64_t{ 0 }));
-			if (timeline.contains(tMs))
-				continue;
-			auto after = timeline.upper_bound(tMs);
+		// Every ordered transition receives a distinct frame. Millisecond collisions are shifted
+		// forward by the minimum amount required by the strictly increasing VR frame contract.
+		std::int64_t lastAssignedEventMs = -1;
+		std::size_t  adjustedEventTimes = 0;
+		for (auto& event : controllerEvents) {
+			const auto sourceMs = std::max<std::int64_t>(0, event.value("tMs", std::int64_t{ 0 }));
+			auto       replayMs = std::max(sourceMs, lastAssignedEventMs + 1);
+			while (timeline.contains(replayMs))
+				++replayMs;
+			if (replayMs > kMaximumVRTrackedDurationMs)
+				throw std::invalid_argument("controller transition timestamp adjustment exceeds the VR replay duration limit");
+			if (replayMs != sourceMs)
+				++adjustedEventTimes;
+			event["replayTMs"] = replayMs;
+			lastAssignedEventMs = replayMs;
+			auto after = timeline.upper_bound(replayMs);
 			if (after == timeline.begin())
-				timeline.emplace(tMs, after->second);
+				timeline.emplace(replayMs, after->second);
 			else {
 				--after;
 				json held = after->second;
-				held["tMs"] = tMs;
-				timeline.emplace(tMs, std::move(held));
+				held["tMs"] = replayMs;
+				timeline.emplace(replayMs, std::move(held));
 			}
 		}
+		report["timestampAdjustedControllerEvents"] = adjustedEventTimes;
 
 		json          leftState = EmptyControllerState();
 		json          rightState = EmptyControllerState();
@@ -288,7 +299,7 @@ namespace dvb::Recording
 			if (frame["right"].contains("controller"))
 				rightState = frame["right"]["controller"];
 			while (eventIndex < controllerEvents.size() &&
-				   controllerEvents[eventIndex].value("tMs", std::int64_t{ 0 }) <= tMs) {
+				   controllerEvents[eventIndex].value("replayTMs", std::int64_t{ 0 }) <= tMs) {
 				bool              roleFallback = false;
 				const std::string role = ControllerRole(controllerEvents[eventIndex], frame, roleFallback);
 				if (roleFallback)

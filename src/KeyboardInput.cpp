@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -30,6 +31,9 @@ namespace dvb
 		constexpr std::size_t kMaximumHeldKeys = 8;
 		constexpr std::size_t kMaximumSequenceEvents = 128;
 		constexpr int         kMaximumSequenceMs = 30000;
+		constexpr int         kReleaseAttempts = 5;
+		constexpr auto        kReleaseRetryDelay = milliseconds(100);
+		constexpr auto        kWatchdogRetryDelay = seconds(1);
 
 		std::atomic<bool> g_inputReady{ false };
 
@@ -40,14 +44,21 @@ namespace dvb
 
 		int BoundedInteger(const json& a_object, const char* a_name, int a_default, int a_min, int a_max)
 		{
+			try {
+				return static_cast<int>(ParseBoundedIntegerArgument(
+					a_object, a_name, a_default, a_min, a_max));
+			} catch (const std::invalid_argument& e) {
+				throw ToolError(400, e.what());
+			}
+		}
+
+		bool BooleanArgument(const json& a_object, const char* a_name, bool a_default)
+		{
 			if (!a_object.contains(a_name))
 				return a_default;
-			if (!a_object[a_name].is_number_integer())
-				throw ToolError(400, std::format("'{}' must be an integer", a_name));
-			const int value = a_object[a_name].get<int>();
-			if (value < a_min || value > a_max)
-				throw ToolError(400, std::format("'{}' must be between {} and {}", a_name, a_min, a_max));
-			return value;
+			if (!a_object[a_name].is_boolean())
+				throw ToolError(400, std::format("'{}' must be a boolean", a_name));
+			return a_object[a_name].get<bool>();
 		}
 
 		KeyboardKey ParseKey(const json& a_args)
@@ -57,9 +68,11 @@ namespace dvb
 			std::optional<KeyboardKey> key;
 			if (a_args["key"].is_string())
 				key = ResolveKeyboardKey(a_args["key"].get<std::string>());
-			else if (a_args["key"].is_number_integer())
-				key = ResolveKeyboardKey(a_args["key"].get<int>());
-			else
+			else if (a_args["key"].is_number_integer()) {
+				const auto value = BoundedInteger(a_args, "key", 0, 0,
+					std::numeric_limits<std::uint16_t>::max());
+				key = ResolveKeyboardKey(value);
+			} else
 				throw ToolError(400, "'key' must be a string name or integer DirectInput scancode");
 			if (!key)
 				throw ToolError(400, std::format("unknown/invalid keyboard key {} — use action='capabilities' for names and scan codes", a_args["key"].dump()));
@@ -318,7 +331,7 @@ namespace dvb
 					}
 				} catch (...) {
 					for (const auto& lease : opened)
-						ReleaseGeneration(lease.key.scancode, lease.generation, "sequenceFailure");
+						ReleaseGenerationWithRetry(lease.key.scancode, lease.generation, "sequenceFailure");
 					throw;
 				}
 
@@ -347,7 +360,7 @@ namespace dvb
 				json failed = json::array();
 				for (const auto& lease : selected) {
 					try {
-						if (ReleaseGeneration(lease.key.scancode, lease.generation, a_reason))
+						if (ReleaseGenerationWithRetry(lease.key.scancode, lease.generation, a_reason))
 							released.push_back(KeyJson(lease.key));
 					} catch (const std::exception& e) {
 						json item = KeyJson(lease.key);
@@ -437,13 +450,43 @@ namespace dvb
 				const auto delay = milliseconds(std::max<std::int64_t>(0, a_lease.expiresAtMs - NowMs()));
 				std::thread([lease = std::move(a_lease), delay]() {
 					std::this_thread::sleep_for(delay);
-					try {
-						KeyboardManager::Get().ReleaseGeneration(lease.key.scancode, lease.generation, "leaseExpired");
-					} catch (const std::exception& e) {
-						logs::warn("devbench: automatic keyboard release failed for {} (generation {}): {}",
-							lease.key.name, lease.generation, e.what());
+					std::size_t attempt = 0;
+					for (;;) {
+						++attempt;
+						try {
+							// A failed release retains the generation. Keep retrying until the key is
+							// released or a newer generation proves this watchdog obsolete.
+							if (!KeyboardManager::Get().ReleaseGeneration(
+									lease.key.scancode, lease.generation, "leaseExpired"))
+								return;
+							return;
+						} catch (const std::exception& e) {
+							if (attempt == 1 || attempt % 60 == 0)
+								logs::warn(
+									"devbench: automatic keyboard release still pending for {} "
+									"(generation {}, attempt {}): {}",
+									lease.key.name, lease.generation, attempt, e.what());
+						}
+						std::this_thread::sleep_for(kWatchdogRetryDelay);
 					}
 				}).detach();
+			}
+
+			bool ReleaseGenerationWithRetry(std::uint16_t a_scancode, std::uint64_t a_generation,
+				std::string_view a_reason)
+			{
+				for (int attempt = 1; attempt <= kReleaseAttempts; ++attempt) {
+					try {
+						return ReleaseGeneration(a_scancode, a_generation, a_reason);
+					} catch (const ToolError& e) {
+						if (e.code != 503 || attempt == kReleaseAttempts)
+							throw;
+						logs::warn("devbench: keyboard release attempt {}/{} deferred: {}",
+							attempt, kReleaseAttempts, e.what());
+						std::this_thread::sleep_for(kReleaseRetryDelay);
+					}
+				}
+				return false;
 			}
 
 			bool ReleaseGeneration(std::uint16_t a_scancode, std::uint64_t a_generation,
@@ -466,7 +509,7 @@ namespace dvb
 			EventBus*          m_events = nullptr;
 		};
 
-		json HandleInput(const json& a_args, const ToolContext& a_ctx)
+		json HandleInputImpl(const json& a_args, const ToolContext& a_ctx)
 		{
 			if (!a_args.is_object())
 				throw ToolError(400, "input arguments must be an object");
@@ -488,15 +531,30 @@ namespace dvb
 				return KeyboardManager::Get().Down(ParseKey(a_args), owner,
 					BoundedInteger(a_args, "maxHoldMs", kDefaultMaxHoldMs, 100, kMaximumMaxHoldMs));
 			if (action == "up")
-				return KeyboardManager::Get().Up(ParseKey(a_args), owner, a_args.value("force", false));
+				return KeyboardManager::Get().Up(ParseKey(a_args), owner,
+					a_ctx.internal && BooleanArgument(a_args, "force", false));
 			if (action == "tap")
 				return KeyboardManager::Get().Tap(ParseKey(a_args), owner,
 					BoundedInteger(a_args, "durationMs", kDefaultTapMs, 10, 5000));
 			if (action == "sequence")
 				return KeyboardManager::Get().Sequence(a_args, owner);
 			if (action == "releaseAll")
-				return KeyboardManager::Get().ReleaseAll(owner, a_args.value("all", false));
+				return KeyboardManager::Get().ReleaseAll(owner,
+					a_ctx.internal && BooleanArgument(a_args, "all", false));
 			throw ToolError(400, std::format("unknown input action '{}' (capabilities|status|down|up|tap|sequence|releaseAll)", action));
+		}
+
+		json HandleInput(const json& a_args, const ToolContext& a_ctx)
+		{
+			try {
+				if (!a_ctx.internal && a_args.contains("force") && BooleanArgument(a_args, "force", false))
+					throw ToolError(403, "cross-owner keyboard release is reserved for internal cleanup");
+				if (!a_ctx.internal && a_args.contains("all") && BooleanArgument(a_args, "all", false))
+					throw ToolError(403, "all-owner keyboard cleanup is reserved for internal lifecycle/replay paths");
+				return HandleInputImpl(a_args, a_ctx);
+			} catch (const json::exception& e) {
+				throw ToolError(400, std::format("invalid keyboard input JSON: {}", e.what()));
+			}
 		}
 	}
 
@@ -513,13 +571,14 @@ namespace dvb
 			"own BSInputEventQueue (not Windows SendInput, so window focus is irrelevant). 'status' "
 			"reports readiness and every synthetic held key with owner/lease timing. 'down' starts a "
 			"bounded owned hold (default maxHoldMs 5000; automatic up on expiry); repeated down by the "
-			"same owner is idempotent and another owner gets 409. 'up' releases that owner's key "
-			"(force=true overrides ownership); releasing a key not held by DevBench is an idempotent "
+			"same owner is idempotent and another owner gets 409. 'up' releases that owner's key; "
+			"cross-owner force is reserved for internal cleanup. Releasing an unheld key is an idempotent "
 			"no-op. 'tap' emits down, waits durationMs (default 50), then up. 'sequence' executes a "
 			"prevalidated balanced array of tap/down/up/wait events (optional afterMs); it rejects an "
 			"unbalanced hold before injecting anything and releases keys acquired by the sequence on "
-			"failure. 'releaseAll' releases this owner only, or all=true releases every DevBench-owned "
-			"synthetic key. owner defaults to the MCP session id or rest:anonymous; automation should "
+			"failure. 'releaseAll' releases this owner only; all-owner cleanup is internal-only. Every "
+			"lease watchdog retries a failed automatic release until it succeeds or becomes obsolete. "
+			"owner defaults to the MCP session id or rest:anonymous; automation should "
 			"supply a stable task owner. DevBench also releases owned keys on load/new-game and emits "
 			"input.keyboard events for accepted down/up transitions. Contract v2 also implements "
 			"device='vrTrackedSet': read-only observe returns the current physical OpenVR HMD and both controllers; "
@@ -527,7 +586,8 @@ namespace dvb
 			"contains HMD, left-controller, and right-controller pose plus both controllers' complete "
 			"OpenVR button/touch/axis state. It is applied at the OpenVR compositor/system boundary, is "
 			"always asynchronous, has one owner, passes the real runtime through when inactive, and "
-			"stops as a whole on cleanup. Ad-hoc sequences stop on lifecycle boundaries; recording replay "
+			"returns a controlToken required for external stop. Failed controller-index restoration remains "
+			"retryable through that token. Ad-hoc sequences stop on lifecycle boundaries; recording replay "
 			"may explicitly survive the load/new-game events it is reproducing. There are deliberately no per-device or "
 			"per-button VR mutation actions: submit the coherent tracked set so poses and controls cannot "
 			"come from different clocks.";
@@ -540,12 +600,13 @@ namespace dvb
 								{ "owner", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "stable task/session owner; defaults to MCP session id or rest:anonymous" } } },
 								{ "durationMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", 5000 }, { "description", "tap duration (default 50); sequence tap/wait event duration" } } },
 								{ "maxHoldMs", json{ { "type", "integer" }, { "minimum", 100 }, { "maximum", kMaximumMaxHoldMs }, { "description", "down safety lease (default 5000); automatic up at expiry" } } },
-								{ "force", json{ { "type", "boolean" }, { "description", "up: override owner mismatch (default false)" } } },
-								{ "all", json{ { "type", "boolean" }, { "description", "releaseAll: release all owners, not only this caller (default false)" } } },
+								{ "force", json{ { "type", "boolean" }, { "description", "internal cleanup only; external true is rejected" } } },
+								{ "all", json{ { "type", "boolean" }, { "description", "internal cleanup only; external true is rejected" } } },
 								{ "events", json{ { "type", "array" }, { "minItems", 1 }, { "maxItems", kMaximumSequenceEvents }, { "description", "sequence: balanced [{action:tap|down|up|wait,key?,durationMs?,afterMs?}]" }, { "items", json{ { "type", "object" } } } } },
 								{ "frames", json{ { "type", "array" }, { "minItems", 1 }, { "maxItems", kMaximumVRTrackedFrames }, { "description", "vrTrackedSet sequence: monotonic atomic frames; each requires tMs, originCode, hmd, left, right; controller objects carry packetNumber/pressed/touched/five axes" }, { "items", json{ { "type", "object" } } } } },
 								{ "tailMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", 1000 }, { "description", "vrTrackedSet sequence: final-state visibility before automatic release (default 50ms)" } } },
-								{ "surviveLifecycle", json{ { "type", "boolean" }, { "description", "vrTrackedSet sequence: keep this owned stream active across recorded load/new-game boundaries (default false; record replay sets true)" } } },
+								{ "controlToken", json{ { "type", "string" }, { "description", "vrTrackedSet stop/releaseAll: opaque token returned by sequence start" } } },
+								{ "surviveLifecycle", json{ { "type", "boolean" }, { "description", "internal recording replay only; external true is rejected" } } },
 							} },
 		};
 		a_registry.Register(std::move(input), &HandleInput);

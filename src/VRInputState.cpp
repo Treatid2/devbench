@@ -9,9 +9,114 @@
 
 namespace dvb
 {
+	bool VRSequenceTransaction::Begin(std::string a_owner, std::string a_controlToken,
+		bool a_surviveLifecycle)
+	{
+		if (Busy())
+			return false;
+		m_starting = true;
+		m_active = false;
+		m_restoring = false;
+		m_restoreAttemptActive = false;
+		m_terminalClaimed = false;
+		m_indicesApplied = false;
+		m_surviveLifecycle = a_surviveLifecycle;
+		m_owner = std::move(a_owner);
+		m_controlToken = std::move(a_controlToken);
+		++m_generation;
+		return true;
+	}
+
+	bool VRSequenceTransaction::CanApplyIndices(std::uint64_t a_generation) const
+	{
+		return m_starting && m_generation == a_generation;
+	}
+
+	bool VRSequenceTransaction::MarkIndicesApplied(std::uint64_t a_generation)
+	{
+		if (!CanApplyIndices(a_generation))
+			return false;
+		m_indicesApplied = true;
+		return true;
+	}
+
+	bool VRSequenceTransaction::Commit(std::uint64_t a_generation)
+	{
+		if (!CanApplyIndices(a_generation) || !m_indicesApplied)
+			return false;
+		m_starting = false;
+		m_active = true;
+		return true;
+	}
+
+	VRSequenceLifecycleDecision VRSequenceTransaction::CancelForLifecycle()
+	{
+		VRSequenceLifecycleDecision out{ Busy(), false, m_generation, m_owner };
+		if (!out.present)
+			return out;
+		if ((m_starting || m_active) && m_surviveLifecycle) {
+			out.preserved = true;
+			return out;
+		}
+		m_starting = false;
+		m_active = false;
+		return out;
+	}
+
+	VRSequenceStopAccess VRSequenceTransaction::AuthorizeStop(std::string_view a_owner,
+		std::string_view a_controlToken, bool a_force, bool a_internal) const
+	{
+		if (!Busy())
+			return VRSequenceStopAccess::kNotActive;
+		if (a_force && !a_internal)
+			return VRSequenceStopAccess::kForceRequiresInternal;
+		if (!a_internal && a_controlToken != m_controlToken)
+			return VRSequenceStopAccess::kControlTokenMismatch;
+		if (!a_force && a_owner != m_owner)
+			return VRSequenceStopAccess::kOwnerMismatch;
+		return VRSequenceStopAccess::kAllowed;
+	}
+
+	VRSequenceFinishAction VRSequenceTransaction::ClaimFinish(std::uint64_t a_generation)
+	{
+		if (m_generation != a_generation)
+			return VRSequenceFinishAction::kNone;
+		if (!m_terminalClaimed) {
+			m_terminalClaimed = true;
+			m_starting = false;
+			m_active = false;
+			m_restoring = m_indicesApplied;
+			if (!m_restoring)
+				return VRSequenceFinishAction::kPublish;
+			m_restoreAttemptActive = true;
+			return VRSequenceFinishAction::kRestore;
+		}
+		if (m_restoring && !m_restoreAttemptActive) {
+			m_restoreAttemptActive = true;
+			return VRSequenceFinishAction::kRestore;
+		}
+		return VRSequenceFinishAction::kNone;
+	}
+
+	bool VRSequenceTransaction::RestoreSucceeded(std::uint64_t a_generation)
+	{
+		if (m_generation != a_generation || !m_restoring)
+			return false;
+		m_indicesApplied = false;
+		m_restoring = false;
+		m_restoreAttemptActive = false;
+		return true;
+	}
+
+	void VRSequenceTransaction::RestoreFailed(std::uint64_t a_generation)
+	{
+		if (m_generation == a_generation && m_restoring)
+			m_restoreAttemptActive = false;
+	}
+
 	namespace
 	{
-		std::int64_t BoundedInteger(const json& a_value, std::string_view a_name,
+		std::int64_t BoundedIntegerValue(const json& a_value, std::string_view a_name,
 			std::int64_t a_minimum, std::int64_t a_maximum)
 		{
 			if (!a_value.is_number_integer())
@@ -82,7 +187,7 @@ namespace dvb
 				throw std::invalid_argument(std::format("'{}.index' must be below 64", a_role));
 			out.index = static_cast<std::uint32_t>(index);
 			if (a_value.contains("trackingResult"))
-				out.trackingResult = static_cast<std::int32_t>(BoundedInteger(a_value["trackingResult"],
+				out.trackingResult = static_cast<std::int32_t>(BoundedIntegerValue(a_value["trackingResult"],
 					std::format("{}.trackingResult", a_role), 0, 300));
 			out.velocity = FloatArray<3>(a_value, "velocity", false);
 			out.angularVelocity = FloatArray<3>(a_value, "angularVelocity", false);
@@ -103,7 +208,7 @@ namespace dvb
 												(state[name].type() == json::value_t::number_integer && state[name].get<std::int64_t>() < 0)))
 					throw std::invalid_argument(std::format("'{}.controller.{}' must be a non-negative integer", a_role, name));
 			if (state.contains("packetNumber"))
-				out.controller.packetNumber = static_cast<std::uint32_t>(BoundedInteger(state["packetNumber"],
+				out.controller.packetNumber = static_cast<std::uint32_t>(BoundedIntegerValue(state["packetNumber"],
 					std::format("{}.controller.packetNumber", a_role), 0,
 					std::numeric_limits<std::uint32_t>::max()));
 			out.controller.pressed = state.value("pressed", std::uint64_t{ 0 });
@@ -146,6 +251,14 @@ namespace dvb
 		}
 	}
 
+	std::int64_t ParseBoundedIntegerArgument(const json& a_parent, const char* a_name,
+		std::int64_t a_default, std::int64_t a_minimum, std::int64_t a_maximum)
+	{
+		if (!a_parent.contains(a_name))
+			return a_default;
+		return BoundedIntegerValue(a_parent.at(a_name), a_name, a_minimum, a_maximum);
+	}
+
 	std::vector<VRTrackedInputFrame> ParseVRTrackedInputFrames(const json& a_frames)
 	{
 		if (!a_frames.is_array() || a_frames.empty() || a_frames.size() > kMaximumVRTrackedFrames)
@@ -178,7 +291,7 @@ namespace dvb
 				throw std::invalid_argument(std::format("frames[{}].seq must be strictly increasing and non-zero", i));
 			previousSeq = frame.seq;
 			if (item.contains("originCode"))
-				frame.originCode = static_cast<std::int32_t>(BoundedInteger(item["originCode"],
+				frame.originCode = static_cast<std::int32_t>(BoundedIntegerValue(item["originCode"],
 					std::format("frames[{}].originCode", i), 0, 2));
 			if (originCode && frame.originCode != *originCode)
 				throw std::invalid_argument(std::format("frames[{}].originCode changed within one atomic sequence", i));
