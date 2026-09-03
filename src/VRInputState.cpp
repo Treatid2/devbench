@@ -58,8 +58,12 @@ namespace dvb
 			out.preserved = true;
 			return out;
 		}
-		m_starting = false;
-		m_active = false;
+		if (m_starting || m_active) {
+			m_starting = false;
+			m_active = false;
+			// Reserve this generation until the asynchronous cleanup claims it.
+			m_restoring = true;
+		}
 		return out;
 	}
 

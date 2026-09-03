@@ -130,8 +130,26 @@ TEST_CASE("VR sequence transaction cancels startup before mutation")
 	CHECK(!decision.preserved);
 	CHECK(decision.generation == generation);
 	CHECK(!state.CanApplyIndices(generation));
+	CHECK(state.Busy());
+	CHECK(state.Restoring());
 	CHECK(state.ClaimFinish(generation) == VRSequenceFinishAction::kPublish);
 	CHECK(!state.Busy());
+}
+
+TEST_CASE("VR lifecycle cleanup reserves an applied controller transaction")
+{
+	VRSequenceTransaction state;
+	CHECK(state.Begin("owner", "secret", false));
+	const auto generation = state.Generation();
+	CHECK(state.MarkIndicesApplied(generation));
+	CHECK(state.Commit(generation));
+
+	const auto decision = state.CancelForLifecycle();
+	CHECK(decision.present);
+	CHECK(!decision.preserved);
+	CHECK(state.Busy());
+	CHECK(state.Restoring());
+	CHECK(state.ClaimFinish(generation) == VRSequenceFinishAction::kRestore);
 }
 
 TEST_CASE("VR sequence restoration is retained and retryable")
