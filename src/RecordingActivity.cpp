@@ -14,6 +14,7 @@ namespace dvb::Recording
 	namespace
 	{
 		constexpr std::int64_t kRecordedHoldCapMs = 60000;
+		constexpr std::int64_t kRecordedHoldSafetyMarginMs = 2000;
 
 		bool IsKeyboardTransition(const json& a_event)
 		{
@@ -117,7 +118,7 @@ namespace dvb::Recording
 				{ "owner", a_owner },
 			};
 			if (args["action"] == "down")
-				args["maxHoldMs"] = kRecordedHoldCapMs;
+				args["maxHoldMs"] = a_event.value("replayMaxHoldMs", kRecordedHoldCapMs);
 			return json{ { "tool", "input" }, { "args", std::move(args) },
 				{ "label", "recorded keyboard input" } };
 		}
@@ -232,6 +233,8 @@ namespace dvb::Recording
 		// The first complete set is defined at sequence time zero, even if the recorder's first
 		// polling tick happened later. This prevents a null-HMD runtime leaking its placeholder pose.
 		if (!timeline.contains(0)) {
+			if (timeline.size() >= kMaximumVRTrackedFrames)
+				throw std::invalid_argument("tracking samples leave no frame budget for the required time-zero pose");
 			json initial = timeline.begin()->second;
 			initial["tMs"] = 0;
 			timeline.emplace(0, std::move(initial));
@@ -260,6 +263,8 @@ namespace dvb::Recording
 		std::int64_t lastAssignedEventMs = -1;
 		std::size_t  adjustedEventTimes = 0;
 		for (auto& event : controllerEvents) {
+			if (timeline.size() >= kMaximumVRTrackedFrames)
+				throw std::invalid_argument("tracking and controller events exceed the VR replay frame budget");
 			const auto sourceMs = std::max<std::int64_t>(0, event.value("tMs", std::int64_t{ 0 }));
 			auto       replayMs = std::max(sourceMs, lastAssignedEventMs + 1);
 			while (timeline.contains(replayMs)) {
@@ -370,6 +375,50 @@ namespace dvb::Recording
 			const auto bt = b.value("tMs", static_cast<std::int64_t>(0));
 			return at != bt ? at < bt : a.value("seq", 0ull) < b.value("seq", 0ull);
 		});
+
+		std::int64_t traceEndMs = 0;
+		if (a_steps.is_array())
+			for (const auto& step : a_steps) {
+				traceEndMs = std::max(traceEndMs, step.value("atMs", traceEndMs));
+				traceEndMs += std::max<std::int64_t>(0, step.value("wait", std::int64_t{ 0 }));
+			}
+		for (const auto& event : replayable)
+			traceEndMs = std::max(traceEndMs, event.value("tMs", std::int64_t{ 0 }));
+
+		// Derive each lease from its recorded up transition (or the trace end). Long
+		// holds cannot be represented by the public 60-second safety lease, so reject
+		// them explicitly instead of reporting a replay that released the key early.
+		std::map<int, std::size_t> openKeys;
+		for (std::size_t i = 0; i < replayable.size(); ++i) {
+			const int         key = replayable[i].value("idCode", 0);
+			const std::string state = replayable[i].value("state", std::string{});
+			if (state == "down") {
+				openKeys[key] = i;
+			} else if (state == "up") {
+				if (const auto it = openKeys.find(key); it != openKeys.end()) {
+					const auto holdMs = std::max<std::int64_t>(0,
+						replayable[i].value("tMs", std::int64_t{ 0 }) -
+							replayable[it->second].value("tMs", std::int64_t{ 0 }));
+					if (holdMs + kRecordedHoldSafetyMarginMs > kRecordedHoldCapMs)
+						throw std::invalid_argument(std::format(
+							"recorded keyboard hold for key {} is {}ms and exceeds the {}ms faithful replay limit",
+							key, holdMs, kRecordedHoldCapMs - kRecordedHoldSafetyMarginMs));
+					replayable[it->second]["replayMaxHoldMs"] =
+						std::max<std::int64_t>(100, holdMs + kRecordedHoldSafetyMarginMs);
+					openKeys.erase(it);
+				}
+			}
+		}
+		for (const auto& [key, index] : openKeys) {
+			const auto holdMs = std::max<std::int64_t>(0, traceEndMs -
+															  replayable[index].value("tMs", std::int64_t{ 0 }));
+			if (holdMs + kRecordedHoldSafetyMarginMs > kRecordedHoldCapMs)
+				throw std::invalid_argument(std::format(
+					"unreleased recorded keyboard hold for key {} spans {}ms and exceeds the {}ms faithful replay limit",
+					key, holdMs, kRecordedHoldCapMs - kRecordedHoldSafetyMarginMs));
+			replayable[index]["replayMaxHoldMs"] =
+				std::max<std::int64_t>(100, holdMs + kRecordedHoldSafetyMarginMs);
+		}
 
 		json         steps = json::array();
 		std::size_t  eventIndex = 0;

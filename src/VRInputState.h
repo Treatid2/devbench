@@ -88,7 +88,7 @@ namespace dvb
 		bool                        RestoreSucceeded(std::uint64_t a_generation);
 		void                        RestoreFailed(std::uint64_t a_generation);
 
-		bool               Busy() const { return m_starting || m_active || m_restoring; }
+		bool               Busy() const { return m_starting || m_active || m_restoring || m_indicesApplied; }
 		bool               Starting() const { return m_starting; }
 		bool               Active() const { return m_active; }
 		bool               Restoring() const { return m_restoring; }

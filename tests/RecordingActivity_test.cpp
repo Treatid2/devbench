@@ -110,6 +110,24 @@ TEST_CASE("VR tracked-set replay rejects malformed source samples before returni
 		std::invalid_argument);
 }
 
+TEST_CASE("canonical VR replay enforces its final frame budget")
+{
+	json samples = json::array();
+	for (std::int64_t i = 1; i <= dvb::kMaximumVRTrackedFrames; ++i)
+		samples.push_back(json{ { "tMs", i } });
+	CHECK_THROWS_AS(BuildVRTrackedSetReplay(samples, json::array(),
+						"recording:test", true),
+		std::invalid_argument);
+
+	// With time zero already present, one controller transition would become frame 60,001.
+	samples[0]["tMs"] = 0;
+	json controller = Button(1, 1, "oculusPrimary", "down", 33);
+	controller["wandIndex"] = 2;
+	CHECK_THROWS_AS(BuildVRTrackedSetReplay(samples, json::array({ controller }),
+						"recording:test", true),
+		std::invalid_argument);
+}
+
 TEST_CASE("keyboard replay planning rejects wrong-typed ordering fields")
 {
 	const json badTime = json::array({
@@ -200,6 +218,33 @@ TEST_CASE("keyboard transitions interleave without changing the original traject
 	CHECK(totalWait == 100);
 	CHECK(transitions == json::array({ "down", "up" }));
 	CHECK(plan["inputOwner"] == "recording:test");
+	const auto downStep = std::find_if(plan["steps"].begin(), plan["steps"].end(),
+		[](const json& step) {
+			return step.value("tool", std::string{}) == "input" &&
+		           step["args"].value("action", std::string{}) == "down";
+		});
+	CHECK(downStep != plan["steps"].end());
+	if (downStep != plan["steps"].end())
+		CHECK((*downStep)["args"]["maxHoldMs"] == 2050);
+}
+
+TEST_CASE("keyboard replay rejects holds without a complete safety margin")
+{
+	const json atLimit = json::array({
+		Button(0, 1, "keyboard", "down", 17),
+		Button(58000, 2, "keyboard", "up", 17),
+	});
+	const json plan = InterleaveReplayableActivity(json::array(), atLimit,
+		"recording:test", true);
+	CHECK(plan["steps"][0]["args"]["maxHoldMs"] == 60000);
+
+	const json overLimit = json::array({
+		Button(0, 1, "keyboard", "down", 17),
+		Button(58001, 2, "keyboard", "up", 17),
+	});
+	CHECK_THROWS_AS(InterleaveReplayableActivity(json::array(), overLimit,
+						"recording:test", true),
+		std::invalid_argument);
 }
 
 TEST_CASE("input replay can be disabled without altering legacy steps")
