@@ -1,6 +1,7 @@
 #include "test_framework.h"
 
 #include "RecordingActivity.h"
+#include "VRInputState.h"
 
 using dvb::json;
 using dvb::Recording::ActivityCaptureContract;
@@ -97,6 +98,16 @@ TEST_CASE("VR tracked-set replay rejects malformed source samples before returni
 
 	json duplicate = json::array({ json{ { "tMs", 20 } }, json{ { "tMs", 20 } } });
 	CHECK_THROWS(BuildVRTrackedSetReplay(duplicate, json::array(), "recording:test", true));
+
+	json overLimit = json::array({ json{ { "tMs", dvb::kMaximumVRTrackedDurationMs + 1 } } });
+	CHECK_THROWS_AS(BuildVRTrackedSetReplay(overLimit, json::array(), "recording:test", true),
+		std::invalid_argument);
+
+	json atLimit = json::array({ json{ { "tMs", dvb::kMaximumVRTrackedDurationMs } } });
+	json collision = Button(dvb::kMaximumVRTrackedDurationMs, 1, "oculusPrimary", "down", 33);
+	CHECK_THROWS_AS(BuildVRTrackedSetReplay(atLimit, json::array({ collision }),
+						"recording:test", true),
+		std::invalid_argument);
 }
 
 TEST_CASE("keyboard replay planning rejects wrong-typed ordering fields")

@@ -215,9 +215,8 @@ namespace dvb::Recording
 			const auto& sample = a_trackingSamples[sampleIndex];
 			if (!sample.is_object() || !sample.contains("tMs") || !sample["tMs"].is_number_integer())
 				throw std::invalid_argument(std::format("trackingSamples[{}].tMs must be an integer", sampleIndex));
-			const auto tMs = sample["tMs"].get<std::int64_t>();
-			if (tMs < 0)
-				throw std::invalid_argument(std::format("trackingSamples[{}].tMs must be non-negative", sampleIndex));
+			const auto tMs = ParseBoundedIntegerArgument(sample, "tMs", 0, 0,
+				kMaximumVRTrackedDurationMs);
 			if (timeline.contains(tMs))
 				throw std::invalid_argument(std::format("trackingSamples[{}].tMs duplicates {}", sampleIndex, tMs));
 			timeline.emplace(tMs, sample);
@@ -246,8 +245,8 @@ namespace dvb::Recording
 					continue;
 				if (!event.contains("tMs") || !event["tMs"].is_number_integer())
 					throw std::invalid_argument(std::format("activityEvents[{}].tMs must be an integer", eventIndex));
-				if (event["tMs"].get<std::int64_t>() < 0)
-					throw std::invalid_argument(std::format("activityEvents[{}].tMs must be non-negative", eventIndex));
+				ParseBoundedIntegerArgument(event, "tMs", 0, 0,
+					kMaximumVRTrackedDurationMs);
 				controllerEvents.push_back(event);
 			}
 		std::stable_sort(controllerEvents.begin(), controllerEvents.end(), [](const json& a, const json& b) {
@@ -263,8 +262,11 @@ namespace dvb::Recording
 		for (auto& event : controllerEvents) {
 			const auto sourceMs = std::max<std::int64_t>(0, event.value("tMs", std::int64_t{ 0 }));
 			auto       replayMs = std::max(sourceMs, lastAssignedEventMs + 1);
-			while (timeline.contains(replayMs))
+			while (timeline.contains(replayMs)) {
+				if (replayMs >= kMaximumVRTrackedDurationMs)
+					throw std::invalid_argument("controller transition timestamp adjustment exceeds the VR replay duration limit");
 				++replayMs;
+			}
 			if (replayMs > kMaximumVRTrackedDurationMs)
 				throw std::invalid_argument("controller transition timestamp adjustment exceeds the VR replay duration limit");
 			if (replayMs != sourceMs)

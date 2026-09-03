@@ -144,6 +144,8 @@ TEST_CASE("VR sequence restoration is retained and retryable")
 	CHECK(state.ClaimFinish(generation) == VRSequenceFinishAction::kRestore);
 	CHECK(state.Restoring());
 	CHECK(state.RestoreAttemptActive());
+	CHECK(state.ClaimFinish(generation) == VRSequenceFinishAction::kNone);
+	CHECK(state.RestoreAttemptActive());
 
 	state.RestoreFailed(generation);
 	CHECK(state.Restoring());

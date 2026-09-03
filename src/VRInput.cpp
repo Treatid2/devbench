@@ -31,6 +31,8 @@ namespace dvb
 		constexpr int         kMaximumTailMs = 1000;
 		constexpr int         kControllerRestoreAttempts = 5;
 		constexpr auto        kControllerRestoreRetryDelay = std::chrono::milliseconds(200);
+		constexpr auto        kControllerRestoreWaitTimeout = std::chrono::seconds(30);
+		constexpr auto        kControllerRecoveryRetryDelay = std::chrono::seconds(1);
 
 		// Vtable slots from the pinned OpenVR IVRCompositor_022 and IVRSystem_019 ABIs.
 		constexpr std::size_t kIVRCompositorWaitGetPosesSlot = 2;
@@ -228,6 +230,9 @@ namespace dvb
 						m_current = frames.front();
 						m_lastCompletion = json::object();
 					}
+					Publish("started", json{ { "owner", a_owner }, { "generation", generation },
+										   { "frameCount", frameCount }, { "durationMs", durationMs },
+										   { "surviveLifecycle", surviveLifecycle } });
 					std::thread worker([this, generation, owner = a_owner,
 										   frames = std::move(frames), tailMs, started]() mutable {
 						Playback(generation, owner, std::move(frames), tailMs, started);
@@ -237,9 +242,6 @@ namespace dvb
 					AbortActivation(generation);
 					throw;
 				}
-				Publish("started", json{ { "owner", a_owner }, { "generation", generation },
-									   { "frameCount", frameCount }, { "durationMs", durationMs },
-									   { "surviveLifecycle", surviveLifecycle } });
 				return json{ { "contract", ContractJson() }, { "device", kDevice },
 					{ "action", "sequence" }, { "queued", true }, { "owner", a_owner },
 					{ "controlToken", controlToken },
@@ -270,7 +272,8 @@ namespace dvb
 				m_cv.notify_all();
 				const std::string reason(a_reason);
 				std::thread([this, generation, owner = std::move(owner), reason]() mutable {
-					Finish(generation, "stopped", json{ { "owner", std::move(owner) }, { "generation", generation }, { "reason", reason }, { "completed", false } });
+					if (!Finish(generation, "stopped", json{ { "owner", std::move(owner) }, { "generation", generation }, { "reason", reason }, { "completed", false } }))
+						ScheduleRestorationRecovery(generation);
 				}).detach();
 			}
 
@@ -299,7 +302,9 @@ namespace dvb
 					completion = json{ { "owner", owner }, { "generation", generation },
 						{ "reason", a_reason }, { "completed", false } };
 				}
-				const bool restored = Finish(generation, "stopped", std::move(completion));
+				bool restored = Finish(generation, "stopped", std::move(completion));
+				if (!restored)
+					restored = WaitForConcurrentRestoration(generation);
 				return json{ { "contract", ContractJson() }, { "device", kDevice },
 					{ "action", "stop" }, { "stopRequested", true }, { "stopped", restored }, { "owner", owner },
 					{ "generation", generation }, { "reason", a_reason },
@@ -339,7 +344,8 @@ namespace dvb
 					completion = json{ { "owner", a_owner }, { "generation", a_generation },
 						{ "reason", "complete" }, { "completed", true }, { "frameCount", a_frames.size() } };
 				}
-				Finish(a_generation, "finished", std::move(completion));
+				if (!Finish(a_generation, "finished", std::move(completion)))
+					ScheduleRestorationRecovery(a_generation);
 			}
 
 			bool ApplyControllerIndices(std::uint64_t a_generation, std::uint32_t a_left,
@@ -438,7 +444,72 @@ namespace dvb
 					std::lock_guard lock(m_mutex);
 					owner = m_transaction.Owner();
 				}
-				Finish(a_generation, "aborted", json{ { "owner", std::move(owner) }, { "generation", a_generation }, { "reason", "activationFailed" }, { "completed", false } });
+				if (!Finish(a_generation, "aborted", json{ { "owner", std::move(owner) }, { "generation", a_generation }, { "reason", "activationFailed" }, { "completed", false } }))
+					ScheduleRestorationRecovery(a_generation);
+			}
+
+			bool WaitForConcurrentRestoration(std::uint64_t a_generation)
+			{
+				std::unique_lock lock(m_mutex);
+				if (m_transaction.Generation() != a_generation)
+					return true;
+				if (!m_transaction.Restoring())
+					return !m_transaction.IndicesApplied();
+				if (!m_transaction.RestoreAttemptActive())
+					return false;
+
+				if (!m_cv.wait_for(lock, kControllerRestoreWaitTimeout, [&] {
+						return m_transaction.Generation() != a_generation ||
+					           !m_transaction.Restoring() ||
+					           !m_transaction.RestoreAttemptActive();
+					}))
+					return false;
+				return m_transaction.Generation() != a_generation ||
+				       (!m_transaction.Restoring() && !m_transaction.IndicesApplied());
+			}
+
+			void ScheduleRestorationRecovery(std::uint64_t a_generation) noexcept
+			{
+				{
+					std::lock_guard lock(m_mutex);
+					if (m_transaction.Generation() != a_generation || !m_transaction.Restoring() ||
+						(m_recoveryGeneration && *m_recoveryGeneration == a_generation))
+						return;
+					m_recoveryGeneration = a_generation;
+				}
+
+				try {
+					std::thread([this, a_generation] {
+						for (;;) {
+							std::this_thread::sleep_for(kControllerRecoveryRetryDelay);
+							{
+								std::lock_guard lock(m_mutex);
+								if (m_transaction.Generation() != a_generation ||
+									!m_transaction.Restoring()) {
+									if (m_recoveryGeneration && *m_recoveryGeneration == a_generation)
+										m_recoveryGeneration.reset();
+									return;
+								}
+							}
+							if (Finish(a_generation, nullptr, json::object())) {
+								std::lock_guard lock(m_mutex);
+								if (m_recoveryGeneration && *m_recoveryGeneration == a_generation)
+									m_recoveryGeneration.reset();
+								return;
+							}
+						}
+					}).detach();
+				} catch (const std::exception& e) {
+					std::lock_guard lock(m_mutex);
+					if (m_recoveryGeneration && *m_recoveryGeneration == a_generation)
+						m_recoveryGeneration.reset();
+					logs::warn("devbench: unable to schedule VR restoration recovery: {}", e.what());
+				} catch (...) {
+					std::lock_guard lock(m_mutex);
+					if (m_recoveryGeneration && *m_recoveryGeneration == a_generation)
+						m_recoveryGeneration.reset();
+					logs::warn("devbench: unable to schedule VR restoration recovery");
+				}
 			}
 
 			bool Finish(std::uint64_t a_generation, const char* a_event, json a_completion)
@@ -506,6 +577,7 @@ namespace dvb
 			std::optional<VRTrackedInputFrame> m_current;
 			json                               m_pendingCompletion = json::object();
 			json                               m_lastCompletion = json::object();
+			std::optional<std::uint64_t>       m_recoveryGeneration;
 		};
 
 		bool CanOverridePoseArray(const VRTrackedInputFrame& a_frame,
