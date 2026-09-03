@@ -105,7 +105,7 @@ Missing → auto-created with defaults. Invalid → defaults (logged). All keys 
   "replayHotkeyShift": false, // require Shift held with replayHotkey
   "replayPath": "", // recording to replay; empty = most recent
   "replayRestoreScene": true, // hotkey replay re-establishes the recorded scene
-  "recordIntervalMs": 10, // record: pose sample period in ms (min 10); per-call intervalMs overrides
+  "recordIntervalMs": 10, // record: pose sample period in ms (10..1800000); per-call intervalMs overrides
 
   // Autorun: replay a recording once on the first load of the session (unattended benchmark).
   "autoRunPath": "", // recording to replay on first postLoadGame; empty = off
@@ -199,7 +199,7 @@ The `record` tool captures a manual play-through as a replayable scenario file:
 1. Load a save or `coc` to the scene you want to record. To capture a main-menu → new-game
    flow instead, start there and pass `allowNoPlayer=true`.
 2. Call `record` with `action='start'` (or press the `recordHotkey`). devbench samples the
-   player pose + point-of-view every `intervalMs` ms (default from `recordIntervalMs`, min 10),
+   player pose + point-of-view every `intervalMs` ms (default from `recordIntervalMs`, range 10..1800000),
    including HMD and left/right wand world transforms after the player loads. On VR it also
    samples raw OpenVR HMD/left/right tracking-space poses, velocities, validity, connection state,
    device index/class/role, and both controllers' complete packet/button/touch/five-axis state. The
@@ -222,6 +222,8 @@ The `record` tool captures a manual play-through as a replayable scenario file:
    plus both controllers.
    Legacy captures are upgraded using wand indices and inserted transition frames; reports disclose
    any right-handed role fallback or unsupported event instead of pretending it was reproduced.
+   Keyboard holds longer than 58 seconds are rejected before replay because the input contract's
+   60-second safety lease must retain a release margin; use `replayInputs=false` for those captures.
 
 4. Replay with `record action='replay' path='<file>'`. The atomic HMD/controller stream and recorded
    keyboard transitions use the recording clock by default; pass `replayInputs=false` for pose-only

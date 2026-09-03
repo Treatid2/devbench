@@ -14,6 +14,7 @@
 #include "Server.h"
 #include "ToolExtensions.h"
 #include "ToolRegistry.h"
+#include "VRInputState.h"
 #include "Version.h"
 
 #include <algorithm>
@@ -2235,13 +2236,20 @@ namespace dvb
 					return runScenario();
 
 				RunRegistry::Get().Start(runId);
-				std::thread([runScenario, runId]() {
-					try {
-						RunRegistry::Get().Finish(runId, runScenario());
-					} catch (const std::exception& e) {
-						RunRegistry::Get().Fail(runId, e.what());
-					}
-				}).detach();
+				try {
+					std::thread([runScenario, runId]() {
+						try {
+							RunRegistry::Get().Finish(runId, runScenario());
+						} catch (const std::exception& e) {
+							RunRegistry::Get().Fail(runId, e.what());
+						}
+					}).detach();
+				} catch (const std::exception& e) {
+					RunRegistry::Get().Fail(runId, e.what());
+					a_events.Publish("scenario.finished", json{ { "runId", runId }, { "ok", false },
+															  { "error", "could not start asynchronous scenario worker" } });
+					throw ToolError(500, std::format("could not start asynchronous scenario worker: {}", e.what()));
+				}
 				return json{ { "queued", true }, { "runId", runId }, { "steps", numSteps } };
 			});
 
@@ -2251,7 +2259,7 @@ namespace dvb
 			"Capture a manual play-through as a versioned activity trace and replayable scenario. "
 			"action='start' begins sampling the player pose (x/y/z/angleZ/angleX + camera pos + POV "
 			"+ game frame + VR HMD/left-wand/right-wand world transforms) every "
-			"intervalMs (default from config recordIntervalMs, min 10) on a background thread "
+			"intervalMs (default from config recordIntervalMs, range 10..1800000) on a background thread "
 			"while the Skyrim BSInputDeviceManager sink records every normalized keyboard, mouse, "
 			"gamepad, and VR-controller event plus menu and lifecycle transitions on the same "
 			"monotonic clock. The activity contract and exact replay support are returned by start "
@@ -2309,7 +2317,7 @@ namespace dvb
 			{ "type", "object" },
 			{ "properties", json{
 								{ "action", json{ { "type", "string" }, { "enum", json::array({ "start", "stop", "status", "replay", "checkpoint" }) }, { "description", "start | stop | status | replay | checkpoint" } } },
-								{ "intervalMs", json{ { "type", "integer" }, { "description", "start: player-pose and raw-VR-tracking sample period in ms (default = config recordIntervalMs, min 10)" } } },
+								{ "intervalMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", kMaximumVRTrackedDurationMs }, { "description", "start: player-pose and raw-VR-tracking sample period in ms (default = config recordIntervalMs)" } } },
 								{ "allowNoPlayer", json{ { "type", "boolean" }, { "description", "start: permit a main-menu/new-game recording before a PlayerCharacter is loaded (default false)" } } },
 								{ "correlationId", json{ { "type", "string" }, { "maxLength", 128 }, { "description", "start: caller correlation identifier retained in status and recording metadata" } } },
 								{ "id", json{ { "type", "string" }, { "description", "checkpoint: unique id for this checkpoint (required)" } } },
@@ -2448,13 +2456,20 @@ namespace dvb
 						return runReplay();
 
 					RunRegistry::Get().Start(runId);
-					std::thread([runReplay, runId]() {
-						try {
-							RunRegistry::Get().Finish(runId, runReplay());
-						} catch (const std::exception& e) {
-							RunRegistry::Get().Fail(runId, e.what());
-						}
-					}).detach();
+					try {
+						std::thread([runReplay, runId]() {
+							try {
+								RunRegistry::Get().Finish(runId, runReplay());
+							} catch (const std::exception& e) {
+								RunRegistry::Get().Fail(runId, e.what());
+							}
+						}).detach();
+					} catch (const std::exception& e) {
+						RunRegistry::Get().Fail(runId, e.what());
+						a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", false },
+																{ "error", "could not start asynchronous replay worker" } });
+						throw ToolError(500, std::format("could not start asynchronous replay worker: {}", e.what()));
+					}
 					return json{ { "queued", true }, { "runId", runId }, { "steps", steps.size() },
 						{ "estMs", estMs }, { "activity", activity } };
 				}

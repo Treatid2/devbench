@@ -61,7 +61,7 @@ namespace dvb::Recording
 	void SetLoadSettleMs(int a_ms);
 
 	/// Default sample interval (ms) for record `start` when no intervalMs arg is given (e.g. the
-	/// hotkey). Local/per-machine via config (recordIntervalMs). Clamped to the 10ms floor.
+	/// hotkey). Local/per-machine via config (recordIntervalMs). Clamped to the supported range.
 	void SetDefaultIntervalMs(int a_ms);
 
 	/// Scene-coupling defaults from config: the age thresholds (ms) that map a recipe's

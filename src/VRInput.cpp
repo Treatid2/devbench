@@ -218,11 +218,12 @@ namespace dvb
 					if (!ApplyControllerIndices(generation, frames.front().left.pose.index,
 							frames.front().right.pose.index))
 						throw ToolError(409, "VR tracked-set activation was cancelled before controller indices were applied");
-					const auto started = steady_clock::now();
+					steady_clock::time_point started;
 					{
 						std::lock_guard lock(m_mutex);
 						if (!m_transaction.Commit(generation))
 							throw ToolError(409, "VR tracked-set activation was superseded");
+						started = steady_clock::now();
 						m_frameIndex = 0;
 						m_frameCount = frameCount;
 						m_durationMs = durationMs;
@@ -271,10 +272,15 @@ namespace dvb
 				}
 				m_cv.notify_all();
 				const std::string reason(a_reason);
-				std::thread([this, generation, owner = std::move(owner), reason]() mutable {
-					if (!Finish(generation, "stopped", json{ { "owner", std::move(owner) }, { "generation", generation }, { "reason", reason }, { "completed", false } }))
-						ScheduleRestorationRecovery(generation);
-				}).detach();
+				try {
+					std::thread([this, generation, owner = std::move(owner), reason]() mutable {
+						if (!Finish(generation, "stopped", json{ { "owner", std::move(owner) }, { "generation", generation }, { "reason", reason }, { "completed", false } }))
+							ScheduleRestorationRecovery(generation);
+					}).detach();
+				} catch (const std::exception& e) {
+					logs::warn("devbench: VR lifecycle cleanup worker could not start: {}", e.what());
+					ScheduleRestorationRecovery(generation);
+				}
 			}
 
 			json Stop(const std::string& a_owner, const std::string& a_controlToken,
@@ -400,15 +406,15 @@ namespace dvb
 								m_lastCompletion = completion;
 							}
 							m_cv.notify_all();
-							return json{ { "restored", true }, { "event", std::move(event) },
-								{ "completion", std::move(completion) } };
-						});
-						if (result.value("restored", false)) {
-							const std::string event = result.value("event", std::string{});
+							// Publish in the queued main-thread task. If RunAndWait times out after
+							// queueing, this task may complete later and remains the only code that
+							// can durably announce the terminal transition.
 							if (!event.empty())
-								Publish(event.c_str(), std::move(result["completion"]));
+								Publish(event.c_str(), std::move(completion));
+							return json{ { "restored", true } };
+						});
+						if (result.value("restored", false))
 							return true;
-						}
 					} catch (const ToolError& e) {
 						if (e.code == 503 && attempt < kControllerRestoreAttempts) {
 							logs::warn("devbench: VR tracked-set controller restoration attempt {}/{} deferred: {}",

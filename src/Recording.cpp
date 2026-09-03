@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <ctime>
 #include <filesystem>
 #include <format>
@@ -421,7 +422,9 @@ namespace dvb::Recording
 			std::atomic<bool>        running{ false };
 			std::thread              worker;
 			std::mutex               mtx;
+			std::condition_variable  cv;
 			RecorderState            state = RecorderState::idle;
+			std::uint64_t            generation = 0;
 			std::vector<json>        samples;
 			std::vector<json>        commands;         // console commands seen mid-recording: { command, frame }
 			std::vector<json>        checkpoints;      // screenshot checkpoints marked mid-recording: { id, atMs, excludeUi }
@@ -434,11 +437,35 @@ namespace dvb::Recording
 			long                     intervalMs = kDefaultIntervalMs;
 			steady_clock::time_point startTick;
 
-			void Sample()
+			void Sample(std::uint64_t a_generation)
 			{
-				while (running.load(std::memory_order_relaxed)) {
-					std::this_thread::sleep_for(milliseconds(intervalMs));
-					if (!running.load(std::memory_order_relaxed))
+				steady_clock::time_point started;
+				long                     interval = kDefaultIntervalMs;
+				{
+					std::lock_guard lock(mtx);
+					started = startTick;
+					interval = intervalMs;
+				}
+				const auto deadline = started + milliseconds(kMaximumVRTrackedDurationMs);
+				const auto waitFor = [&](milliseconds a_delay) {
+					std::unique_lock lock(mtx);
+					const auto       target = std::min(steady_clock::now() + a_delay, deadline);
+					if (cv.wait_until(lock, target, [&] {
+							return !running.load(std::memory_order_relaxed) ||
+						           state != RecorderState::running || generation != a_generation;
+						}))
+						return false;
+					if (steady_clock::now() < deadline)
+						return true;
+					if (state == RecorderState::running && generation == a_generation) {
+						limitReached = true;
+						limitReason = "maximum replayable duration reached";
+						running.store(false, std::memory_order_relaxed);
+					}
+					return false;
+				};
+				for (;;) {
+					if (!waitFor(milliseconds(interval)))
 						break;
 					json frameSample;
 					try {
@@ -453,11 +480,11 @@ namespace dvb::Recording
 					if (pose.is_null() && tracking.is_null()) {
 						// Main-menu/new-game capture needs the input sink, not 100 empty pose
 						// probes per second. Keep detection responsive without adding startup load.
-						if (intervalMs < 100)
-							std::this_thread::sleep_for(milliseconds(100 - intervalMs));
+						if (interval < 100 && !waitFor(milliseconds(100 - interval)))
+							break;
 						continue;  // player not loaded (or the wait was aborted by stop)
 					}
-					const auto tMs = duration_cast<milliseconds>(steady_clock::now() - startTick).count();
+					const auto tMs = duration_cast<milliseconds>(steady_clock::now() - started).count();
 					if (tMs > kMaximumVRTrackedDurationMs) {
 						std::lock_guard lock(mtx);
 						limitReached = true;
@@ -469,7 +496,7 @@ namespace dvb::Recording
 						tracking["tMs"] = tMs;
 						tracking["frame"] = frameSample.value("frame", 0u);
 						std::lock_guard lock(mtx);
-						if (state == RecorderState::running) {
+						if (state == RecorderState::running && generation == a_generation) {
 							if (trackingSamples.size() + activityEvents.size() >= kMaximumVRTrackedFrames) {
 								limitReached = true;
 								limitReason = "maximum replayable tracking/activity frame budget reached";
@@ -505,7 +532,7 @@ namespace dvb::Recording
 					// wait values — RunAndWait latency inflates actual intervals above intervalMs.
 					pose["tMs"] = tMs;
 					std::lock_guard lock(mtx);
-					if (state == RecorderState::running) {
+					if (state == RecorderState::running && generation == a_generation) {
 						if (samples.size() >= kMaximumRetainedPoseSamples) {
 							limitReached = true;
 							limitReason = "maximum retained trajectory sample budget reached";
@@ -524,16 +551,25 @@ namespace dvb::Recording
 			return r;
 		}
 
-		void AppendActivity(json a_event)
+		std::uint64_t ActiveGeneration()
 		{
-			auto& rec = Get();
-			if (!rec.running.load(std::memory_order_relaxed))
+			auto&           rec = Get();
+			std::lock_guard lock(rec.mtx);
+			if (!rec.running.load(std::memory_order_relaxed) ||
+				rec.state != RecorderState::running)
+				return 0;
+			return rec.generation;
+		}
+
+		void AppendActivity(json a_event, std::uint64_t a_generation)
+		{
+			auto&           rec = Get();
+			std::lock_guard lock(rec.mtx);
+			if (!a_generation || !rec.running.load(std::memory_order_relaxed) ||
+				rec.state != RecorderState::running || rec.generation != a_generation)
 				return;
 			a_event["tMs"] = duration_cast<milliseconds>(steady_clock::now() - rec.startTick).count();
 			a_event["frame"] = game::CurrentFrame();
-			std::lock_guard lock(rec.mtx);
-			if (!rec.running.load(std::memory_order_relaxed) || rec.state != RecorderState::running)
-				return;
 			if (rec.activityEvents.size() >= kMaximumRetainedActivityEvents ||
 				rec.trackingSamples.size() + rec.activityEvents.size() >= kMaximumVRTrackedFrames) {
 				rec.limitReached = true;
@@ -730,8 +766,10 @@ namespace dvb::Recording
 	{
 		std::string action = a_args.value("action", std::string("status"));
 		auto&       rec = Get();
-		if (action == "toggle")  // hotkey-friendly: start if idle, stop if recording
-			action = rec.running.load() ? "stop" : "start";
+		if (action == "toggle") {  // Auto-limited sessions still need hotkey finalization.
+			std::lock_guard lock(rec.mtx);
+			action = rec.state == RecorderState::idle ? "start" : "stop";
+		}
 
 		if (action == "start") {
 			{
@@ -751,9 +789,14 @@ namespace dvb::Recording
 				cancelStart();
 				return json{ { "error", "intervalMs must be an integer" } };
 			}
-			long interval = a_args.value("intervalMs", g_defaultIntervalMs);  // config default; arg overrides
-			if (interval < kMinIntervalMs)
-				interval = kMinIntervalMs;
+			long interval;
+			try {
+				interval = static_cast<long>(ParseBoundedIntegerArgument(a_args, "intervalMs",
+					g_defaultIntervalMs, kMinIntervalMs, kMaximumVRTrackedDurationMs));
+			} catch (const std::invalid_argument& e) {
+				cancelStart();
+				return json{ { "error", e.what() } };
+			}
 
 			// Capture the manifest synchronously: the player must be loaded to anchor the
 			// scene, so fail fast (rather than starting an empty recording) if not.
@@ -813,10 +856,11 @@ namespace dvb::Recording
 				rec.manifest = std::move(manifest);
 				rec.intervalMs = interval;
 				rec.startTick = steady_clock::now();
+				const auto generation = ++rec.generation;
 				rec.running.store(true, std::memory_order_relaxed);
 				rec.state = RecorderState::running;
 				try {
-					rec.worker = std::thread([&rec] { rec.Sample(); });
+					rec.worker = std::thread([&rec, generation] { rec.Sample(generation); });
 				} catch (...) {
 					rec.running.store(false, std::memory_order_relaxed);
 					rec.state = RecorderState::idle;
@@ -851,15 +895,18 @@ namespace dvb::Recording
 			if (id.empty())
 				return json{ { "error", "checkpoint requires a non-empty 'id'" } };
 
-			const long atMs = static_cast<long>(
-				duration_cast<milliseconds>(steady_clock::now() - rec.startTick).count());
-			json entry{ { "id", id }, { "atMs", atMs }, { "excludeUi", a_args.value("excludeUi", true) } };
-
+			long   atMs = 0;
+			json   entry;
 			size_t count = 0;
 			{
 				std::lock_guard lock(rec.mtx);
 				if (rec.state != RecorderState::running)
 					return json{ { "error", "not recording — call action=start first" } };
+				atMs = static_cast<long>(duration_cast<milliseconds>(
+					steady_clock::now() - rec.startTick)
+						.count());
+				entry = json{ { "id", id }, { "atMs", atMs },
+					{ "excludeUi", a_args.value("excludeUi", true) } };
 				if (std::any_of(rec.checkpoints.begin(), rec.checkpoints.end(),
 						[&](const json& c) { return c.value("id", std::string{}) == id; }))
 					return json{ { "error", std::format("checkpoint id '{}' already marked this recording", id) } };
@@ -880,6 +927,7 @@ namespace dvb::Recording
 				rec.state = RecorderState::stopping;
 				rec.running.store(false, std::memory_order_relaxed);
 			}
+			rec.cv.notify_all();
 			if (rec.worker.joinable())
 				rec.worker.join();  // sampler done → samples are stable, no lock needed below
 
@@ -974,71 +1022,79 @@ namespace dvb::Recording
 
 	void NoteConsoleCommand(const std::string& a_command)
 	{
-		auto& rec = Get();
-		if (!rec.running.load(std::memory_order_relaxed))
+		auto&      rec = Get();
+		const auto generation = ActiveGeneration();
+		if (!generation)
 			return;  // only capture while a recording is active
 		// coc/cow are real user commands — capture them. But flag that the player just commanded a
 		// transition, so the cell-load that follows (NoteCellChange) won't ALSO emit a coc for the
 		// same move; the user's own command already reproduces it.
-		if (a_command.size() >= 4 && a_command[3] == ' ' &&
-			(a_command[0] | 0x20) == 'c' && (a_command[1] | 0x20) == 'o' &&
-			((a_command[2] | 0x20) == 'c' || (a_command[2] | 0x20) == 'w'))
-			g_userCocPending.store(true, std::memory_order_relaxed);
+		const bool isCellTransition = a_command.size() >= 4 && a_command[3] == ' ' &&
+		                              (a_command[0] | 0x20) == 'c' && (a_command[1] | 0x20) == 'o' &&
+		                              ((a_command[2] | 0x20) == 'c' || (a_command[2] | 0x20) == 'w');
 		{
 			std::lock_guard lock(rec.mtx);
-			if (rec.state != RecorderState::running || !rec.running.load(std::memory_order_relaxed))
+			if (rec.state != RecorderState::running || !rec.running.load(std::memory_order_relaxed) ||
+				rec.generation != generation)
 				return;
 			rec.commands.push_back(json{ { "command", a_command }, { "frame", game::CurrentFrame() },
 				{ "tMs", duration_cast<milliseconds>(steady_clock::now() - rec.startTick).count() } });
+			if (isCellTransition)
+				g_userCocPending.store(true, std::memory_order_relaxed);
 		}
-		AppendActivity(json{ { "kind", "console" }, { "command", a_command } });
+		AppendActivity(json{ { "kind", "console" }, { "command", a_command } }, generation);
 	}
 
 	void NoteCellChange(const std::string& a_command)
 	{
-		auto& rec = Get();
-		if (!rec.running.load(std::memory_order_relaxed) || a_command.empty())
+		auto&      rec = Get();
+		const auto generation = ActiveGeneration();
+		if (!generation || a_command.empty())
 			return;  // only capture while recording; caller passes "" when it can't build a command
 		// If the player commanded this transition (a coc/cow was just captured), their own command
 		// already reproduces it — consume the flag and skip, so we don't double it. A door issues
 		// no console command, so the flag is clear and we capture the transition here.
-		if (g_userCocPending.exchange(false, std::memory_order_relaxed)) {
-			AppendActivity(json{ { "kind", "cell" }, { "command", a_command },
-				{ "commandAlreadyCaptured", true } });
-			return;
-		}
-		// A mid-recording cell transition with no commanding console input (door / fast-travel).
-		// The caller built the reproducible command — `coc <interior>` (unique editor id) or
-		// `cow <worldspace> <gx> <gy>` for exteriors (whose editor ids are NOT unique across
-		// worldspaces). The trajectory's setpos then refines to the exact spot.
+		bool commandAlreadyCaptured = false;
 		{
 			std::lock_guard lock(rec.mtx);
-			if (rec.state != RecorderState::running || !rec.running.load(std::memory_order_relaxed))
+			if (rec.state != RecorderState::running || !rec.running.load(std::memory_order_relaxed) ||
+				rec.generation != generation)
 				return;
-			rec.commands.push_back(json{ { "command", a_command }, { "frame", game::CurrentFrame() } });
+			commandAlreadyCaptured = g_userCocPending.exchange(false, std::memory_order_relaxed);
+			if (!commandAlreadyCaptured) {
+				// Door and fast-travel transitions have no commanding console input. The caller
+				// supplies a reproducible coc/cow command and the trajectory refines the position.
+				rec.commands.push_back(json{ { "command", a_command }, { "frame", game::CurrentFrame() } });
+			}
 		}
-		AppendActivity(json{ { "kind", "cell" }, { "command", a_command } });
-		logs::info("devbench: recorded cell transition — {}", a_command);
+		json activity{ { "kind", "cell" }, { "command", a_command } };
+		if (commandAlreadyCaptured)
+			activity["commandAlreadyCaptured"] = true;
+		AppendActivity(std::move(activity), generation);
+		if (!commandAlreadyCaptured)
+			logs::info("devbench: recorded cell transition — {}", a_command);
 	}
 
 	void NoteInputEvents(RE::InputEvent* const* a_events)
 	{
-		auto& rec = Get();
-		if (!a_events || !rec.running.load(std::memory_order_relaxed) ||
+		const auto generation = ActiveGeneration();
+		if (!a_events || !generation ||
 			g_replaying.load(std::memory_order_relaxed))
 			return;
 		for (const auto* event = *a_events; event; event = event->next)
-			AppendActivity(SerializeInputEvent(*event));
+			AppendActivity(SerializeInputEvent(*event), generation);
 	}
 
 	void NoteMenuState(const std::string& a_menuName, bool a_opening)
 	{
-		AppendActivity(json{ { "kind", "menu" }, { "name", a_menuName }, { "opening", a_opening } });
+		const auto generation = ActiveGeneration();
+		AppendActivity(json{ { "kind", "menu" }, { "name", a_menuName }, { "opening", a_opening } }, generation);
 	}
 
 	void NoteLifecycleEvent(const std::string& a_event)
 	{
-		AppendActivity(json{ { "kind", "lifecycle" }, { "event", a_event } });
+		const auto generation = ActiveGeneration();
+		AppendActivity(json{ { "kind", "lifecycle" }, { "event", a_event } }, generation);
 	}
 
 	void SetReplaying(bool a_replaying)
@@ -1053,7 +1109,8 @@ namespace dvb::Recording
 
 	void SetDefaultIntervalMs(int a_ms)
 	{
-		g_defaultIntervalMs = (a_ms < kMinIntervalMs) ? kMinIntervalMs : a_ms;
+		g_defaultIntervalMs = std::clamp<long>(a_ms, kMinIntervalMs,
+			kMaximumVRTrackedDurationMs);
 	}
 
 	void SetCoupling(int a_anchorMs, int a_cellMs, bool a_cleanTransition, const std::string& a_transitionCell)

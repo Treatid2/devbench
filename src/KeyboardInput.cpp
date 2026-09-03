@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <limits>
 #include <mutex>
 #include <thread>
@@ -118,7 +119,7 @@ namespace dvb
 		public:
 			static KeyboardManager& Get()
 			{
-				// Process-lifetime singleton: detached bounded lease timers may still reference it
+				// Process-lifetime singleton: the bounded watchdog may still reference it
 				// during DLL/process teardown, so deliberately do not run a static destructor.
 				static auto* instance = new KeyboardManager();
 				return *instance;
@@ -185,6 +186,7 @@ namespace dvb
 				bool a_requireFresh = false)
 			{
 				RequireReady();
+				EnsureWatchdog();
 				KeyboardAcquireResult acquired;
 				QueueResult           queued;
 				{
@@ -201,6 +203,7 @@ namespace dvb
 						result["alreadyHeld"] = true;
 						return result;
 					}
+					m_latestGeneration.store(acquired.lease.generation, std::memory_order_release);
 					try {
 						queued = QueueButton(a_key, true, 0.0F);
 					} catch (...) {
@@ -209,8 +212,8 @@ namespace dvb
 					}
 				}
 
+				SignalWatchdog();
 				Publish("down", acquired.lease, "request", queued.pending);
-				ScheduleExpiry(acquired.lease);
 				return EventResult("down", acquired.lease, queued.pending, false, queued.frame);
 			}
 
@@ -232,6 +235,7 @@ namespace dvb
 					static_cast<float>(NowMs() - current->pressedAtMs) / 1000.0F);
 				const QueueResult queued = QueueButton(a_key, false, heldSecs);
 				m_leases.RemoveExact(a_key.scancode, current->generation);
+				SignalWatchdog();
 				Publish("up", *current, a_reason, queued.pending);
 				return EventResult("up", *current, queued.pending, true, queued.frame);
 			}
@@ -384,6 +388,15 @@ namespace dvb
 				};
 			}
 
+			void RequestLifecycleRelease() noexcept
+			{
+				const auto cutoff = m_latestGeneration.load(std::memory_order_acquire);
+				if (!cutoff)
+					return;
+				RaiseLifecycleCutoff(cutoff);
+				SignalWatchdog();
+			}
+
 		private:
 			void RequireReady() const
 			{
@@ -451,31 +464,90 @@ namespace dvb
 				m_events->Publish("input.keyboard", std::move(payload));
 			}
 
-			void ScheduleExpiry(KeyboardLease a_lease)
+			void EnsureWatchdog()
 			{
-				const auto delay = milliseconds(std::max<std::int64_t>(0, a_lease.expiresAtMs - NowMs()));
-				std::thread([lease = std::move(a_lease), delay]() {
-					std::this_thread::sleep_for(delay);
-					std::size_t attempt = 0;
-					for (;;) {
-						++attempt;
-						try {
-							// A failed release retains the generation. Keep retrying until the key is
-							// released or a newer generation proves this watchdog obsolete.
-							if (!KeyboardManager::Get().ReleaseGeneration(
-									lease.key.scancode, lease.generation, "leaseExpired"))
-								return;
-							return;
-						} catch (const std::exception& e) {
-							if (attempt == 1 || attempt % 60 == 0)
-								logs::warn(
-									"devbench: automatic keyboard release still pending for {} "
-									"(generation {}, attempt {}): {}",
-									lease.key.name, lease.generation, attempt, e.what());
+				std::lock_guard lock(m_mutex);
+				if (m_watchdogStarted)
+					return;
+				// Provision the sole watchdog before any key-down is admitted. Thread
+				// construction failure therefore cannot strand an unmonitored lease.
+				std::thread([this] { WatchdogLoop(); }).detach();
+				m_watchdogStarted = true;
+			}
+
+			void WatchdogLoop() noexcept
+			{
+				for (;;) {
+					std::vector<KeyboardLease> selected;
+					const auto                 lifecycleCutoff = m_lifecycleCutoff.exchange(0, std::memory_order_acq_rel);
+					const bool                 lifecycle = lifecycleCutoff != 0;
+					{
+						std::unique_lock lock(m_mutex);
+						const auto       leases = m_leases.Snapshot();
+						if (!lifecycle && leases.empty()) {
+							const auto revision = m_watchdogRevision.load(std::memory_order_acquire);
+							m_watchdogCv.wait(lock, [&] {
+								return m_lifecycleCutoff.load(std::memory_order_acquire) != 0 ||
+								       m_watchdogRevision.load(std::memory_order_acquire) != revision;
+							});
+							continue;
 						}
-						std::this_thread::sleep_for(kWatchdogRetryDelay);
+						const auto now = NowMs();
+						if (lifecycle) {
+							for (const auto& lease : leases)
+								if (lease.generation <= lifecycleCutoff)
+									selected.push_back(lease);
+						} else {
+							const auto earliest = std::min_element(leases.begin(), leases.end(),
+								[](const auto& a, const auto& b) { return a.expiresAtMs < b.expiresAtMs; });
+							if (earliest != leases.end() && earliest->expiresAtMs > now) {
+								const auto revision = m_watchdogRevision.load(std::memory_order_acquire);
+								m_watchdogCv.wait_for(lock, milliseconds(earliest->expiresAtMs - now), [&] {
+									return m_lifecycleCutoff.load(std::memory_order_acquire) != 0 ||
+									       m_watchdogRevision.load(std::memory_order_acquire) != revision;
+								});
+								continue;
+							}
+							for (const auto& lease : leases)
+								if (lease.expiresAtMs <= now)
+									selected.push_back(lease);
+						}
 					}
-				}).detach();
+
+					bool retryPending = false;
+					for (const auto& lease : selected) {
+						try {
+							ReleaseGenerationWithRetry(lease.key.scancode, lease.generation,
+								lifecycle ? "lifecycle" : "leaseExpired");
+						} catch (const std::exception& e) {
+							retryPending = true;
+							if (lifecycle)
+								RaiseLifecycleCutoff(lifecycleCutoff);
+							logs::warn(
+								"devbench: automatic keyboard release remains pending for {} "
+								"(generation {}): {}",
+								lease.key.name, lease.generation, e.what());
+						}
+					}
+					if (retryPending) {
+						std::unique_lock lock(m_mutex);
+						m_watchdogCv.wait_for(lock, kWatchdogRetryDelay);
+					}
+				}
+			}
+
+			void SignalWatchdog() noexcept
+			{
+				m_watchdogRevision.fetch_add(1, std::memory_order_release);
+				m_watchdogCv.notify_all();
+			}
+
+			void RaiseLifecycleCutoff(std::uint64_t a_cutoff) noexcept
+			{
+				auto pending = m_lifecycleCutoff.load(std::memory_order_relaxed);
+				while (pending < a_cutoff && !m_lifecycleCutoff.compare_exchange_weak(
+												 pending, a_cutoff, std::memory_order_release, std::memory_order_relaxed)) {
+				}
 			}
 
 			bool ReleaseGenerationWithRetry(std::uint16_t a_scancode, std::uint64_t a_generation,
@@ -510,9 +582,14 @@ namespace dvb
 				return true;
 			}
 
-			std::mutex         m_mutex;
-			KeyboardLeaseTable m_leases;
-			EventBus*          m_events = nullptr;
+			std::mutex                 m_mutex;
+			std::condition_variable    m_watchdogCv;
+			KeyboardLeaseTable         m_leases;
+			EventBus*                  m_events = nullptr;
+			bool                       m_watchdogStarted = false;
+			std::atomic<std::uint64_t> m_latestGeneration{ 0 };
+			std::atomic<std::uint64_t> m_lifecycleCutoff{ 0 };
+			std::atomic<std::uint64_t> m_watchdogRevision{ 0 };
 		};
 
 		json HandleInputImpl(const json& a_args, const ToolContext& a_ctx)
@@ -628,16 +705,9 @@ namespace dvb
 	{
 		if (!g_inputReady.load(std::memory_order_relaxed))
 			return;
-		// OnMessage is a main-thread callback. Never acquire KeyboardManager::m_mutex there:
-		// an input request may hold it while RunAndWait is waiting for this same main thread.
-		// Hand the cleanup to a worker, which queues ordinary up events once this callback exits.
-		const std::string reason = a_reason ? a_reason : "lifecycle";
-		std::thread([reason]() {
-			try {
-				KeyboardManager::Get().ReleaseAll("lifecycle", true, reason);
-			} catch (const std::exception& e) {
-				logs::warn("devbench: lifecycle keyboard release failed ({}): {}", reason, e.what());
-			}
-		}).detach();
+		(void)a_reason;
+		// The lifecycle callback cannot take the manager mutex while another request is
+		// waiting on this main thread. The already-provisioned bounded watchdog owns cleanup.
+		KeyboardManager::Get().RequestLifecycleRelease();
 	}
 }
