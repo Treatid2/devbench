@@ -210,10 +210,10 @@ namespace dvb
 						m_leases.RemoveExact(a_key.scancode, acquired.lease.generation);
 						throw;
 					}
+					PublishLocked("down", acquired.lease, "request", queued.pending);
 				}
 
 				SignalWatchdog();
-				Publish("down", acquired.lease, "request", queued.pending);
 				return EventResult("down", acquired.lease, queued.pending, false, queued.frame);
 			}
 
@@ -236,7 +236,7 @@ namespace dvb
 				const QueueResult queued = QueueButton(a_key, false, heldSecs);
 				m_leases.RemoveExact(a_key.scancode, current->generation);
 				SignalWatchdog();
-				Publish("up", *current, a_reason, queued.pending);
+				PublishLocked("up", *current, a_reason, queued.pending);
 				return EventResult("up", *current, queued.pending, true, queued.frame);
 			}
 
@@ -446,7 +446,9 @@ namespace dvb
 				return result;
 			}
 
-			void Publish(std::string_view a_action, const KeyboardLease& a_lease,
+			// Call while holding m_mutex so event order matches the serialized lease changes.
+			// EventBus only queues here; subscriber callbacks run on its worker thread.
+			void PublishLocked(std::string_view a_action, const KeyboardLease& a_lease,
 				std::string_view a_reason, bool a_pending)
 			{
 				if (!m_events)
@@ -578,7 +580,7 @@ namespace dvb
 					static_cast<float>(NowMs() - current->pressedAtMs) / 1000.0F);
 				const QueueResult queued = QueueButton(current->key, false, heldSecs);
 				m_leases.RemoveExact(a_scancode, a_generation);
-				Publish("up", *current, a_reason, queued.pending);
+				PublishLocked("up", *current, a_reason, queued.pending);
 				return true;
 			}
 

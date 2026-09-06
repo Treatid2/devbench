@@ -230,10 +230,10 @@ namespace dvb
 						m_started = started;
 						m_current = frames.front();
 						m_lastCompletion = json::object();
+						PublishLocked("started", json{ { "owner", a_owner }, { "generation", generation },
+													 { "frameCount", frameCount }, { "durationMs", durationMs },
+													 { "surviveLifecycle", surviveLifecycle } });
 					}
-					Publish("started", json{ { "owner", a_owner }, { "generation", generation },
-										   { "frameCount", frameCount }, { "durationMs", durationMs },
-										   { "surviveLifecycle", surviveLifecycle } });
 					std::thread worker([this, generation, owner = a_owner,
 										   frames = std::move(frames), tailMs, started]() mutable {
 						Playback(generation, owner, std::move(frames), tailMs, started);
@@ -404,13 +404,10 @@ namespace dvb
 								m_pendingCompletion = json::object();
 								m_pendingTerminalEvent.clear();
 								m_lastCompletion = completion;
+								if (!event.empty())
+									PublishLocked(event.c_str(), std::move(completion));
 							}
 							m_cv.notify_all();
-							// Publish in the queued main-thread task. If RunAndWait times out after
-							// queueing, this task may complete later and remains the only code that
-							// can durably announce the terminal transition.
-							if (!event.empty())
-								Publish(event.c_str(), std::move(completion));
 							return json{ { "restored", true } };
 						});
 						if (result.value("restored", false))
@@ -543,27 +540,24 @@ namespace dvb
 						m_pendingCompletion = json::object();
 						m_pendingTerminalEvent.clear();
 						m_lastCompletion = completionToPublish;
+						if (!eventToPublish.empty())
+							PublishLocked(eventToPublish.c_str(), std::move(completionToPublish));
 					}
 				}
 				m_cv.notify_all();
 				if (action == VRSequenceFinishAction::kRestore)
 					return RestoreControllerIndices(a_generation);
-				if (action == VRSequenceFinishAction::kPublish && !eventToPublish.empty())
-					Publish(eventToPublish.c_str(), std::move(completionToPublish));
 				return true;
 			}
 
-			void Publish(const char* a_state, json a_payload) noexcept
+			// Call while holding m_mutex so terminal events cannot overtake "started".
+			// EventBus only queues here; subscriber callbacks run on its worker thread.
+			void PublishLocked(const char* a_state, json a_payload) noexcept
 			{
-				EventBus* events = nullptr;
-				{
-					std::lock_guard lock(m_mutex);
-					events = m_events;
-				}
-				if (events)
+				if (m_events)
 					try {
 						a_payload["state"] = a_state;
-						events->Publish("input.vrTrackedSet", std::move(a_payload));
+						m_events->Publish("input.vrTrackedSet", std::move(a_payload));
 					} catch (const std::exception& e) {
 						logs::warn("devbench: VR tracked-set event publish failed: {}", e.what());
 					}
