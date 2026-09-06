@@ -221,7 +221,7 @@ TEST_CASE("keyboard transitions interleave without changing the original traject
 	const auto downStep = std::find_if(plan["steps"].begin(), plan["steps"].end(),
 		[](const json& step) {
 			return step.value("tool", std::string{}) == "input" &&
-		           step["args"].value("action", std::string{}) == "down";
+			       step["args"].value("action", std::string{}) == "down";
 		});
 	CHECK(downStep != plan["steps"].end());
 	if (downStep != plan["steps"].end())

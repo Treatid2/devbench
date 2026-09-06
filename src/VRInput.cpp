@@ -463,8 +463,8 @@ namespace dvb
 
 				if (!m_cv.wait_for(lock, kControllerRestoreWaitTimeout, [&] {
 						return m_transaction.Generation() != a_generation ||
-					           !m_transaction.Restoring() ||
-					           !m_transaction.RestoreAttemptActive();
+						       !m_transaction.Restoring() ||
+						       !m_transaction.RestoreAttemptActive();
 					}))
 					return false;
 				return m_transaction.Generation() != a_generation ||

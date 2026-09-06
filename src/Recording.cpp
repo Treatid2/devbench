@@ -452,7 +452,7 @@ namespace dvb::Recording
 					const auto       target = std::min(steady_clock::now() + a_delay, deadline);
 					if (cv.wait_until(lock, target, [&] {
 							return !running.load(std::memory_order_relaxed) ||
-						           state != RecorderState::running || generation != a_generation;
+							       state != RecorderState::running || generation != a_generation;
 						}))
 						return false;
 					if (steady_clock::now() < deadline)
