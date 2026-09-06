@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 // extension tools otherwise follow, so a bare filter could admit a rogue one.
 // Update this set (and re-run) whenever a core tool is added or removed.
 const CORE_TOOL_NAMES = new Set([
+  "input",
   "menu",
   "console",
   "scenario",

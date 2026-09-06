@@ -1,6 +1,104 @@
 {
   "tools": [
     {
+      "name": "input",
+      "description": "Versioned synthetic input interface. action='capabilities' (default) returns the exact contract/version, readiness, limits, injection path, supported actions, and complete keyboard name→DirectInput-scan-code catalog; clients MUST capability-negotiate rather than assuming this tool exists. Contract v1 implements device='keyboard' using Skyrim's own BSInputEventQueue (not Windows SendInput, so window focus is irrelevant). 'status' reports readiness and every synthetic held key with owner/lease timing. 'down' starts a bounded owned hold (default maxHoldMs 5000; automatic up on expiry); repeated down by the same owner is idempotent and another owner gets 409. 'up' releases that owner's key; cross-owner force is reserved for internal cleanup. Releasing an unheld key is an idempotent no-op. 'tap' emits down, waits durationMs (default 50), then up. 'sequence' executes a prevalidated balanced array of tap/down/up/wait events (optional afterMs); it rejects an unbalanced hold before injecting anything and releases keys acquired by the sequence on failure. 'releaseAll' releases this owner only; all-owner cleanup is internal-only. Every lease watchdog retries a failed automatic release until it succeeds or becomes obsolete. owner defaults to the MCP session id or rest:anonymous; automation should supply a stable task owner. DevBench also releases owned keys on load/new-game and emits input.keyboard events for accepted down/up transitions. Contract v2 also implements device='vrTrackedSet': read-only observe returns the current physical OpenVR HMD and both controllers; one prevalidated timestamped sequence whose every frame atomically contains HMD, left-controller, and right-controller pose plus both controllers' complete OpenVR button/touch/axis state. It is applied at the OpenVR compositor/system boundary, is always asynchronous, has one owner, passes the real runtime through when inactive, and returns a controlToken required for external stop. Failed controller-index restoration remains retryable through that token. Ad-hoc sequences stop on lifecycle boundaries; recording replay may explicitly survive the load/new-game events it is reproducing. There are deliberately no per-device or per-button VR mutation actions: submit the coherent tracked set so poses and controls cannot come from different clocks.",
+      "inputSchema": {
+        "properties": {
+          "action": {
+            "enum": [
+              "capabilities",
+              "status",
+              "down",
+              "up",
+              "tap",
+              "sequence",
+              "stop",
+              "releaseAll"
+            ],
+            "type": "string"
+          },
+          "all": {
+            "description": "internal cleanup only; external true is rejected",
+            "type": "boolean"
+          },
+          "controlToken": {
+            "description": "vrTrackedSet stop/releaseAll: opaque token returned by sequence start",
+            "type": "string"
+          },
+          "device": {
+            "description": "mutation/status device; omit for capabilities",
+            "enum": ["keyboard", "vrTrackedSet"],
+            "type": "string"
+          },
+          "durationMs": {
+            "description": "tap duration (default 50); sequence tap/wait event duration",
+            "maximum": 5000,
+            "minimum": 10,
+            "type": "integer"
+          },
+          "events": {
+            "description": "sequence: balanced [{action:tap|down|up|wait,key?,durationMs?,afterMs?}]",
+            "items": {
+              "type": "object"
+            },
+            "maxItems": 128,
+            "minItems": 1,
+            "type": "array"
+          },
+          "force": {
+            "description": "internal cleanup only; external true is rejected",
+            "type": "boolean"
+          },
+          "frames": {
+            "description": "vrTrackedSet sequence: monotonic atomic frames; each requires tMs, originCode, hmd, left, right; controller objects carry packetNumber/pressed/touched/five axes",
+            "items": {
+              "type": "object"
+            },
+            "maxItems": 60000,
+            "minItems": 1,
+            "type": "array"
+          },
+          "key": {
+            "description": "down/up/tap: documented key name or raw DirectInput scancode",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "maximum": 255,
+                "minimum": 1,
+                "type": "integer"
+              }
+            ]
+          },
+          "maxHoldMs": {
+            "description": "down safety lease (default 5000); automatic up at expiry",
+            "maximum": 60000,
+            "minimum": 100,
+            "type": "integer"
+          },
+          "owner": {
+            "description": "stable task/session owner; defaults to MCP session id or rest:anonymous",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "surviveLifecycle": {
+            "description": "internal recording replay only; external true is rejected",
+            "type": "boolean"
+          },
+          "tailMs": {
+            "description": "vrTrackedSet sequence: final-state visibility before automatic release (default 50ms)",
+            "maximum": 1000,
+            "minimum": 10,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
       "name": "menu",
       "description": "Inspect, open, answer, or dismiss menus. action='list' returns { openMenus, messageBoxOpen, registered } tracked live from menu open/close events. 'describe' returns the active MessageBoxMenu as { messageBoxOpen, bodyText, buttons:[…], cancelIndex } (read the buttons, then pick one), or with a 'name' the registered menu's descriptor. 'accept' answers a MessageBoxMenu by button 'index' (default 0) — runs its callback and dismisses it (this is how you clear a Yes/No modal, e.g. the content-mismatch dialog gating a load; kHide does NOT). 'open' shows an ENGINE menu by 'name' via the UI queue (kShow) — opens hub menus from a plain name (TweenMenu, 'Journal Menu', MagicMenu, MapMenu, StatsMenu, InventoryMenu, FavoritesMenu); context menus that need a target ref (ContainerMenu/BarterMenu/BookMenu) won't open this way. 'close' hides a menu by 'name' via the UI queue (kHide). 'invoke' dispatches to a consumer-registered (mod) menu by 'name' — NOT 'open' (mod menus aren't engine menus). A mod exposes its menu via the C-ABI RegisterMenuHandler; 'list' returns those under 'registered'. Registered (mod) menus (invoke with action='invoke', name=<x>): CommunityShaders — Open, close, or toggle the Open Shaders in-game settings menu headlessly, the same window the ToggleKey (default End) shows. op: open|close|toggle (default toggle). page: OPTIONAL built-in page name (e.g. \"Performance\", \"Home\") or a feature's shortName (see openshaders.feature list) to navigate to on the next frame, same as clicking it in the left pane. Returns {op,page,queued:true}; the change is applied on the render thread on the next frame (open is a no-op while first-time setup is pending).; devbench.selftest — devbench menu-extension self-test; echoes its args..",
       "inputSchema": {
