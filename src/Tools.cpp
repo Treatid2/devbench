@@ -104,8 +104,11 @@ namespace dvb
 			const std::string action = a_args.value("action", std::string("exec"));
 
 			if (action == "read") {
-				return MainThread::RunAndWait([]() -> json {
-					const auto r = ConsoleLogCapture::ReadFenced(200);
+				const int maxLines = a_args.value("maxLines", 200);
+				if (maxLines < 1 || maxLines > static_cast<int>(ConsoleLogCapture::PrintCollector::kMaxLines))
+					throw ToolError(400, std::format("console read: 'maxLines' must be 1..{}", ConsoleLogCapture::PrintCollector::kMaxLines));
+				return MainThread::RunAndWait([maxLines]() -> json {
+					const auto r = ConsoleLogCapture::ReadFenced(static_cast<std::size_t>(maxLines));
 					json       arr = json::array();
 					for (const auto& l : r.lines)
 						arr.push_back(l);
@@ -127,6 +130,9 @@ namespace dvb
 									  { "consoleMenuExists", r.consoleMenuExists },
 									  { "consoleMenuOpen", r.consoleMenuOpen },
 									  { "consoleMode", r.consoleMode },
+									  { "printHooked", r.printHooked },
+									  { "printLines", r.printLines },
+									  { "printDropped", r.printDropped },
 									  { "ringLines", r.ringLines },
 									  { "samples", r.samples },
 									  { "ticks", r.ticks },
@@ -234,6 +240,7 @@ namespace dvb
 		// game setTimeScale: how long to wait for the engine to actually reach the requested speed
 		// (the reconciler applies it on the next main-thread frame, and the engine then ramps).
 		constexpr int kScaleApplyTimeoutMs = 2000;
+		constexpr int kScaleMaxWaitMs = 30000;
 		constexpr int kScalePollMs = 5;
 
 		// A Pascal-style string in the .ess header: uint16 length + that many raw (non-UTF16,
@@ -491,21 +498,36 @@ namespace dvb
 						throw ToolError(400, std::format("game setTimeScale: 'holdMs' must be 1..{}", TimeScaleControl::kMaximumLeaseMs));
 				}
 
+				int waitMs = kScaleApplyTimeoutMs;
+				if (const auto waitArg = a_args.find("waitMs"); waitArg != a_args.end()) {
+					if (!waitArg->is_number_integer() || waitArg->get<std::int64_t>() < 0 || waitArg->get<std::int64_t>() > kScaleMaxWaitMs)
+						throw ToolError(400, std::format("game setTimeScale: 'waitMs' must be an integer 0..{}", kScaleMaxWaitMs));
+					waitMs = waitArg->get<int>();
+				}
+
 				const TimeScaleControl::SetResult set = TimeScaleControl::Set(validation.value, holdMs,
 					LeaseOwner(a_ctx), BooleanArgument(a_args, "allowTimeScale", false));
 				if (!set.ok)
 					throw ToolError(409, std::format("game setTimeScale: {}", set.error));
 
 				// The reconciler applies this on the next engine frame and the engine then ramps
-				// toward it, so report only once it is actually running at the requested speed.
-				const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kScaleApplyTimeoutMs);
-				while (std::fabs(TimeScaleControl::Effective() - validation.value) > TimeScaleControl::kEffectiveTolerance) {
-					if (std::chrono::steady_clock::now() >= deadline)
-						throw ToolError(504, std::format("game setTimeScale: the engine is still at {} after {}ms (requested {})", TimeScaleControl::Effective(), kScaleApplyTimeoutMs, validation.value));
+				// toward it over a few seconds. The lease is already set, so a wait that runs out
+				// is reported as reached:false, not as an error.
+				const auto start = std::chrono::steady_clock::now();
+				const auto deadline = start + std::chrono::milliseconds(waitMs);
+				bool       reached = false;
+				while (true) {
+					reached = std::fabs(TimeScaleControl::Effective() - validation.value) <= TimeScaleControl::kEffectiveTolerance;
+					if (reached || std::chrono::steady_clock::now() >= deadline)
+						break;
 					std::this_thread::sleep_for(std::chrono::milliseconds(kScalePollMs));
 				}
 				json out = TimeScaleControl::Status();
 				out["applied"] = true;
+				out["reached"] = reached;
+				out["waitedMs"] = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+				if (!reached)
+					out["note"] = std::format("the engine ramps toward the new scale; it was at {} after {}ms (requested {}). Poll getTimeScale or pass a longer waitMs.", TimeScaleControl::Effective(), waitMs, validation.value);
 				return out;
 			}
 
@@ -824,6 +846,184 @@ namespace dvb
 			return j;
 		}
 
+		// ---- lights: which NiLights hang under a reference's 3D, and whether the renderer uses them ----
+
+		// NiLight -> "active" / "shadow" for every light the world ShadowSceneNode is lighting with.
+		using ActiveLightIndex = std::unordered_map<const RE::NiLight*, const char*>;
+
+		ActiveLightIndex IndexActiveLights()
+		{
+			ActiveLightIndex index;
+			auto*            ssn = RE::BSShaderManager::State::GetSingleton().shadowSceneNode[0];
+			if (!ssn)
+				return index;
+			auto& data = ssn->GetRuntimeData();
+			for (const auto& bl : data.activeLights)
+				if (bl && bl->light)
+					index.emplace(bl->light.get(), "active");
+			for (const auto& bl : data.activeShadowLights)
+				if (bl && bl->light)
+					index[bl->light.get()] = "shadow";
+			return index;
+		}
+
+		// "NPC Root [Root] > ... > MagicRight" from a_root (or the top of the graph) down to the
+		// light's parent node.
+		std::string NodePath(const RE::NiAVObject* a_object, const RE::NiAVObject* a_root)
+		{
+			std::vector<std::string> names;
+			for (const RE::NiAVObject* n = a_object->parent; n; n = n->parent) {
+				names.emplace_back(n->name.c_str() ? n->name.c_str() : "");
+				if (n == a_root || names.size() >= 64)
+					break;
+			}
+			std::string path;
+			for (auto it = names.rbegin(); it != names.rend(); ++it)
+				path += (path.empty() ? "" : " > ") + (it->empty() ? std::string("(unnamed)") : *it);
+			return path;
+		}
+
+		// The reference whose 3D this object hangs under, from the nearest ancestor that carries one.
+		RE::TESObjectREFR* OwnerOf(const RE::NiAVObject* a_object)
+		{
+			for (const RE::NiAVObject* n = a_object; n; n = n->parent)
+				if (auto* ref = n->GetUserData())
+					return ref;
+			return nullptr;
+		}
+
+		json DescribeLight(const RE::NiLight* a_light, const RE::NiAVObject* a_root, const ActiveLightIndex& a_active)
+		{
+			const auto& data = a_light->GetLightRuntimeData();
+			const auto  pos = a_light->world.translate;
+			const auto  scene = a_active.find(a_light);
+			json        j{
+				{ "name", a_light->name.c_str() ? a_light->name.c_str() : "" },
+				{ "type", a_light->GetRTTI() && a_light->GetRTTI()->GetName() ? a_light->GetRTTI()->GetName() : "" },
+				{ "path", NodePath(a_light, a_root) },
+				{ "diffuse", json::array({ data.diffuse.red, data.diffuse.green, data.diffuse.blue }) },
+				{ "radius", data.radius.x },
+				{ "fade", data.fade },
+				{ "fadeAmount", a_light->fadeAmount },
+				{ "appCulled", a_light->GetAppCulled() },
+				{ "inScene", scene != a_active.end() ? json(scene->second) : json(false) },
+				{ "position", json::array({ pos.x, pos.y, pos.z }) },
+			};
+			return j;
+		}
+
+		void CollectLights(const RE::NiAVObject* a_object, const RE::NiAVObject* a_root, const ActiveLightIndex& a_active, json& a_out, int a_depth = 0)
+		{
+			if (!a_object || a_depth > 256)
+				return;
+			if (const auto* light = netimmerse_cast<const RE::NiLight*>(a_object))
+				a_out.push_back(DescribeLight(light, a_root, a_active));
+			if (auto* node = const_cast<RE::NiAVObject*>(a_object)->AsNode())
+				for (const auto& child : node->GetChildren())
+					CollectLights(child.get(), a_root, a_active, a_out, a_depth + 1);
+		}
+
+		json LightsUnder(const RE::NiAVObject* a_root, const ActiveLightIndex& a_active)
+		{
+			json out = json::array();
+			CollectLights(a_root, a_root, a_active, out);
+			return out;
+		}
+
+		// ---- hands: what each hand holds, whether it is out, and whether its casting art is on ----
+
+		const char* WeaponStateName(RE::WEAPON_STATE a_state)
+		{
+			switch (a_state) {
+			case RE::WEAPON_STATE::kSheathed:
+				return "sheathed";
+			case RE::WEAPON_STATE::kWantToDraw:
+				return "wantToDraw";
+			case RE::WEAPON_STATE::kDrawing:
+				return "drawing";
+			case RE::WEAPON_STATE::kDrawn:
+				return "drawn";
+			case RE::WEAPON_STATE::kWantToSheathe:
+				return "wantToSheathe";
+			case RE::WEAPON_STATE::kSheathing:
+				return "sheathing";
+			default:
+				return "unknown";
+			}
+		}
+
+		const char* CasterStateName(RE::MagicCaster::State a_state)
+		{
+			switch (a_state) {
+			case RE::MagicCaster::State::kNone:
+				return "none";
+			case RE::MagicCaster::State::kReady:
+				return "ready";
+			case RE::MagicCaster::State::kCharging:
+				return "charging";
+			case RE::MagicCaster::State::kCasting:
+				return "casting";
+			default:
+				return "other";
+			}
+		}
+
+		RE::ActorMagicCaster* HandCaster(RE::Actor* a_actor, bool a_left)
+		{
+			return a_actor->GetActorRuntimeData().magicCasters[a_left ? RE::Actor::SlotTypes::kLeftHand : RE::Actor::SlotTypes::kRightHand];
+		}
+
+		// True when the hand holds a spell whose casting art is attached, or holds no spell.
+		bool HandArtReady(RE::Actor* a_actor, bool a_left)
+		{
+			auto* equipped = a_actor->GetEquippedObject(a_left);
+			if (!equipped || !equipped->Is(RE::FormType::Spell))
+				return true;
+			auto* caster = HandCaster(a_actor, a_left);
+			return caster && caster->flags.any(RE::ActorMagicCaster::Flags::kCastingArtAttached);
+		}
+
+		json DescribeHand(RE::Actor* a_actor, bool a_left, const ActiveLightIndex& a_active)
+		{
+			json  j{ { "equipped", IdentifyForm(a_actor->GetEquippedObject(a_left)) } };
+			auto* caster = HandCaster(a_actor, a_left);
+			if (!caster) {
+				j["caster"] = nullptr;
+				return j;
+			}
+			json c{
+				{ "state", CasterStateName(caster->state.get()) },
+				{ "stateValue", caster->state.underlying() },
+				{ "currentSpell", IdentifyForm(caster->currentSpell) },
+				{ "castingArt", IdentifyForm(caster->castingArt) },
+				{ "castingArtAttached", caster->flags.any(RE::ActorMagicCaster::Flags::kCastingArtAttached) },
+				{ "castingArtLoading", caster->cloneTask.get() != nullptr },
+				{ "magicNode", caster->magicNode && caster->magicNode->name.c_str() ? json(caster->magicNode->name.c_str()) : json(nullptr) },
+			};
+			// The hand light the engine gives a readied spell (its magic effect's casting light).
+			if (caster->light && caster->light->light)
+				c["light"] = DescribeLight(caster->light->light.get(), nullptr, a_active);
+			else
+				c["light"] = nullptr;
+			j["caster"] = std::move(c);
+			return j;
+		}
+
+		json DescribeHands(RE::Actor* a_actor)
+		{
+			const auto active = IndexActiveLights();
+			json       j{
+				{ "left", DescribeHand(a_actor, true, active) },
+				{ "right", DescribeHand(a_actor, false, active) },
+			};
+			if (auto* state = a_actor->AsActorState()) {
+				j["weaponDrawn"] = state->IsWeaponDrawn();
+				j["weaponState"] = WeaponStateName(state->GetWeaponState());
+			}
+			j["castingArtReady"] = HandArtReady(a_actor, true) && HandArtReady(a_actor, false);
+			return j;
+		}
+
 		// Normalize a form-type filter to a substring needle. The engine's type strings are 4-char
 		// codes (ACHR, NPC_, CONT, WEAP); map common friendly names ('actor', 'weapon') onto them so
 		// a substring match works (a longer friendly name like "weapon" never matches "weap"
@@ -1022,6 +1222,7 @@ namespace dvb
 						{ "left", IdentifyForm(pc->GetEquippedObject(true)) },
 						{ "ammo", IdentifyForm(pc->GetCurrentAmmo()) },
 					};
+					j["hands"] = DescribeHands(pc);
 					return j;
 				});
 			}
@@ -1240,6 +1441,82 @@ namespace dvb
 			//   'selected'    → the console-selected / crosshair ref (set via prid/click)
 			//   else enumerate the loaded references in the grid (on-screen or not), with optional
 			//                   'formType' filter, 'radius' (from player), and 'limit' (default 100).
+			// lights: every NiLight under a reference's 3D (default the player, both 3rd- and
+			// 1st-person), or scope='scene' for every light the renderer is using, nearest first.
+			if (kind == "lights") {
+				const std::string formId = a_args.value("formId", std::string{});
+				const bool        selected = a_args.value("selected", false);
+				const bool        scene = a_args.value("scope", std::string{}) == "scene";
+				const double      radius = a_args.value("radius", 0.0);
+				const int         limit = a_args.value("limit", 100);
+				if (radius < 0.0 || limit < 0)
+					throw ToolError(400, "inspect lights: 'radius' and 'limit' must be >= 0");
+				return MainThread::RunAndWait([=]() -> json {
+					const auto active = IndexActiveLights();
+					auto*      pc = RE::PlayerCharacter::GetSingleton();
+
+					if (scene) {
+						const RE::NiPoint3                  origin = pc ? pc->GetPosition() : RE::NiPoint3{};
+						std::vector<std::pair<float, json>> found;
+						for (const auto& entry : active) {
+							const RE::NiLight* light = entry.first;
+							const float        distance = pc ? origin.GetDistance(light->world.translate) : 0.0f;
+							if (radius > 0.0 && distance > radius)
+								continue;
+							json j = DescribeLight(light, nullptr, active);
+							j["distance"] = distance;
+							j["owner"] = IdentifyRef(OwnerOf(light));
+							found.emplace_back(distance, std::move(j));
+						}
+						std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+						json lights = json::array();
+						for (std::size_t i = 0; i < found.size() && static_cast<int>(i) < limit; ++i)
+							lights.push_back(std::move(found[i].second));
+						return json{
+							{ "scope", "scene" },
+							{ "count", found.size() },
+							{ "returned", lights.size() },
+							{ "truncated", found.size() > lights.size() },
+							{ "lights", std::move(lights) },
+						};
+					}
+
+					RE::TESObjectREFR* ref = nullptr;
+					if (selected) {
+						ref = RE::Console::GetSelectedRef().get();
+					} else if (!formId.empty()) {
+						RE::TESForm* f = RE::TESForm::LookupByEditorID(formId);
+						if (!f) {
+							std::size_t        consumed = 0;
+							unsigned long long id = 0;
+							const std::string  hex = (formId.size() > 2 && formId[0] == '0' && (formId[1] == 'x' || formId[1] == 'X')) ? formId.substr(2) : formId;
+							try {
+								id = std::stoull(hex, &consumed, 16);
+							} catch (...) {
+							}
+							if (consumed == hex.size() && id <= 0xFFFFFFFFull)
+								f = RE::TESForm::LookupByID(static_cast<RE::FormID>(id));
+						}
+						ref = f ? f->As<RE::TESObjectREFR>() : nullptr;
+					} else {
+						ref = pc;
+					}
+					if (!ref)
+						throw ToolError(404, "inspect lights: reference not found");
+
+					json out{ { "ref", IdentifyRef(ref) }, { "sceneActiveLights", active.size() } };
+					if (auto* actor = ref->As<RE::Actor>(); actor && actor == pc) {
+						out["thirdPerson"] = LightsUnder(pc->Get3D(false), active);
+						out["firstPerson"] = LightsUnder(pc->Get3D(true), active);
+					} else {
+						out["lights"] = LightsUnder(ref->Get3D(), active);
+					}
+					if (auto* actor = ref->As<RE::Actor>())
+						out["hands"] = DescribeHands(actor);
+					return out;
+				});
+			}
+
 			if (kind == "refs") {
 				const std::string formId = a_args.value("formId", std::string{});
 				const bool        selected = a_args.value("selected", false);
@@ -1718,11 +1995,32 @@ namespace dvb
 						return false;
 				return true;
 			}
+			if (a_cond == "weaponDrawn" || a_cond == "handsReady" || a_cond == "castingArtLeft" || a_cond == "castingArtRight") {
+				try {
+					const json r = MainThread::RunAndWait([a_cond]() -> json {
+						auto* pc = RE::PlayerCharacter::GetSingleton();
+						if (!pc || !pc->Get3D())
+							return false;
+						auto*      state = pc->AsActorState();
+						const bool drawn = state && state->GetWeaponState() == RE::WEAPON_STATE::kDrawn;
+						if (a_cond == "weaponDrawn")
+							return drawn;
+						if (a_cond == "handsReady")
+							return drawn && HandArtReady(pc, true) && HandArtReady(pc, false);
+						auto* caster = HandCaster(pc, a_cond == "castingArtLeft");
+						return caster && caster->flags.any(RE::ActorMagicCaster::Flags::kCastingArtAttached);
+					},
+						milliseconds(2000));
+					return r.get<bool>();
+				} catch (const ToolError&) {
+					return false;
+				}
+			}
 			if (a_cond == "noMenu")
 				return GetOpenMenus().empty();
 			if (a_cond == "noBlockingMenu")
 				return BlockingMenus().empty();
-			throw ToolError(400, std::format("unknown waitUntil condition '{}' (playerLoaded|noModal|noMenu|noBlockingMenu)", a_cond));
+			throw ToolError(400, std::format("unknown waitUntil condition '{}' (playerLoaded|noModal|noMenu|noBlockingMenu|weaponDrawn|handsReady|castingArtLeft|castingArtRight)", a_cond));
 		}
 
 		// Caller must already know a_args["runId"] is present. A bare get<uint64_t>() on a
@@ -2247,7 +2545,14 @@ namespace dvb
 				"'scene' → player context { cell, worldspace, location, position, gameHour, daysPassed, "
 				"weather }; 'mods' → active load order { count, lightCount, total, plugins:[{index, name}], "
 				"lightPlugins:[…] }; 'player' → player snapshot { name, level, sex, gold, race, "
-				"actorValues:{health,magicka,stamina,carryWeight each {current,max}}, equipped:{right,left,ammo} }; "
+				"actorValues:{health,magicka,stamina,carryWeight each {current,max}}, equipped:{right,left,ammo}, "
+				"hands:{weaponDrawn, weaponState, castingArtReady, left/right:{equipped, caster:{state, currentSpell, "
+				"castingArt, castingArtAttached, castingArtLoading, light}}} }; "
+				"'lights' → every NiLight under a reference's 3D (default the player: thirdPerson + firstPerson; "
+				"or 'formId' / 'selected') as {name, type, path, diffuse, radius, fade, fadeAmount, appCulled, "
+				"inScene:'active'|'shadow'|false, position}, plus an actor's hands (each hand's casting light); "
+				"scope='scene' instead lists every light the renderer is using, nearest first, each with its "
+				"'owner' reference and 'distance' ('radius', 'limit'); "
 				"'inventory' → items held by the player (or a container 'formId') { owner, count, items:[{formId, "
 				"name, formType, count, value, weight, equipped}] } (filters: 'formType', 'limit'); "
 				"'quests' → journal (running/completed) { count, quests:[{formId, name, stage, type, active, "
@@ -2272,18 +2577,19 @@ namespace dvb
 				"'extensions' lists those registered kinds + descriptors, and kind=<registered> dispatches.";
 			inspect.description += RegisteredExtensionSummary("inspect", "kinds");
 			inspect.readOnly = true;
-			json kinds = json::array({ "state", "health", "vm", "scene", "mods", "player", "inventory", "quests", "effects", "refs", "registrants", "screenshots", "extensions" });
+			json kinds = json::array({ "state", "health", "vm", "scene", "mods", "player", "inventory", "quests", "effects", "refs", "lights", "registrants", "screenshots", "extensions" });
 			for (const auto& k : ToolExtensions::Keys("inspect"))
 				kinds.push_back(k);
 			inspect.inputSchema = json{
 				{ "type", "object" },
 				{ "properties", json{
-									{ "kind", json{ { "type", "string" }, { "enum", kinds }, { "description", "state | health | vm | scene | mods | player | inventory | quests | effects | refs | registrants | screenshots | extensions (health answers off-thread for liveness+identity; or a registered mod kind — listed here + via kind=extensions)" } } },
-									{ "formId", json{ { "type", "string" }, { "description", "refs: identify this form; inventory: the container ref to read (default player); effects: the actor to read (default player) (hex formId, e.g. 0x14, or EditorID)" } } },
-									{ "selected", json{ { "type", "boolean" }, { "description", "refs: identify the console-selected / crosshair ref instead" } } },
+									{ "kind", json{ { "type", "string" }, { "enum", kinds }, { "description", "state | health | vm | scene | mods | player | inventory | quests | effects | refs | lights | registrants | screenshots | extensions (health answers off-thread for liveness+identity; or a registered mod kind — listed here + via kind=extensions)" } } },
+									{ "formId", json{ { "type", "string" }, { "description", "refs: identify this form; inventory: the container ref to read (default player); effects: the actor to read (default player); lights: the reference whose 3D to read (default player) (hex formId, e.g. 0x14, or EditorID)" } } },
+									{ "selected", json{ { "type", "boolean" }, { "description", "refs/lights: use the console-selected / crosshair ref instead" } } },
+									{ "scope", json{ { "type", "string" }, { "enum", json::array({ "ref", "scene" }) }, { "description", "lights: 'ref' (default) reads one reference's 3D; 'scene' lists every light the renderer is using, nearest the player first, each with the reference it hangs under" } } },
 									{ "formType", json{ { "type", "string" }, { "description", "refs/inventory: keep only entries whose type matches (e.g. Actor, Weapon, Potion)" } } },
-									{ "radius", json{ { "type", "number" }, { "description", "refs enumerate: only refs within this distance of the player (0 = whole loaded grid)" } } },
-									{ "limit", json{ { "type", "integer" }, { "description", "refs/inventory: max entries to return (default 100)" } } },
+									{ "radius", json{ { "type", "number" }, { "description", "refs enumerate / lights scope=scene: only those within this distance of the player (0 = no limit)" } } },
+									{ "limit", json{ { "type", "integer" }, { "description", "refs/inventory/lights scope=scene: max entries to return (default 100)" } } },
 								} },
 			};
 			return inspect;
@@ -2330,11 +2636,15 @@ namespace dvb
 			"Run a Skyrim console command. action='exec' (default) queues `command` onto the main "
 			"thread (runs next tick). With capture=true it is fenced between marker commands and exec "
 			"returns once the output has landed, so a following action='read' returns the command's "
-			"output as { markersFound, lines:[...], source, lossPossible }. source='buffer' is complete, "
-			"including several lines printed in one frame (e.g. `help`). source='sampler' is used once "
-			"the Console menu has been created, when the game stops filling that buffer: it sees one "
-			"line per frame, so a command that prints SEVERAL lines in a frame keeps only the last "
-			"(lossPossible=true); getav, getgs and getpos are exact. A second capture while one is "
+			"output as { markersFound, lines:[...], source, lossPossible }. source='print' (the normal "
+			"case) comes from a hook on the console's print function and holds EVERY line printed "
+			"between the markers, from the game or any plugin, whether or not the Console menu exists "
+			"(lossPossible only past 20000 lines). The fallbacks, used only when that hook could not "
+			"be installed (diag.printHooked=false): source='buffer' is complete, including several "
+			"lines printed in one frame (e.g. `help`); source='sampler' is used once the Console menu "
+			"has been created, when the game stops filling that buffer: it sees one line per frame, so "
+			"a command that prints SEVERAL lines in a frame keeps only the last (lossPossible=true). "
+			"read returns the most recent 'maxLines' lines (default 200). A second capture while one is "
 			"running gets 409. exec then returns { queued:false, completed }, completed=false meaning "
 			"the end marker never arrived and `lines` may be incomplete; a capture that never sees its "
 			"begin marker gets 504 and the command is not run. "
@@ -2347,6 +2657,7 @@ namespace dvb
 								{ "action", json{ { "type", "string" }, { "enum", json::array({ "exec", "read" }) }, { "description", "'exec' (default) runs `command`; 'read' returns the fenced output and closes the window" } } },
 								{ "command", json{ { "type", "string" }, { "description", "the console command, exactly as typed after ~ (required for exec)" } } },
 								{ "capture", json{ { "type", "boolean" }, { "description", "exec: fence and capture this command's output for the next read" } } },
+								{ "maxLines", json{ { "type", "integer" }, { "description", "read: most recent lines to return (default 200, max 20000)" } } },
 							} },
 		};
 		a_registry.Register(std::move(console), &ConsoleHandler);
@@ -2373,9 +2684,10 @@ namespace dvb
 			"'scale', or 'freeze':true for 0) speeds up or slows down the game itself for "
 			"'holdMs' (default 60000) — which is what makes a replay or scenario run faster in wall "
 			"time — then restores the previous scale; 0.1..3.0, up to 10.0 with 'allowHigh':true, and "
-			"it returns { requested, effective, applied, owner, leaseRemainingMs } only once the "
-			"engine is actually running at the requested scale (the reconciler applies it on the next "
-			"frame and the engine then ramps). It is refused (409) while a recording or a capture is "
+			"it returns { requested, effective, applied, reached, waitedMs, owner, leaseRemainingMs }. "
+			"The engine ramps toward a new scale over a few seconds, so it waits up to 'waitMs' "
+			"(default 2000, 0..30000) for effective to reach it; reached:false means still ramping "
+			"(the change is in effect, never an error) — poll getTimeScale if it matters. It is refused (409) while a recording or a capture is "
 			"in flight, unless 'allowTimeScale':true. 'getTimeScale' returns the same object without "
 			"changing anything.";
 		game.inputSchema = json{
@@ -2393,6 +2705,7 @@ namespace dvb
 								{ "freeze", json{ { "type", "boolean" }, { "description", "setTimeScale: confirm scale 0 (freeze); required with a 0 scale" } } },
 								{ "allowHigh", json{ { "type", "boolean" }, { "description", "setTimeScale: permit a scale above 3.0, up to 10.0" } } },
 								{ "allowTimeScale", json{ { "type", "boolean" }, { "description", "setTimeScale: change the scale even while a recording or capture is in flight (default false)" } } },
+								{ "waitMs", json{ { "type", "integer" }, { "description", "setTimeScale: how long to wait for the engine to reach the new scale before answering (default 2000, 0..30000); the answer is always applied:true with reached true/false, never an error for a change still ramping" } } },
 							} },
 		};
 		a_registry.Register(std::move(game), &GameHandler);
@@ -2474,7 +2787,11 @@ namespace dvb
 			"name) and returns its { globalFunctions, memberFunctions, properties }, each function "
 			"with params + returnType — use it to discover what 'call' can invoke. 'call' runs a "
 			"function via the VM: 'script' + 'function' (+ optional 'args' array, 'timeoutMs' "
-			"default 3000) and returns { called, returned, returnedType }. Unlike console 'cgf', "
+			"default 3000) and returns { called, returned, returnedType }. Omitted trailing optional "
+			"args are filled from a table of known Papyrus defaults (PlaceAtMe aiCount=1, MoveTo "
+			"abMatchRotation=true, ...) or else None/0/false/\"\", listed under 'filledArgs' with a "
+			"'warning' for any guess — pass them explicitly when the real default is not neutral. "
+			"Unlike console 'cgf', "
 			"this hands the return value back (e.g. Utility.GetCurrentGameTime → a Float). Pass "
 			"'self' to call a MEMBER function on a target: { \"form\": \"0x14 | EditorID\" } targets "
 			"any form, or \"selected\" uses the console/crosshair ref (set via prid); without 'self' "
@@ -2507,7 +2824,10 @@ namespace dvb
 			"{\"waitFor\":<event>,…} block on a Skyrim EVENT — string shorthand "
 			"(\"postLoadGame\"/\"saveGame\"/\"newGame\"/\"preLoadGame\"/\"dataLoaded\"/\"deleteGame\", or "
 			"\"menuOpened\"/\"menuClosed\" with a \"name\"), or {\"topic\":\"…\",\"match\":{…}}; "
-			"{\"waitUntil\":\"playerLoaded\"|\"noModal\"|\"noMenu\"|\"noBlockingMenu\"} poll live state. "
+			"{\"waitUntil\":\"playerLoaded\"|\"noModal\"|\"noMenu\"|\"noBlockingMenu\"|\"weaponDrawn\"|"
+			"\"castingArtLeft\"|\"castingArtRight\"|\"handsReady\"} poll live state (handsReady: weapon drawn "
+			"and every hand holding a spell shows its casting art — wait on it after EquipSpell + DrawWeapon "
+			"before a capture). "
 			"PREFER waitFor over a fixed wait — e.g. wait for postLoadGame to know a load truly "
 			"finished. Optional: repeat (≤1000), continueOnError, async. By default action='run' "
 			"BLOCKS the request for the run's duration and returns the transcript directly — the "

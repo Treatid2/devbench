@@ -6,6 +6,7 @@ using dvb::ConsoleLogCapture::kMarkerBegin;
 using dvb::ConsoleLogCapture::kMarkerEnd;
 using dvb::ConsoleLogCapture::kRingMax;
 using dvb::ConsoleLogCapture::LineSampler;
+using dvb::ConsoleLogCapture::PrintCollector;
 using dvb::ConsoleLogCapture::SliceFencedLines;
 using dvb::ConsoleLogCapture::SliceFencedText;
 
@@ -282,4 +283,52 @@ TEST_CASE("fence detection with no offset finds the latest fence")
 	CHECK(state.hasBegin);
 	CHECK(!state.hasEnd);
 	CHECK(!FindFence("no markers here").hasBegin);
+}
+
+TEST_CASE("print collector keeps every line of a multi-line command between the markers")
+{
+	PrintCollector c;
+	c.Feed("noise before the capture");
+	c.Feed(BeginLine());
+	c.Feed("00000014 (2 lights)");
+	c.Feed("> skeleton_female.nif\n> NPC Root [Root]\r\n> MagicRight\n");
+	c.Feed("> LP_Light[Let There Be Glow|MagicLightWhite01](1)#0 (radius: 246.9|fade: 0.97|visible)");
+	c.Feed(EndLine());
+	c.Feed("noise after the capture");
+	CHECK(c.SawBegin());
+	CHECK(c.SawEnd());
+	const auto slice = SliceFencedLines(c.Lines(), 200);
+	CHECK(slice.sawBegin);
+	CHECK(slice.sawEnd);
+	CHECK(slice.lines.size() == 5);
+	CHECK(slice.lines[0] == "00000014 (2 lights)");
+	CHECK(slice.lines[2] == "> NPC Root [Root]");
+	CHECK(slice.lines[4].starts_with("> LP_Light["));
+}
+
+TEST_CASE("print collector ignores an end marker before the begin marker")
+{
+	PrintCollector c;
+	c.Feed(EndLine());
+	CHECK(!c.SawEnd());
+	c.Feed(BeginLine());
+	c.Feed("only line");
+	CHECK(c.SawBegin());
+	CHECK(!c.SawEnd());
+	CHECK(SliceFencedLines(c.Lines(), 200).lines.size() == 1);
+}
+
+TEST_CASE("print collector caps its lines, counts the drop, and still sees the end marker")
+{
+	PrintCollector c;
+	c.Feed(BeginLine());
+	for (std::size_t i = 0; i < PrintCollector::kMaxLines + 10; ++i)
+		c.Feed("x");
+	c.Feed(EndLine());
+	CHECK(c.SawEnd());
+	CHECK(c.Dropped() == 11);
+	c.Reset();
+	CHECK(!c.SawBegin());
+	CHECK(c.Lines().empty());
+	CHECK(c.Dropped() == 0);
 }

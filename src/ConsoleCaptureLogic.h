@@ -93,6 +93,31 @@ namespace dvb::ConsoleLogCapture
 		int m_samplerLooks = -1;
 	};
 
+	/// Collects every line printed through ConsoleLog::VPrint during a capture: nothing before the
+	/// begin marker, everything from it through the end marker, nothing after. A print may hold
+	/// several lines. Not thread-safe; the caller locks.
+	class PrintCollector
+	{
+	public:
+		static constexpr std::size_t kMaxLines = 20000;
+
+		void Reset();
+		void Feed(std::string_view a_text);
+
+		[[nodiscard]] bool                           SawBegin() const { return m_sawBegin; }
+		[[nodiscard]] bool                           SawEnd() const { return m_sawEnd; }
+		[[nodiscard]] const std::deque<std::string>& Lines() const { return m_lines; }
+		[[nodiscard]] std::size_t                    Dropped() const { return m_dropped; }
+
+	private:
+		void Line(std::string_view a_line);
+
+		std::deque<std::string> m_lines;
+		std::size_t             m_dropped = 0;
+		bool                    m_sawBegin = false;
+		bool                    m_sawEnd = false;
+	};
+
 	/// Reports when a command has stopped printing: at least one new line seen, then
 	/// kQuietLooks looks with none.
 	class QuietDetector

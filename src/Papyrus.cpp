@@ -2,6 +2,7 @@
 
 #include "Json.h"
 #include "MainThread.h"
+#include "PapyrusDefaults.h"
 #include "ToolRegistry.h"
 
 #include <algorithm>
@@ -248,6 +249,44 @@ namespace dvb::Papyrus
 			return v;  // object / array → leave as None
 		}
 
+		// The declared default when the table knows it, else a type-neutral one. Records which in
+		// a_filled so the caller can see what was sent in its place.
+		BSScript::Variable FillOmitted(const BSScript::IFunction* a_fn, std::uint32_t a_index, json& a_filled)
+		{
+			RE::BSFixedString  name;
+			BSScript::TypeInfo type;
+			a_fn->GetParam(a_index, name, type);
+			const char*        script = a_fn->GetObjectTypeName().c_str();
+			const char*        param = name.c_str();
+			json               entry{ { "name", Str(param) }, { "type", type.TypeAsString() } };
+			BSScript::Variable v;
+			const auto         declared = PapyrusDefaults::Find(script ? script : "", a_fn->GetName().c_str() ? a_fn->GetName().c_str() : "", param ? param : "", a_index);
+			if (declared && ((declared->kind == PapyrusDefaults::Value::Kind::kBool && type.IsBool()) ||
+								(declared->kind == PapyrusDefaults::Value::Kind::kInt && type.IsInt()) ||
+								(declared->kind == PapyrusDefaults::Value::Kind::kFloat && type.IsFloat()))) {
+				if (type.IsBool()) {
+					v.SetBool(declared->number != 0.0);
+					entry["value"] = declared->number != 0.0;
+				} else if (type.IsInt()) {
+					v.SetSInt(static_cast<std::int32_t>(declared->number));
+					entry["value"] = static_cast<std::int32_t>(declared->number);
+				} else {
+					v.SetFloat(static_cast<float>(declared->number));
+					entry["value"] = declared->number;
+				}
+				entry["source"] = "declared";
+			} else {
+				v = DefaultVariable(type);
+				entry["value"] = type.IsBool() ? json(false) : type.IsInt() ? json(0) :
+				                                           type.IsFloat()   ? json(0.0) :
+				                                           type.IsString()  ? json("") :
+				                                                              json(nullptr);
+				entry["source"] = "neutral";
+			}
+			a_filled.push_back(std::move(entry));
+			return v;
+		}
+
 		// Find a function by name on a type, walking the parent chain for member functions
 		// (globals/statics are not inherited). Case-insensitive (Papyrus names are). For resolving
 		// param types so form args can be packed to the declared (possibly base) param class.
@@ -460,6 +499,20 @@ namespace dvb::Papyrus
 			return true;
 		}
 
+		// Lists the omitted arguments that were filled, and warns when any was a guess.
+		void AddFilledDefaults(json& a_out, const json& a_filled)
+		{
+			if (a_filled.empty())
+				return;
+			a_out["filledArgs"] = a_filled;
+			std::string guessed;
+			for (const auto& f : a_filled)
+				if (f.value("source", std::string{}) == "neutral")
+					guessed += (guessed.empty() ? "" : ", ") + f.value("name", std::string{});
+			if (!guessed.empty())
+				a_out["warning"] = std::format("omitted argument(s) {} were sent as None/0/false/\"\" because their Papyrus defaults are not known at run time; if the result is wrong, pass them explicitly", guessed);
+		}
+
 		json HandleCall(const json& a_args, bool a_waitForResult)
 		{
 			const std::string script = a_args.value("script", std::string{});
@@ -480,7 +533,8 @@ namespace dvb::Papyrus
 			const RE::BSFixedString cls(script.c_str());
 			const RE::BSFixedString fn(function.c_str());
 
-			auto dispatch = [cls, fn, argsJson, selfJson, hasSelf](RE::BSTSmartPointer<BSScript::IStackCallbackFunctor> a_callback) {
+			auto filled = std::make_shared<json>(json::array());
+			auto dispatch = [cls, fn, argsJson, selfJson, hasSelf, filled](RE::BSTSmartPointer<BSScript::IStackCallbackFunctor> a_callback) {
 				auto* vm = BSScript::Internal::VirtualMachine::GetSingleton();
 				if (!vm)
 					throw ToolError(503, "Papyrus VM unavailable");
@@ -532,10 +586,12 @@ namespace dvb::Papyrus
 					throw ToolError(400, e.what());
 				}
 
-				// Pad omitted trailing optionals with their type default — the VM won't, and a
-				// short arg list makes reference ops (MoveTo/Disable/Kill) run yet do nothing.
+				// Pad omitted trailing optionals — the VM won't, and a short arg list makes
+				// reference ops (MoveTo/Disable/Kill) run yet do nothing. Papyrus defaults live
+				// in the .psc and are compiled into each call site, so the VM cannot say what
+				// they are: the known ones come from a table, the rest are neutral and reported.
 				for (std::size_t p = rawArgs->args.size(); p < paramTypes.size(); ++p)
-					rawArgs->args.push_back(DefaultVariable(paramTypes[p]));
+					rawArgs->args.push_back(FillOmitted(ifn, static_cast<std::uint32_t>(p), *filled));
 
 				const bool ok = hasSelf ? vm->DispatchMethodCall(selfObj, fn, rawArgs, a_callback) : vm->DispatchStaticCall(cls, fn, rawArgs, a_callback);
 				if (!ok)
@@ -543,9 +599,11 @@ namespace dvb::Papyrus
 			};
 
 			if (!a_waitForResult) {
-				return MainThread::RunAndWait([dispatch]() -> json {
+				return MainThread::RunAndWait([dispatch, filled]() -> json {
 					dispatch(nullptr);
-					return json{ { "queued", true } };
+					json out{ { "queued", true } };
+					AddFilledDefaults(out, *filled);
+					return out;
 				});
 			}
 
@@ -576,13 +634,15 @@ namespace dvb::Papyrus
 			BSScript::Variable result = state->result;
 			lk.unlock();
 
-			return MainThread::RunAndWait([result]() -> json {
+			return MainThread::RunAndWait([result, filled]() -> json {
 				auto* vm = GetVM();
-				return json{
+				json  out{
 					{ "called", true },
 					{ "returned", VariableToJson(vm, result) },
 					{ "returnedType", result.GetType().TypeAsString() },
 				};
+				AddFilledDefaults(out, *filled);
+				return out;
 			});
 		}
 	}

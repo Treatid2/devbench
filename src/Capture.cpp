@@ -49,6 +49,58 @@ namespace dvb::Capture
 			return a_p.generic_string();  // forward slashes, per the provider contract
 		}
 
+		// Where the file really sits on disk. Under Mod Organizer 2 the game sees a virtual Data
+		// folder and a file written there lands in MO2's overwrite folder; the open handle knows.
+		// Empty when the file cannot be opened.
+		std::string RealPath(const fs::path& a_p)
+		{
+			HANDLE h = CreateFileW(a_p.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+				OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+			if (h == INVALID_HANDLE_VALUE)
+				return {};
+			std::wstring buf(MAX_PATH, L'\0');
+			DWORD        n = GetFinalPathNameByHandleW(h, buf.data(), static_cast<DWORD>(buf.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+			if (n >= buf.size()) {
+				buf.resize(n + 1);
+				n = GetFinalPathNameByHandleW(h, buf.data(), static_cast<DWORD>(buf.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+			}
+			CloseHandle(h);
+			if (n == 0 || n >= buf.size())
+				return {};
+			buf.resize(n);
+			if (buf.starts_with(L"\\\\?\\UNC\\"))
+				buf = L"\\\\" + buf.substr(8);
+			else if (buf.starts_with(L"\\\\?\\"))
+				buf = buf.substr(4);
+			return GenericPath(fs::path(buf));
+		}
+
+		// Adds realPath next to path, and says so when a virtual file system may be hiding it.
+		void AddRealPath(json& a_result, const fs::path& a_p)
+		{
+			const std::string real = RealPath(a_p);
+			a_result["realPath"] = real.empty() ? json(nullptr) : json(real);
+			const bool mo2 = GetModuleHandleW(L"usvfs_x64.dll") != nullptr;
+			a_result["virtualFileSystem"] = mo2;
+			std::error_code ec;
+			const fs::path  absolute = fs::absolute(a_p, ec);
+			if (mo2 && (real.empty() || real == GenericPath(absolute)))
+				a_result["pathNote"] =
+					"Mod Organizer 2 is running and did not reveal where this file really is; outside the "
+					"game it is probably under MO2's overwrite folder. Set captureDir in devbench's config "
+					"(or pass outDir) to a folder outside the game directory for a path that is the same "
+					"inside and outside the game.";
+		}
+
+		// Names a client may reach for from other tools; the real ones are checkpointId and cleanup.
+		void RejectMisnamedArgs(const json& a_args)
+		{
+			if (a_args.contains("id") && !a_args.contains("checkpointId"))
+				throw ToolError(400, "capture: the file stem is 'checkpointId', not 'id'");
+			if (a_args.contains("deleteSource"))
+				throw ToolError(400, "capture: deleting the game's own screenshot is 'cleanup':true, not 'deleteSource'");
+		}
+
 		// recording/variant/checkpointId all become single path SEGMENTS under the capture
 		// root (never a sub-path) -- reject anything that could escape it (a separator, "..",
 		// or a bare ".") instead of silently building a path outside g_captureDir/outDir.
@@ -331,7 +383,8 @@ namespace dvb::Capture
 
 		json Native(const json& a_args)
 		{
-			const auto        start = steady_clock::now();
+			const auto start = steady_clock::now();
+			RejectMisnamedArgs(a_args);
 			const std::string checkpointId = a_args.value("checkpointId", std::string{});
 			if (checkpointId.empty())
 				throw ToolError(400, "capture requires 'checkpointId'");
@@ -462,6 +515,7 @@ namespace dvb::Capture
 			result.update(sceneStamp);
 			ComputeInconclusive(result);
 			MaybeScoreAgainstGolden(result, a_args, dest);
+			AddRealPath(result, dest);
 
 			WriteSidecar(dest, result);
 			PublishSaved(result);
@@ -477,6 +531,7 @@ namespace dvb::Capture
 			if (!entry)
 				throw ToolError(404, std::format("no capture provider registered under '{}'", a_providerKey));
 
+			RejectMisnamedArgs(a_args);
 			const std::string checkpointId = a_args.value("checkpointId", std::string{});
 			if (checkpointId.empty())
 				throw ToolError(400, "capture requires 'checkpointId'");
@@ -555,6 +610,7 @@ namespace dvb::Capture
 			result.update(sceneStamp);
 			ComputeInconclusive(result);
 			MaybeScoreAgainstGolden(result, a_args, outputPath);
+			AddRealPath(result, outputPath);
 
 			WriteSidecar(outputPath, result);
 			PublishSaved(result);
@@ -707,7 +763,12 @@ namespace dvb::Capture
 			"directory poll — no path control, no completion signal beyond polling, format fixed by "
 			"the user's .ini, may include open UI) — NOT comparable against a provider-authored "
 			"golden image. kind='providers' lists registered provider keys; kind='extensions' lists "
-			"them with descriptors. Optional 'golden' compares the capture against a reference image "
+			"them with descriptors. The request names the file with 'checkpointId' (not 'id'); "
+			"'cleanup':true (native only; not 'deleteSource') deletes the game's own screenshot after "
+			"the copy. The result's 'path' is where the GAME sees the file; 'realPath' is where it "
+			"really is on disk — they differ under Mod Organizer 2, which puts files written into Data "
+			"in its overwrite folder ('virtualFileSystem':true, and 'pathNote' when the real place "
+			"could not be found: set captureDir or outDir outside the game folder). Optional 'golden' compares the capture against a reference image "
 			"via SSIM and adds {ssim, threshold, passed} to the result (or 'regions' for independent "
 			"per-region scores, {name,ssim,threshold,passed} each, overall 'passed' is AND across "
 			"all — see record{action:'replay'}'s 'goldens' arg, the normal way this gets set for a "
