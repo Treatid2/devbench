@@ -2,10 +2,16 @@
 
 #include "GameState.h"
 #include "MainThread.h"
+#include "PrologueScan.h"
 #include "ToolRegistry.h"
 
+#include <SKSE/ContextHook.h>
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -28,6 +34,7 @@ namespace dvb::ConsoleLogCapture
 		enum class Source
 		{
 			kNone,
+			kPrint,
 			kBuffer,
 			kSampler,
 		};
@@ -40,6 +47,54 @@ namespace dvb::ConsoleLogCapture
 		std::atomic<Source> g_source{ Source::kNone };
 		std::atomic<bool>   g_timedOut{ false };
 		std::mutex          g_captureMutex;
+
+		// The print hook runs on whatever thread prints, so its collector sits behind a lock and it
+		// does nothing outside a capture.
+		std::atomic<bool> g_printHooked{ false };
+		std::atomic<bool> g_printCapturing{ false };
+		std::mutex        g_printMutex;
+		PrintCollector    g_printed;
+
+		// ConsoleLog::VPrint(this, fmt, va_list) at entry: rdx is the format, r8 the argument list.
+		void PrintDetour(CONTEXT& a_ctx)
+		{
+			if (!g_printCapturing.load(std::memory_order_acquire))
+				return;
+			try {
+				const auto* fmt = reinterpret_cast<const char*>(a_ctx.Rdx);
+				if (!fmt)
+					return;
+				const auto args = reinterpret_cast<std::va_list>(a_ctx.R8);
+				char       head[1024];
+				const int  n = std::vsnprintf(head, sizeof(head), fmt, args);
+				if (n < 0)
+					return;
+				std::string text;
+				if (static_cast<std::size_t>(n) < sizeof(head)) {
+					text.assign(head, static_cast<std::size_t>(n));
+				} else {
+					text.resize(static_cast<std::size_t>(n) + 1);
+					std::vsnprintf(text.data(), text.size(), fmt, args);
+					text.resize(static_cast<std::size_t>(n));
+				}
+				std::lock_guard<std::mutex> lk(g_printMutex);
+				g_printed.Feed(text);
+			} catch (...) {
+			}
+		}
+
+		struct PrintCaptureWindow
+		{
+			PrintCaptureWindow()
+			{
+				{
+					std::lock_guard<std::mutex> lk(g_printMutex);
+					g_printed.Reset();
+				}
+				g_printCapturing.store(g_printHooked.load(), std::memory_order_release);
+			}
+			~PrintCaptureWindow() { g_printCapturing.store(false, std::memory_order_release); }
+		};
 
 		std::string CurrentLine()
 		{
@@ -72,6 +127,8 @@ namespace dvb::ConsoleLogCapture
 		struct LookView
 		{
 			LineSampler::Seen seen = LineSampler::Seen::kNothing;
+			bool              printSawBegin = false;
+			bool              printSawEnd = false;
 			bool              samplerSawBegin = false;
 			bool              samplerSawEnd = false;
 			bool              bufferHasBegin = false;
@@ -86,6 +143,11 @@ namespace dvb::ConsoleLogCapture
 				g_lastFrame = frame;
 			}
 			LookView view;
+			{
+				std::lock_guard<std::mutex> lk(g_printMutex);
+				view.printSawBegin = g_printed.SawBegin();
+				view.printSawEnd = g_printed.SawEnd();
+			}
 			view.seen = g_sampler.Observe(CurrentLine());
 			view.samplerSawBegin = g_sampler.SawBegin();
 			view.samplerSawEnd = g_sampler.SawEnd();
@@ -147,10 +209,17 @@ namespace dvb::ConsoleLogCapture
 			Queue(kMarkerBegin);
 			SourceChooser chooser;
 			auto          choice = SourceChooser::Choice::kUndecided;
+			bool          printed = false;
 			WaitFor(a_deadline, kBeginLooks, [&](const LookView& v) {
+				if (v.printSawBegin) {
+					printed = true;
+					return true;
+				}
 				choice = chooser.Look(v.bufferHasBegin, v.samplerSawBegin);
 				return choice != SourceChooser::Choice::kUndecided;
 			});
+			if (printed)
+				return Source::kPrint;
 			switch (choice) {
 			case SourceChooser::Choice::kBuffer:
 				return Source::kBuffer;
@@ -159,6 +228,12 @@ namespace dvb::ConsoleLogCapture
 			default:
 				return Source::kNone;
 			}
+		}
+
+		bool CaptureFromPrint(const std::string& a_command, Clock::time_point a_deadline)
+		{
+			QueueThenEndMarker(a_command);
+			return WaitFor(a_deadline, kEndLooks, [](const LookView& v) { return v.printSawEnd; });
 		}
 
 		bool CaptureFromBuffer(const std::string& a_command, Clock::time_point a_deadline)
@@ -180,6 +255,30 @@ namespace dvb::ConsoleLogCapture
 		}
 	}
 
+	void InstallPrintHook()
+	{
+		if (g_printHooked.load())
+			return;
+		REL::Relocation<std::uintptr_t> target{ RELOCATION_ID(50180, 51110) };
+		const auto*                     code = reinterpret_cast<const std::uint8_t*>(target.address());
+		const std::size_t               length = SafePrologueLength(std::span<const std::uint8_t>(code, 32));
+		if (length == 0 || length > 16) {
+			std::string bytes;
+			for (std::size_t i = 0; i < 16; ++i)
+				bytes += std::format("{:02X} ", code[i]);
+			logs::warn("devbench: console print hook not installed (ConsoleLog::VPrint starts {}); captures use the buffer or sampler", bytes);
+			return;
+		}
+		// Negative include: the detour sees the registers as the caller left them, then the
+		// copied prologue runs and execution resumes after it.
+		if (!SKSE::stl::install_context_hook(target.address(), static_cast<int>(length), &PrintDetour, -static_cast<int>(length))) {
+			logs::error("devbench: failed to install console print hook");
+			return;
+		}
+		g_printHooked.store(true);
+		logs::info("devbench: console print hook installed ({} byte prologue)", length);
+	}
+
 	bool RunFencedCapture(const std::string& a_command)
 	{
 		std::unique_lock<std::mutex> owned(g_captureMutex, std::try_to_lock);
@@ -197,16 +296,22 @@ namespace dvb::ConsoleLogCapture
 		},
 			kLookTimeout);
 
-		const auto deadline = Clock::now() + kCaptureDeadline;
-		const auto source = ChooseSource(deadline);
+		const PrintCaptureWindow window;
+		const auto               deadline = Clock::now() + kCaptureDeadline;
+		const auto               source = ChooseSource(deadline);
 		if (source == Source::kNone) {
 			g_timedOut.store(true);
 			throw ToolError(504, "console capture never saw its begin marker; the command was not run");
 		}
 		g_source.store(source);
 
-		const bool finished = source == Source::kBuffer ? CaptureFromBuffer(a_command, deadline) :
-		                                                  CaptureFromSampler(a_command, deadline);
+		bool finished = false;
+		if (source == Source::kPrint)
+			finished = CaptureFromPrint(a_command, deadline);
+		else if (source == Source::kBuffer)
+			finished = CaptureFromBuffer(a_command, deadline);
+		else
+			finished = CaptureFromSampler(a_command, deadline);
 		if (!finished) {
 			logs::warn("devbench: console capture did not see its end marker");
 			g_timedOut.store(true);
@@ -222,6 +327,7 @@ namespace dvb::ConsoleLogCapture
 		out.samples = g_sampler.Samples();
 		out.ticks = g_sampler.Ticks();
 		out.engineFrames = g_engineFrames;
+		out.printHooked = g_printHooked.load();
 
 		if (auto* ui = RE::UI::GetSingleton()) {
 			out.consoleMenuExists = ui->GetMenu(RE::Console::MENU_NAME).get() != nullptr;
@@ -243,7 +349,14 @@ namespace dvb::ConsoleLogCapture
 
 		const Source source = g_source.load();
 		Slice        slice;
-		if (source == Source::kSampler) {
+		if (source == Source::kPrint) {
+			std::lock_guard<std::mutex> lk(g_printMutex);
+			slice = SliceFencedLines(g_printed.Lines(), a_maxLines);
+			out.printLines = g_printed.Lines().size();
+			out.printDropped = g_printed.Dropped();
+			out.source = "print";
+			out.lossPossible = out.printDropped > 0;
+		} else if (source == Source::kSampler) {
 			slice = SliceFencedLines(g_sampler.Lines(), a_maxLines);
 			out.source = "sampler";
 			out.lossPossible = true;

@@ -156,4 +156,42 @@ namespace dvb::ConsoleLogCapture
 		}
 		return m_sawLine && m_quiet >= kQuietLooks;
 	}
+
+	void PrintCollector::Reset()
+	{
+		m_lines.clear();
+		m_dropped = 0;
+		m_sawBegin = false;
+		m_sawEnd = false;
+	}
+
+	void PrintCollector::Line(std::string_view a_line)
+	{
+		if (m_sawEnd || a_line.empty())
+			return;
+		if (!m_sawBegin) {
+			if (!Contains(a_line, kMarkerBegin))
+				return;
+			m_sawBegin = true;
+		} else if (Contains(a_line, kMarkerEnd)) {
+			m_sawEnd = true;
+		}
+		// The end marker is always kept so a capture that hit the cap still reads as finished.
+		if (m_lines.size() >= kMaxLines && !m_sawEnd) {
+			++m_dropped;
+			return;
+		}
+		m_lines.emplace_back(a_line);
+	}
+
+	void PrintCollector::Feed(std::string_view a_text)
+	{
+		std::size_t start = 0;
+		for (std::size_t i = 0; i <= a_text.size(); ++i) {
+			if (i == a_text.size() || a_text[i] == '\n' || a_text[i] == '\r') {
+				Line(a_text.substr(start, i - start));
+				start = i + 1;
+			}
+		}
+	}
 }
