@@ -96,7 +96,18 @@ namespace
 				dvb::Capture::SetDefaults(cfg);
 				dvb::ArmAutoRun(g_server->Tools(), cfg.autoRunPath, cfg.autoRunRestoreScene);
 				dvb::HostApi::Init(g_server->Tools(), g_server->Events());
-				g_server->Start();
+				// Never let a throw here escape into SKSE's kPostLoad dispatch: that aborts the
+				// remaining listeners, silently leaving every later-loaded plugin without its
+				// kPostLoad (observed as other mods' API-dependent features vanishing, with the
+				// fault showing up only in an unrelated mod's log). A dev tool failing to start
+				// must not take the rest of the load order down with it.
+				try {
+					g_server->Start();
+				} catch (const std::exception& e) {
+					logs::error("devbench: server failed to start: {}", e.what());
+				} catch (...) {
+					logs::error("devbench: server failed to start (unknown exception)");
+				}
 				dvb::InstallGameEvents(g_server->Events());
 				dvb::StallWatchdog::Start(g_server->Events(), cfg.stallWatchdogMs);
 				dvb::ConsoleHook::Install(g_server->Events());  // observe console commands as events / for recording
