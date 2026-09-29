@@ -1,4 +1,6 @@
 #include "Tools.h"
+#include "CameraOrbit.h"
+#include <RE/T/ThirdPersonState.h>
 
 #include "Capture.h"
 #include "ConsoleLogCapture.h"
@@ -1410,6 +1412,21 @@ namespace dvb
 						{ "freeCamOwned", FreeCamera::IsOwned() },
 						{ "stateId", cam->currentState ? json(static_cast<std::uint32_t>(cam->currentState->id)) : json(nullptr) },
 						{ "freeCamBackend", REL::Module::IsVR() ? "vr-state" : "engine" } };
+					if (cam->IsInThirdPerson()) {
+						if (auto* tps = static_cast<RE::ThirdPersonState*>(cam->currentState.get())) {
+							out["thirdPersonState"] = json{
+								{ "targetYaw", tps->targetYaw },
+								{ "currentYaw", tps->currentYaw },
+								{ "targetZoomOffset", tps->targetZoomOffset },
+								{ "currentZoomOffset", tps->currentZoomOffset },
+								{ "posOffsetExpected", json::array({ tps->posOffsetExpected.x, tps->posOffsetExpected.y, tps->posOffsetExpected.z }) },
+								{ "posOffsetActual", json::array({ tps->posOffsetActual.x, tps->posOffsetActual.y, tps->posOffsetActual.z }) },
+								{ "freeRotation", json::array({ tps->freeRotation.x, tps->freeRotation.y }) },
+								{ "freeRotationEnabled", tps->freeRotationEnabled },
+							};
+						}
+					}
+					out["orbit"] = CameraOrbit::Active();
 					if (cam->cameraRoot) {
 						const auto& t = cam->cameraRoot->world.translate;
 						out["camX"] = t.x;
@@ -1449,8 +1466,44 @@ namespace dvb
 				});
 			}
 
+			// orbit: hold the gameplay third-person camera round the player. yawDeg 0 is behind, 180 in front; pitchDeg tilts
+			// (positive looks down; omitted leaves the tilt); zoom is the game's zoom offset in [-1, 1] (omitted keeps it);
+			// right / up offset the camera (omitted keeps the game's own). No free camera is involved, so gameplay input still
+			// reaches the player. on=false hands the camera back.
+			if (action == "orbit") {
+				const bool on = a_args.value("on", true);
+				if (!on) {
+					CameraOrbit::Set(false, 0.0f, -99.0f, -9.0f);
+					CameraOrbit::SetOffset(false, 0.0f, 0.0f);
+					return json{ { "action", "orbit" }, { "on", false } };
+				}
+				const float yaw = a_args.value("yawDeg", 180.0f);
+				const float pitch = a_args.value("pitchDeg", -999.0f);
+				const float zoom = a_args.value("zoom", -9.0f);
+				const float right = a_args.value("right", 0.0f), up = a_args.value("up", 0.0f);
+				if (!std::isfinite(yaw) || !std::isfinite(pitch) || !std::isfinite(zoom) || !std::isfinite(right) || !std::isfinite(up))
+					throw ToolError(400, "camera orbit requires finite yawDeg / pitchDeg / zoom / right / up");
+				if (a_args.contains("zoom") && (zoom < -1.0f || zoom > 1.0f))
+					throw ToolError(400, "camera orbit 'zoom' must be within [-1, 1]");
+				if (a_args.contains("pitchDeg") && (pitch < -89.0f || pitch > 89.0f))
+					throw ToolError(400, "camera orbit 'pitchDeg' must be within [-89, 89]");
+				constexpr float kDeg = 3.14159265f / 180.0f;
+				return MainThread::RunAndWait([=]() -> json {
+					auto* cam = RE::PlayerCamera::GetSingleton();
+					if (!cam)
+						throw ToolError(500, "PlayerCamera unavailable");
+					if (cam->IsInFreeCameraMode())
+						throw ToolError(409, "camera orbit holds the third-person camera; leave the free camera first");
+					if (!cam->IsInThirdPerson())
+						cam->ForceThirdPerson();
+					CameraOrbit::SetOffset(a_args.contains("right") || a_args.contains("up"), right, up);
+					CameraOrbit::Set(true, yaw * kDeg, a_args.contains("pitchDeg") ? pitch * kDeg : -99.0f, a_args.contains("zoom") ? zoom : -9.0f);
+					return json{ { "action", "orbit" }, { "on", true }, { "thirdPerson", cam->IsInThirdPerson() } };
+				});
+			}
+
 			if (action != "setPov")
-				throw ToolError(400, std::format("unknown action '{}' (get|setPov|freecam|drive)", action));
+				throw ToolError(400, std::format("unknown action '{}' (get|setPov|freecam|drive|orbit)", action));
 
 			const std::string pov = a_args.value("pov", std::string{});
 			if (pov != "first" && pov != "third" && pov != "vanity")
@@ -2401,7 +2454,8 @@ namespace dvb
 		camera.name = "camera";
 		camera.description =
 			"Read or set the player camera. action='get' (default) returns { pov, freeCam, camX, "
-			"camY, camZ, camPitch, camYaw, stateId, freeCamBackend, freeCamOwned } read live on the main thread, where pov is first | "
+			"camY, camZ, camPitch, camYaw, stateId, freeCamBackend, freeCamOwned, orbit } (plus thirdPersonState: heading, zoom "
+			"and offsets, while in third person) read live on the main thread, where pov is first | "
 			"third | vanity | other. stateId is the runtime-specific CameraState value; interpret it "
 			"with freeCamBackend. action='setPov' applies a switch (param 'pov': first | third "
 			"| vanity) on the main thread and returns { pov: <applied>, requestedPov } read back "
@@ -2418,6 +2472,10 @@ namespace dvb
 			"pitch/yaw are native free-camera angles in radians on both runtimes, writing "
 			"FreeCameraState::rotation directly; completes its field writes before return, so allow "
 			"a rendered frame before capture. "
+			"action='orbit' (params yawDeg default 180, pitchDeg, zoom, right, up; on=false stops) holds the gameplay "
+			"third-person camera round the player on every camera update, with the player's facing held for the orbit - no "
+			"free camera, so gameplay input keeps reaching the player (a held mouseLeft keeps charging a spell, for example). "
+			"It is rejected while the free camera is on and stops on load / new game. "
 			"enable, disable, and drive all reject an active free camera owned elsewhere; "
 			"freeCamOwned reports devbench's own ownership. "
 			"On VR, after failed pre-load restoration, freecam off retries recovery using the "
@@ -2432,7 +2490,12 @@ namespace dvb
 		camera.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
-								{ "action", json{ { "type", "string" }, { "enum", json::array({ "get", "setPov", "freecam", "drive" }) }, { "description", "get (default) | setPov | freecam | drive" } } },
+								{ "action", json{ { "type", "string" }, { "enum", json::array({ "get", "setPov", "freecam", "drive", "orbit" }) }, { "description", "get (default) | setPov | freecam | drive | orbit" } } },
+								{ "yawDeg", json{ { "type", "number" }, { "description", "orbit: degrees round the player (0 behind, 180 in front; default 180)" } } },
+								{ "pitchDeg", json{ { "type", "number" }, { "minimum", -89 }, { "maximum", 89 }, { "description", "orbit: tilt in degrees, positive looks down (omit to leave it)" } } },
+								{ "zoom", json{ { "type", "number" }, { "minimum", -1 }, { "maximum", 1 }, { "description", "orbit: the game's third-person zoom offset (omit to keep it)" } } },
+								{ "right", json{ { "type", "number" }, { "description", "orbit: camera offset to the side in units (with up; omit both to keep the game's own)" } } },
+								{ "up", json{ { "type", "number" }, { "description", "orbit: camera offset up in units" } } },
 								{ "pov", json{ { "type", "string" }, { "enum", json::array({ "first", "third", "vanity" }) }, { "description", "setPov: target point of view" } } },
 								{ "on", json{ { "type", "boolean" }, { "description", "freecam: enable (default) or disable free-camera mode" } } },
 								{ "x", json{ { "type", "number" }, { "description", "drive: world X (requires free-cam mode)" } } },
