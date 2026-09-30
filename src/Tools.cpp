@@ -1002,7 +1002,25 @@ namespace dvb
 
 		json DescribeHand(RE::Actor* a_actor, bool a_left, const ActiveLightIndex& a_active)
 		{
-			json  j{ { "equipped", IdentifyForm(a_actor->GetEquippedObject(a_left)) } };
+			json j{ { "equipped", IdentifyForm(a_actor->GetEquippedObject(a_left)) } };
+			// Lights hung on what the hand holds (a weapon or staff light, an enchantment light), from both 3D trees, each
+			// with whether the renderer is using it: a light that is attached but not in the scene's active list lights nothing.
+			json        held = json::array();
+			std::size_t rendered = 0;
+			for (const bool firstPerson : { false, true }) {
+				auto* root = a_actor->Get3D(firstPerson);
+				auto* node = root ? root->GetObjectByName(a_left ? "SHIELD" : "WEAPON") : nullptr;
+				if (!node)
+					continue;
+				for (auto& light : LightsUnder(node, a_active)) {
+					light["view"] = firstPerson ? "firstPerson" : "thirdPerson";
+					if (light.value("inScene", json(false)) != json(false))
+						++rendered;
+					held.push_back(std::move(light));
+				}
+			}
+			j["heldLights"] = std::move(held);
+			j["heldLightsRendered"] = rendered;
 			auto* caster = HandCaster(a_actor, a_left);
 			if (!caster) {
 				j["caster"] = nullptr;
@@ -2622,7 +2640,8 @@ namespace dvb
 				"weather }; 'mods' → active load order { count, lightCount, total, plugins:[{index, name}], "
 				"lightPlugins:[…] }; 'player' → player snapshot { name, level, sex, gold, race, "
 				"actorValues:{health,magicka,stamina,carryWeight each {current,max}}, equipped:{right,left,ammo}, "
-				"hands:{weaponDrawn, weaponState, castingArtReady, left/right:{equipped, caster:{state, currentSpell, "
+				"hands:{weaponDrawn, weaponState, castingArtReady, left/right:{equipped, heldLights, heldLightsRendered, "
+				"caster:{state, currentSpell, "
 				"castingArt, castingArtAttached, castingArtLoading, light}}} }; "
 				"'lights' → every NiLight under a reference's 3D (default the player: thirdPerson + firstPerson; "
 				"or 'formId' / 'selected') as {name, type, path, diffuse, radius, fade, fadeAmount, appCulled, "
