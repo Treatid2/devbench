@@ -31,13 +31,14 @@ add_rules("mode.debug", "mode.releasedbg")
 set_defaultmode("releasedbg")
 add_rules("plugin.vsxmake.autoupdate")
 
--- packages
-add_requires("nlohmann_json")
+-- Keep direct package versions explicit; xmake-requires.lock also pins their
+-- recipes and transitive dependencies for repeatable native builds.
+add_requires("nlohmann_json v3.12.0")
 -- Decode-only image loading for the `capture` tool's native SSIM comparison (two already-
 -- captured PNGs -> pixel buffers). Same single-header library Open Shaders already vendors
 -- for its own screenshot encode/decode -- no new dependency ecosystem, just the one everyone
 -- adjacent to this already uses.
-add_requires("stb")
+add_requires("stb 2026.03.18")
 
 -- Local package repo: pins the optional SMF3 client API header (single header, pulled at build
 -- time, runtime GetProcAddress — inert when SMF is not installed). See xmake-pkgs/.
@@ -47,8 +48,8 @@ add_requires("skse-menu-framework-api 3.7.0")
 -- GetProcAddress on FUCK.dll — inert when absent). Its header pulls in the real imgui.h for
 -- types and references CSimpleIniA, so its UI target needs imgui + simpleini.
 add_requires("fuck-api 1.0.0")
-add_requires("imgui")
-add_requires("simpleini")
+add_requires("imgui v1.92.9")
+add_requires("simpleini v4.26")
 
 -- The SMF-hosted in-game menu lives in its own PCH-free static lib: the SMF client header's
 -- cimgui-style typedefs cannot coexist with the real imgui.h the main target's PCH pulls in.
