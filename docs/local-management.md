@@ -33,6 +33,30 @@ the review transaction before promotion. Submit reviewed, tested changes
 upstream with accurate compile and requester-test evidence. No pass, successful
 compile or upstream submission implies runtime acceptance or upstream merge.
 
+The DevBench owner is responsible for existing as well as new DevBench reviews.
+Transfer Auto Main's exact review inventory, pending work and human guidance
+with provenance; use supported per-review delegation where necessary, never
+another chat's credentials. Explicitly acknowledge custody so competing review
+submissions stop without losing existing reports or correction work.
+
+Submit one focused PR or bite-size local equivalent per review; do not bundle
+independent reviews. A transport ZIP containing one scope and its necessary
+context/evidence is not an aggregate review. Split broad baseline-adoption work
+into bounded source scopes before submission. Evaluate findings as guidance to
+improve maintainability, clarity, design, robustness and correctness, not merely
+as bugs to fix or a checklist to silence. Record accepted improvements and
+reasoned dispositions, verify proportionately, and continue authorised cycles
+until PASS or evaluated PASS_WITH_FINDINGS, bound to the exact reviewed source.
+
+Respect the review service's 30-minute creation gate. Maintain a finite queue
+and give initial pending submissions priority so correction cycles cannot
+starve untouched work. Use a temporary thread heartbeat only until all items
+in the first tranche have initial review IDs or verified exact focused passes;
+then pause it. Review returns wake the owner thereafter: evaluate and update
+the returned item, and submit another eligible pending scope during that wake.
+Never poll an active review or create duplicates. Retain already-active broad
+reviews as historical evidence; they do not replace focused reviews.
+
 `codex/devbench-all-integrated` is the experimental composition. Include
 independent requested features there for early use without claiming that they
 have passed review. Merge onto its actual owned head; never substitute an
