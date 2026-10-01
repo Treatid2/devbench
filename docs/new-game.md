@@ -70,8 +70,25 @@ Inspect a specific request receipt with `phase: "inspect", requestId: <id>`.
 Repeated known request IDs return their receipt without repeating selection,
 `NEW` or acceptance. A mutation is marked `dispatchUncertain` before entering
 GFx; that ID cannot be replayed after an exception or lost response. Inspect
-actual menu/game state before considering a different ID. Unknown confirmations,
+actual menu/game state; an unresolved receipt prohibits a different ID. Unknown confirmations,
 unrelated dialogs, expired requests and unavailable callbacks do not dispatch.
+
+Uncertainty is a process-lifetime barrier to **all fresh request IDs**, not just
+same-ID replay protection. `dispatchUncertain` and `unresolvedDispatch:true`
+survive expiry, closed/replaced movies and intervening modals; cleanup adds
+`invalidationReason` without rewriting the phase. General inspection reports
+`unresolvedRequestId` and `newRequestsBlocked`, including when the Main Menu
+is closed. It reports neither request nor confirmation readiness for an
+unresolved mutation. The barrier begins before selection enters GFx, so partial
+selection/NEW failure is covered as well as partial confirmation failure.
+
+Only definitive completion and post-dispatch verification by that same running
+task can clear its uncertainty. If it cannot complete definitively, restart the
+game process through your owned session workflow. There is no force/reset or
+fresh-ID escape hatch. Menu changes and elapsed time are not proof that no
+mutation occurred. A merely `requested` confirmation that has not begun
+acceptance can still expire normally. `accepted:true` remains dispatch evidence,
+never proof of world entry.
 
 The process retains at most 64 request receipts; when full it rejects new
 requests instead of forgetting identities and risking replay. Only one pending

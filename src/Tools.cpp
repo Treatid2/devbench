@@ -2797,7 +2797,10 @@ namespace dvb
 			"with a unique requestId; 'confirm' accepts only that request's ready New confirmation and "
 			"requires confirmNewGame:true. Repeated IDs return retained receipts without redispatch. "
 			"accepted:true proves confirmation dispatch, not world entry; verify RaceSex Menu/world state separately. "
-			"After a timeout inspect the same requestId; never retry with a new ID blindly.";
+			"After a timeout inspect the same requestId; never retry with a new ID blindly. "
+			"Unresolved dispatchUncertain receipts block all fresh IDs even after menu changes/expiry; "
+			"inspect reports unresolvedRequestId/newRequestsBlocked. Await definitive same-task completion "
+			"or restart the process; there is no force/reset recovery.";
 		game.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
