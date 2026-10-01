@@ -1,5 +1,8 @@
 # devbench
 
+Local fork contributors: see [local management and owner routing](docs/local-management.md)
+for feature requests, experimental integration, compile-only delivery and requester testing.
+
 A standalone SKSE plugin that hosts a **general test bench for Skyrim mod development**:
 an in-process server that exposes mod functionality to **AI agents (MCP)** and to **plain
 HTTP clients (REST)** through one endpoint, on `127.0.0.1`.
