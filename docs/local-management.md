@@ -16,6 +16,12 @@ cross-layer placement with the relevant CSX owner; do not invent one.
 Auto Main manages feature intake for now, but is not a mandatory proxy for
 ordinary calls to an already available DevBench runtime API.
 
+Prefer an existing documented, discovered and callable API when it represents
+the operation. Missing a convenience wrapper or dedicated menu tool is not a
+blanket blocker. Report exact typed-schema or argument-shape mismatches and
+unsafe uncertainty narrowly; never guess encodings or infer a bypass. Runtime
+transport selection remains governed by the requesting task's protocol.
+
 Requesters should send the desired behavior, use case, current failure/evidence,
 acceptance criteria, urgency and requester identity. They need not build a PR.
 An existing source candidate is optional: provide its immutable commit, base,
@@ -32,6 +38,16 @@ Evaluate findings, bind the verdict to the exact reviewed commit, and complete
 the review transaction before promotion. Submit reviewed, tested changes
 upstream with accurate compile and requester-test evidence. No pass, successful
 compile or upstream submission implies runtime acceptance or upstream merge.
+
+Reasonable trust in upstream permits experimental integration; it is not an
+automatic-review verdict. Product changes promoted to reviewed fork main must
+also be represented in upstream main or a PR against it. Reconcile existing
+upstream PR coverage before creating duplicates. Local-only governance docs
+remain on their management branch until their upstream-coverage disposition
+is explicit; do not silently exempt them or publish local chat/path guidance
+upstream. PASS_WITH_FINDINGS is acceptable only after evaluation establishes
+that no product correction is required. Otherwise preserve the verdict and
+perform the authorised correction work with a fresh exact-source review.
 
 The DevBench owner is responsible for existing as well as new DevBench reviews.
 Transfer Auto Main's exact review inventory, pending work and human guidance
