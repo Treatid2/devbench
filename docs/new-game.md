@@ -52,7 +52,9 @@ not invoke native `StartNewGame` directly or answer `MessageBoxMenu`.
    ```
 
    The request expires after 60 seconds. A replaced or closed menu invalidates
-   the pending request. Confirmation requires that request's movie, ready
+   the pending request, even if the same movie is reopened between tool calls.
+   An intervening MessageBoxMenu also invalidates it (`menuInterrupted`).
+   Confirmation requires that request's movie, ready
    confirmation state and still-selected New entry. It invokes normal
    acceptance and verifies `strFadeOutCallback == "StartNewGame"`.
 

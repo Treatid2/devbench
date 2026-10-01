@@ -2,6 +2,7 @@
 
 #include "EventBus.h"
 #include "Json.h"
+#include "NewGameControl.h"
 #include "Recording.h"
 
 #include <atomic>
@@ -28,6 +29,7 @@ namespace dvb
 				RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override
 			{
 				if (a_event) {
+					NewGameControl::OnMenuEvent(*a_event);
 					const std::string name = a_event->menuName.c_str();
 					{
 						std::lock_guard lock(g_menuMutex);

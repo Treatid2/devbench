@@ -4,6 +4,7 @@
 #include "ToolRegistry.h"
 
 #include <cmath>
+#include <atomic>
 #include <map>
 
 namespace dvb::NewGameControl
@@ -21,6 +22,8 @@ namespace dvb::NewGameControl
 		std::string                           g_pending;
 		RE::GPtr<RE::GFxMovieView>            g_pendingMovie;
 		std::chrono::steady_clock::time_point g_expires;
+		std::atomic<std::uint64_t>             g_menuEpoch{ 0 };
+		std::uint64_t                          g_pendingEpoch = 0;
 
 		RE::GFxValue Member(const RE::GFxValue& a_object, const char* a_name)
 		{
@@ -61,6 +64,8 @@ namespace dvb::NewGameControl
 
 		void ValidatePending(RE::GFxMovieView* a_movie)
 		{
+			if (!g_pending.empty() && g_pendingEpoch != g_menuEpoch.load())
+				ClearPending("menuInterrupted");
 			if (!g_pending.empty() && (a_movie != g_pendingMovie.get() ||
 										  std::chrono::steady_clock::now() >= g_expires))
 				ClearPending(a_movie != g_pendingMovie.get() ? "menuReplaced" : "expired");
@@ -107,7 +112,7 @@ namespace dvb::NewGameControl
 		{
 			json       result{ { "mainMenuOpen", true }, { "state", a_menu.state },
 				{ "moviePath", kMoviePath }, { "pendingRequestId", g_pending },
-				{ "readyToRequest", a_menu.state == "Main" && g_pending.empty() },
+				{ "readyToRequest", a_menu.state == "Main" && g_pending.empty() && g_receipts.size() < kMaximumRequests },
 				{ "readyToConfirm", a_menu.state == "MainConfirm" && !g_pending.empty() } };
 			const auto selected = Member(a_menu.list, "selectedEntry");
 			result["selectedEntryId"] = selected.IsObject() ? json(NumberMember(selected, "index")) : json(nullptr);
@@ -157,6 +162,7 @@ namespace dvb::NewGameControl
 				throw ToolError(422, "newGame: New selection did not read back; inspect before another request");
 			g_pending = a_id;
 			g_pendingMovie = a_menu.movie;
+			g_pendingEpoch = g_menuEpoch.load();
 			g_expires = std::chrono::steady_clock::now() + kRequestLifetime;
 			// Native NEW requests the real confirmation; Callback requires a response ID.
 			const RE::GFxValue responseID(0.0);
@@ -187,6 +193,15 @@ namespace dvb::NewGameControl
 			g_pendingMovie.reset();
 			return receipt;
 		}
+	}
+
+	void OnMenuEvent(const RE::MenuOpenCloseEvent& a_event)
+	{
+		// A close/reopen of the same retained movie, or a modal appearing and
+		// disappearing between calls, must not revive a pending confirmation.
+		if ((a_event.menuName == RE::MainMenu::MENU_NAME && !a_event.opening) ||
+			(a_event.menuName == RE::MessageBoxMenu::MENU_NAME && a_event.opening))
+			g_menuEpoch.fetch_add(1);
 	}
 
 	json Handle(const json& a_args)
