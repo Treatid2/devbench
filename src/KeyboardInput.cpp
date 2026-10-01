@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <future>
 #include <limits>
@@ -30,6 +31,9 @@ namespace dvb
 	namespace
 	{
 		using namespace std::chrono;
+
+		// Keyboard button events have no VR wand association.
+		constexpr std::int32_t kKeyboardNoWandIndex = -1;
 
 		constexpr int         kKeyboardContractVersion = 1;
 		constexpr int         kDefaultTapMs = 50;
@@ -146,7 +150,7 @@ namespace dvb
 				}
 				if (!queued) {
 					const float heldSecs = HeldDownSeconds(key.pressedAtGameMs, gameNow);
-					queue->AddButtonEvent(RE::INPUT_DEVICE::kKeyboard, 0, key.scancode, 1.0F, heldSecs);
+					queue->AddButtonEvent(RE::INPUT_DEVICE::kKeyboard, kKeyboardNoWandIndex, key.scancode, 1.0F, heldSecs);
 				}
 			}
 		}
@@ -548,7 +552,7 @@ namespace dvb
 						if (g_repeatingKeys.empty())
 							DisengageForHold();
 					}
-					queue->AddButtonEvent(RE::INPUT_DEVICE::kKeyboard, 0, a_lease.key.scancode,
+					queue->AddButtonEvent(RE::INPUT_DEVICE::kKeyboard, kKeyboardNoWandIndex, a_lease.key.scancode,
 						a_down ? 1.0F : 0.0F, a_down ? 0.0F : a_heldSecs);
 					return json{ { "frame", game::CurrentFrame() } };
 				});
@@ -808,7 +812,8 @@ namespace dvb
 			"contract/version, readiness, limits, injection path, supported actions, and complete "
 			"keyboard name→DirectInput-scan-code catalog; clients MUST capability-negotiate rather "
 			"than assuming this tool exists. Contract v1 implements device='keyboard' using Skyrim's "
-			"own BSInputEventQueue (not Windows SendInput, so window focus is irrelevant). 'status' "
+			"own BSInputEventQueue (not Windows SendInput, so window focus is irrelevant). Keyboard "
+			"button events carry the engine's signed no-wand value for presses, holds and releases. 'status' "
 			"reports readiness and every synthetic held key with owner/lease timing. 'down' starts a "
 			"bounded owned hold (default maxHoldMs 5000; automatic up on expiry); repeated down by the "
 			"same owner is idempotent and another owner gets 409. 'up' releases that owner's key; "
@@ -838,7 +843,7 @@ namespace dvb
 			{ "properties", json{
 								{ "action", json{ { "type", "string" }, { "enum", json::array({ "capabilities", "status", "down", "up", "tap", "sequence", "stop", "releaseAll" }) } } },
 								{ "device", json{ { "type", "string" }, { "enum", json::array({ "keyboard", "vrTrackedSet" }) }, { "description", "mutation/status device; omit for capabilities" } } },
-								{ "key", json{ { "oneOf", json::array({ json{ { "type", "string" } }, json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 255 } } }) }, { "description", "down/up/tap: documented key name or raw DirectInput scancode" } } },
+								{ "key", json{ { "oneOf", json::array({ json{ { "type", "string" } }, json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 255 } } }) }, { "description", "keyboard down/up/tap: documented key name or raw DirectInput scancode; button events have no VR wand association" } } },
 								{ "owner", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "stable task/session owner; defaults to MCP session id or rest:anonymous" } } },
 								{ "durationMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", 5000 }, { "description", "tap duration (default 50); sequence tap/wait event duration" } } },
 								{ "maxHoldMs", json{ { "type", "integer" }, { "minimum", 100 }, { "maximum", kMaximumMaxHoldMs }, { "description", "down safety lease (default 5000); automatic up at expiry" } } },
