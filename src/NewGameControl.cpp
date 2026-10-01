@@ -1,11 +1,11 @@
 #include "NewGameControl.h"
 
 #include "MainThread.h"
+#include "NewGameRequestLedger.h"
 #include "ToolRegistry.h"
 
 #include <cmath>
 #include <atomic>
-#include <map>
 
 namespace dvb::NewGameControl
 {
@@ -13,12 +13,11 @@ namespace dvb::NewGameControl
 	{
 		constexpr auto          kMoviePath = "_root.MenuHolder.Menu_mc";
 		constexpr auto          kRequestLifetime = std::chrono::seconds(60);
-		constexpr std::size_t   kMaximumRequests = 64;
 		constexpr std::uint32_t kMaximumEntries = 32;
 		constexpr double        kNewEntryID = 1.0;
 
 		// All movie access and request bookkeeping share the game-thread dispatch.
-		std::map<std::string, json>           g_receipts;
+		RequestLedger                        g_receipts;
 		std::string                           g_pending;
 		RE::GPtr<RE::GFxMovieView>            g_pendingMovie;
 		std::chrono::steady_clock::time_point g_expires;
@@ -57,7 +56,7 @@ namespace dvb::NewGameControl
 		void ClearPending(const char* a_phase)
 		{
 			if (!g_pending.empty())
-				g_receipts.at(g_pending)["phase"] = a_phase;
+				g_receipts.Invalidate(g_pending, a_phase);
 			g_pending.clear();
 			g_pendingMovie.reset();
 		}
@@ -112,11 +111,13 @@ namespace dvb::NewGameControl
 		{
 			json       result{ { "mainMenuOpen", true }, { "state", a_menu.state },
 				{ "moviePath", kMoviePath }, { "pendingRequestId", g_pending },
-				{ "readyToRequest", a_menu.state == "Main" && g_pending.empty() && g_receipts.size() < kMaximumRequests },
-				{ "readyToConfirm", a_menu.state == "MainConfirm" && !g_pending.empty() } };
+				{ "unresolvedRequestId", g_receipts.UnresolvedID() },
+				{ "newRequestsBlocked", !g_receipts.UnresolvedID().empty() },
+				{ "readyToRequest", a_menu.state == "Main" && g_pending.empty() && g_receipts.CanRequest() },
+				{ "readyToConfirm", false } };
 			const auto selected = Member(a_menu.list, "selectedEntry");
 			result["selectedEntryId"] = selected.IsObject() ? json(NumberMember(selected, "index")) : json(nullptr);
-			result["readyToConfirm"] = a_menu.state == "MainConfirm" && !g_pending.empty() &&
+			result["readyToConfirm"] = a_menu.state == "MainConfirm" && g_receipts.IsRequested(g_pending) &&
 			                           selected.IsObject() && IsNewEntry(selected);
 			return result;
 		}
@@ -145,53 +146,49 @@ namespace dvb::NewGameControl
 
 		json Request(MenuState& a_menu, const std::string& a_id)
 		{
+			if (const auto unresolved = g_receipts.UnresolvedID(); !unresolved.empty())
+				throw ToolError(409, std::format("newGame: request '{}' has unresolved dispatch; inspect that ID, never retry with a fresh ID; restart the process if it cannot resolve", unresolved));
 			if (a_menu.state != "Main" || !g_pending.empty())
 				throw ToolError(409, "newGame: request needs idle Main state with no pending request");
 			RequireCallback(a_menu, "NEW");
 			RequireCallback(a_menu, "fadeOutStarted");
 			RequireCallback(a_menu, "StartNewGame");
 			const auto row = NewRow(a_menu);
-			if (g_receipts.size() >= kMaximumRequests)
+			if (!g_receipts.CanRequest())
 				throw ToolError(409, "newGame: request history is full; restart the test session");
-			g_receipts.emplace(a_id, json{ { "requestId", a_id }, { "phase", "dispatchUncertain" },
-										 { "newRow", row }, { "accepted", false }, { "completed", false } });
+			g_receipts.BeginRequest(a_id, row);
+			g_pending = a_id;
+			g_pendingMovie = a_menu.movie;
+			g_pendingEpoch = g_menuEpoch.load();
+			g_expires = std::chrono::steady_clock::now() + kRequestLifetime;
 			// Record uncertainty before entering GFx; a lost response must not replay NEW.
 			const RE::GFxValue selection(static_cast<double>(row));
 			if (!a_menu.list.Invoke("__set__selectedIndex", nullptr, &selection, 1) ||
 				!IsNewEntry(Member(a_menu.list, "selectedEntry")))
 				throw ToolError(422, "newGame: New selection did not read back; inspect before another request");
-			g_pending = a_id;
-			g_pendingMovie = a_menu.movie;
-			g_pendingEpoch = g_menuEpoch.load();
-			g_expires = std::chrono::steady_clock::now() + kRequestLifetime;
 			// Native NEW requests the real confirmation; Callback requires a response ID.
 			const RE::GFxValue responseID(0.0);
 			a_menu.delegate->Callback(a_menu.movie.get(), "NEW", &responseID, 1);
-			auto& receipt = g_receipts.at(a_id);
-			receipt["phase"] = "requested";
-			receipt["state"] = StringMember(a_menu.menu, "currentState");
-			return receipt;
+			g_receipts.CompleteRequest(a_id, StringMember(a_menu.menu, "currentState"));
+			return g_receipts.Snapshot(a_id);
 		}
 
 		json Confirm(MenuState& a_menu, const std::string& a_id)
 		{
-			if (g_pending != a_id || a_menu.state != "MainConfirm" ||
+			if (g_pending != a_id || !g_receipts.IsRequested(a_id) || a_menu.state != "MainConfirm" ||
 				!IsNewEntry(Member(a_menu.list, "selectedEntry")))
 				throw ToolError(409, "newGame: confirm needs this request's ready New confirmation");
 			RequireCallback(a_menu, "fadeOutStarted");
 			RequireCallback(a_menu, "StartNewGame");
-			auto& receipt = g_receipts.at(a_id);
-			receipt["phase"] = "dispatchUncertain";
+			g_receipts.BeginConfirmation(a_id);
 			if (!a_menu.menu.Invoke("onAcceptPress"))
 				throw ToolError(422, "newGame: confirmation invocation failed; do not replay");
 			if (StringMember(a_menu.menu, "strFadeOutCallback") != "StartNewGame")
 				throw ToolError(422, "newGame: confirmation did not schedule StartNewGame; do not replay");
-			receipt["phase"] = "dispatched";
-			receipt["accepted"] = true;
-			receipt["note"] = "Normal confirmation accepted; fade/engine initialization is asynchronous. Verify RaceSex Menu and world state separately.";
+			g_receipts.CompleteConfirmation(a_id);
 			g_pending.clear();
 			g_pendingMovie.reset();
-			return receipt;
+			return g_receipts.Snapshot(a_id);
 		}
 	}
 
@@ -225,14 +222,14 @@ namespace dvb::NewGameControl
 			auto* ui = RE::UI::GetSingleton();
 			auto  menu = ui ? ui->GetMenu(RE::MainMenu::MENU_NAME) : nullptr;
 			ValidatePending(menu && ui->IsMenuOpen(RE::MainMenu::MENU_NAME) ? menu->uiMovie.get() : nullptr);
-			const auto known = g_receipts.find(id);
-			if (known != g_receipts.end() &&
-				(phase != "confirm" || known->second["phase"] != "requested"))
-				return known->second;
-			if (phase == "confirm" && known == g_receipts.end())
+			if (g_receipts.Contains(id) && (phase != "confirm" || !g_receipts.IsRequested(id)))
+				return g_receipts.Snapshot(id);
+			if (phase == "confirm" && !g_receipts.Contains(id))
 				throw ToolError(409, "newGame: unknown requestId");
 			if (phase == "inspect" && (!ui || !ui->IsMenuOpen(RE::MainMenu::MENU_NAME)))
-				return json{ { "mainMenuOpen", false }, { "readyToRequest", false }, { "readyToConfirm", false } };
+				return json{ { "mainMenuOpen", false }, { "readyToRequest", false }, { "readyToConfirm", false },
+					{ "pendingRequestId", g_pending }, { "unresolvedRequestId", g_receipts.UnresolvedID() },
+					{ "newRequestsBlocked", !g_receipts.UnresolvedID().empty() } };
 			auto state = ReadMenu();
 			if (phase == "inspect")
 				return Describe(state);
