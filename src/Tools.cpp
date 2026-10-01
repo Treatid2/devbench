@@ -10,6 +10,7 @@
 #include "Json.h"
 #include "KeyboardInput.h"
 #include "MainThread.h"
+#include "NewGameControl.h"
 #include "Papyrus.h"
 #include "Recording.h"
 #include "ReplayDriver.h"
@@ -362,6 +363,9 @@ namespace dvb
 		{
 			const std::string action = a_args.value("action", std::string{});
 
+			if (action == "newGame")
+				return NewGameControl::Handle(a_args);
+
 			if (action == "list") {
 				const fs::path saveDir = ResolveSaveDir(a_args);
 				auto           entries = EnumerateSaves(saveDir);  // already newest-first by mtime
@@ -564,7 +568,7 @@ namespace dvb
 					out["note"] = kLoadNote;
 				return out;
 			}
-			throw ToolError(400, std::format("unknown action '{}' (list|save|load|loadLast|advanceTime|getTimeScale|setTimeScale)", action));
+			throw ToolError(400, std::format("unknown action '{}' (list|save|load|loadLast|newGame|advanceTime|getTimeScale|setTimeScale)", action));
 		}
 
 		bool ContainsCI(const std::string& a_hay, const std::string& a_needle);  // defined below (near CheckState)
@@ -2365,8 +2369,8 @@ namespace dvb
 			"before anything has loaded) plus top-level metaAvailable/metaNote if none parsed; "
 			"'loadLast' loads the most recent save (a settled real-game state — avoids coc's "
 			"heavy new-game init); 'load'/'save' take a 'name' ('load' skips the mod-mismatch "
-			"confirmation modal). All but 'list' are fire-and-forget; watch lifecycle events / "
-			"inspect playerLoaded for completion. 'advanceTime' (param 'hours', non-zero, may be "
+			"confirmation modal). Save/load dispatch is fire-and-forget; inspect current "
+			"playerLoaded state for completion. 'advanceTime' (param 'hours', non-zero, may be "
 			"negative) jumps the calendar directly — no need to fall back to console 'set timescale "
 			"to N' and waiting real time — and returns { gameHour, daysPassed, day, month, year } "
 			"read back the same tick; runs synchronously on the main thread. 'setTimeScale' (param "
@@ -2377,11 +2381,19 @@ namespace dvb
 			"engine is actually running at the requested scale (the reconciler applies it on the next "
 			"frame and the engine then ramps). It is refused (409) while a recording or a capture is "
 			"in flight, unless 'allowTimeScale':true. 'getTimeScale' returns the same object without "
-			"changing anything.";
+			"changing anything. VR-only 'newGame' preserves the normal main-menu confirmation/fade: "
+			"phase='inspect' reports readiness; 'request' selects semantic New and asks for confirmation "
+			"with a unique requestId; 'confirm' accepts only that request's ready New confirmation and "
+			"requires confirmNewGame:true. Repeated IDs return retained receipts without redispatch. "
+			"accepted:true proves confirmation dispatch, not world entry; verify RaceSex Menu/world state separately. "
+			"After a timeout inspect the same requestId; never retry with a new ID blindly.";
 		game.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
-								{ "action", json{ { "type", "string" }, { "enum", json::array({ "list", "save", "load", "loadLast", "advanceTime", "getTimeScale", "setTimeScale" }) }, { "description", "list | save | load | loadLast | advanceTime | getTimeScale | setTimeScale" } } },
+								{ "action", json{ { "type", "string" }, { "enum", json::array({ "list", "save", "load", "loadLast", "newGame", "advanceTime", "getTimeScale", "setTimeScale" }) }, { "description", "list | save | load | loadLast | newGame | advanceTime | getTimeScale | setTimeScale" } } },
+								{ "phase", json{ { "type", "string" }, { "enum", json::array({ "inspect", "request", "confirm" }) }, { "description", "newGame: inspect (default), request confirmation, or confirm the owned New selection" } } },
+								{ "requestId", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "newGame: caller-generated unique ID, required for request/confirm; retain it across response loss" } } },
+								{ "confirmNewGame", json{ { "type", "boolean" }, { "description", "newGame confirm: explicit true required before starting normal game initialization" } } },
 								{ "name", json{ { "type", "string" }, { "description", "save file name (required for save/load; from action='list')" } } },
 								{ "dir", json{ { "type", "string" }, { "description", "list/load/loadLast: override the saves directory (default resolves from sLocalSavePath)" } } },
 								{ "filter", json{ { "type", "string" }, { "description", "list only: case-insensitive substring to match against save names" } } },
