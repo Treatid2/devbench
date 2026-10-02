@@ -33,12 +33,17 @@ not invoke native `StartNewGame` directly or answer `MessageBoxMenu`.
    ```
 
    This selects the unique enabled New entry through the list's setter,
-   verifies the selected semantic ID, and calls `NEW` with the correct
-   response-ID argument. Retain the request ID and receipt.
+   verifies the enabled semantic New entry, and calls `NEW` with the correct
+   response-ID argument. Before acknowledging `phase: "requested"`, the same
+   task re-reads the live menu and requires the retained request/movie/epoch,
+   exact `MainConfirm` state and still-selected enabled `$NEW` entry (ID 1).
+   Any other readable state or changed selection remains `dispatchUncertain`;
+   this adapter does not acknowledge an asynchronous/intermediate transition.
+   Retain the request ID and receipt.
 
-3. Inspect until the same menu reaches `state: "MainConfirm"` and
+3. Inspect the same request/menu for `state: "MainConfirm"` and
    `readyToConfirm: true`, within a bounded deadline. Intermediate animation
-   states are not readiness. Do not repeat the request while waiting.
+   states are not readiness. Do not repeat the request while inspecting.
 
 4. Confirm once:
 

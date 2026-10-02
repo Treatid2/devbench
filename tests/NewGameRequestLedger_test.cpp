@@ -27,7 +27,7 @@ TEST_CASE("New Game partial confirmation mutation followed by exception stays un
 {
 	RequestLedger receipts;
 	receipts.BeginRequest("partial", 1);
-	receipts.CompleteRequest("partial", "MainConfirm");
+	CHECK(receipts.CompleteRequest("partial", "MainConfirm", true));
 	bool mutated = false;
 	const auto confirm = [&]() {
 		receipts.BeginConfirmation("partial");
@@ -47,7 +47,7 @@ TEST_CASE("New Game failed post-dispatch verification cannot acknowledge confirm
 {
 	RequestLedger receipts;
 	receipts.BeginRequest("verify-failed", 1);
-	receipts.CompleteRequest("verify-failed", "MainConfirm");
+	CHECK(receipts.CompleteRequest("verify-failed", "MainConfirm", true));
 	receipts.BeginConfirmation("verify-failed");
 	// An unreadable or non-StartNewGame fade callback never calls completion.
 	CHECK(receipts.Snapshot("verify-failed")["accepted"] == false);
@@ -80,7 +80,7 @@ TEST_CASE("New Game started queue timeout cannot abandon a partially mutating co
 {
 	RequestLedger receipts;
 	receipts.BeginRequest("started-timeout", 1);
-	receipts.CompleteRequest("started-timeout", "MainConfirm");
+	CHECK(receipts.CompleteRequest("started-timeout", "MainConfirm", true));
 	std::latch started(1);
 	std::latch finish(1);
 	QueuedTask task([&]() -> dvb::json {
@@ -108,7 +108,7 @@ TEST_CASE("New Game definitive late completion resolves only its own started ope
 	RequestLedger receipts;
 	receipts.BeginRequest("late", 1);
 	CHECK_THROWS(receipts.CompleteConfirmation("late"));
-	receipts.CompleteRequest("late", "MainConfirm");
+	CHECK(receipts.CompleteRequest("late", "MainConfirm", true));
 	receipts.BeginConfirmation("late");
 	receipts.Invalidate("late", "menuInterrupted");
 	CHECK(!receipts.CanRequest());
@@ -127,7 +127,7 @@ TEST_CASE("New Game merely requested confirmation may expire before dispatch")
 {
 	RequestLedger receipts;
 	receipts.BeginRequest("not-confirmed", 1);
-	receipts.CompleteRequest("not-confirmed", "MainConfirm");
+	CHECK(receipts.CompleteRequest("not-confirmed", "MainConfirm", true));
 	receipts.Invalidate("not-confirmed", "expired");
 	CHECK(receipts.Snapshot("not-confirmed")["phase"] == "expired");
 	CHECK(receipts.Snapshot("not-confirmed")["unresolvedDispatch"] == false);
@@ -143,10 +143,82 @@ TEST_CASE("New Game bounded history never forgets IDs to admit fresh requests")
 	for (std::size_t i = 0; i < RequestLedger::kMaximumRequests; ++i) {
 		const auto id = std::to_string(i);
 		receipts.BeginRequest(id, 1);
-		receipts.CompleteRequest(id, "MainConfirm");
+		CHECK(receipts.CompleteRequest(id, "MainConfirm", true));
 		receipts.Invalidate(id, "expired");
 	}
 	CHECK(!receipts.CanRequest());
 	CHECK(receipts.Contains("0"));
 	CHECK_THROWS(receipts.BeginRequest("overflow", 1));
+}
+
+namespace
+{
+	void CheckUnverifiedRequest(const char* a_state, bool a_selectedNew)
+	{
+		RequestLedger receipts;
+		receipts.BeginRequest("unverified", 1);
+		CHECK(!receipts.CompleteRequest("unverified", a_state, a_selectedNew));
+		CHECK(!receipts.IsRequested("unverified"));
+		CHECK(receipts.Snapshot("unverified")["state"] == a_state);
+		CHECK(receipts.Snapshot("unverified")["selectedNew"] == a_selectedNew);
+		for (const auto* reason : { "menuClosed", "menuReplaced", "menuInterrupted", "expired" }) {
+			receipts.Invalidate("unverified", reason);
+			const auto snapshot = receipts.Snapshot("unverified");
+			CHECK(snapshot["phase"] == "dispatchUncertain");
+			CHECK(snapshot["invalidationReason"] == reason);
+			CHECK(snapshot["unresolvedDispatch"] == true);
+			CHECK(snapshot["accepted"] == false);
+			CHECK(snapshot["completed"] == false);
+			auto inspection = snapshot;
+			inspection["phase"] = "requested";
+			CHECK(receipts.Snapshot("unverified")["phase"] == "dispatchUncertain");
+			CHECK(receipts.UnresolvedID() == "unverified");
+			CHECK(!receipts.CanRequest());
+			CHECK_THROWS(receipts.BeginRequest("fresh", 1));
+			CHECK_THROWS(receipts.BeginRequest("unverified", 1));
+			CHECK_THROWS(receipts.BeginConfirmation("unverified"));
+		}
+	}
+}
+
+TEST_CASE("New Game readable Main after NEW cannot resolve request uncertainty")
+{
+	CheckUnverifiedRequest("Main", true);
+}
+
+TEST_CASE("New Game other readable post-NEW states cannot resolve request uncertainty")
+{
+	for (const auto* state : { "Transition", "StartNewGame", "", "mainconfirm" })
+		CheckUnverifiedRequest(state, true);
+}
+
+TEST_CASE("New Game MainConfirm without the selected semantic New remains uncertain")
+{
+	CheckUnverifiedRequest("MainConfirm", false);
+}
+
+TEST_CASE("New Game started request timeout cannot acknowledge an unsupported postcondition")
+{
+	RequestLedger receipts;
+	std::latch started(1);
+	std::latch finish(1);
+	QueuedTask task([&]() -> dvb::json {
+		receipts.BeginRequest("request-timeout", 1);
+		started.count_down();
+		finish.wait();
+		if (!receipts.CompleteRequest("request-timeout", "Main", true))
+			throw std::runtime_error("NEW returned without supported confirmation");
+		return receipts.Snapshot("request-timeout");
+	}, QueuedTask::Clock::now() + 1min);
+	auto future = task.GetFuture();
+	std::jthread gameThread([&]() { task.Run(); });
+	started.wait();
+	CHECK(future.wait_for(0ms) == std::future_status::timeout);
+	CHECK(!task.Abandon());
+	finish.count_down();
+	gameThread.join();
+	CHECK_THROWS_AS(future.get(), std::runtime_error);
+	receipts.Invalidate("request-timeout", "expired");
+	CHECK(receipts.Snapshot("request-timeout")["phase"] == "dispatchUncertain");
+	CHECK_THROWS(receipts.BeginRequest("fresh", 1));
 }
