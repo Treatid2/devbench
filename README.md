@@ -217,6 +217,11 @@ Other mods add their own tools via the C ABI (see [Use devbench from your mod](#
 
 ## Record, replay, and autorun
 
+Keyboard actions emit button events with the engine's signed no-wand value (`-1`)
+for initial presses, held events, and releases. Character/text input requires
+separate support. An accepted input command proves queue submission; inspect the
+target menu or game state to establish that the intended interaction completed.
+
 The `record` tool captures a manual play-through as a replayable scenario file:
 
 1. Load a save or `coc` to the scene you want to record. To capture a main-menu → new-game
