@@ -53,6 +53,14 @@ namespace dvb::NewGameControl
 			return NumberMember(a_entry, "index") == kNewEntryID;
 		}
 
+		bool IsEnabledNewEntry(const RE::GFxValue& a_entry)
+		{
+			if (!IsNewEntry(a_entry) || StringMember(a_entry, "text") != "$NEW")
+				return false;
+			const auto disabled = Member(a_entry, "disabled");
+			return disabled.IsBool() && !disabled.GetBool();
+		}
+
 		void ClearPending(const char* a_phase)
 		{
 			if (!g_pending.empty())
@@ -118,7 +126,7 @@ namespace dvb::NewGameControl
 			const auto selected = Member(a_menu.list, "selectedEntry");
 			result["selectedEntryId"] = selected.IsObject() ? json(NumberMember(selected, "index")) : json(nullptr);
 			result["readyToConfirm"] = a_menu.state == "MainConfirm" && g_receipts.IsRequested(g_pending) &&
-			                           selected.IsObject() && IsNewEntry(selected);
+			                           selected.IsObject() && IsEnabledNewEntry(selected);
 			return result;
 		}
 
@@ -164,19 +172,27 @@ namespace dvb::NewGameControl
 			// Record uncertainty before entering GFx; a lost response must not replay NEW.
 			const RE::GFxValue selection(static_cast<double>(row));
 			if (!a_menu.list.Invoke("__set__selectedIndex", nullptr, &selection, 1) ||
-				!IsNewEntry(Member(a_menu.list, "selectedEntry")))
+				!IsEnabledNewEntry(Member(a_menu.list, "selectedEntry")))
 				throw ToolError(422, "newGame: New selection did not read back; inspect before another request");
 			// Native NEW requests the real confirmation; Callback requires a response ID.
 			const RE::GFxValue responseID(0.0);
 			a_menu.delegate->Callback(a_menu.movie.get(), "NEW", &responseID, 1);
-			g_receipts.CompleteRequest(a_id, StringMember(a_menu.menu, "currentState"));
+			// Re-read the live menu, not just a field on the retained pre-call object.
+			// Closure/replacement/modal/expiry may clean up the movie but cannot clear uncertainty.
+			auto post = ReadMenu();
+			if (g_pending != a_id || post.movie.get() != a_menu.movie.get() ||
+				g_pendingEpoch != g_menuEpoch.load())
+				throw ToolError(422, "newGame: request menu changed after NEW; do not replay");
+			if (!g_receipts.CompleteRequest(a_id, post.state,
+					IsEnabledNewEntry(Member(post.list, "selectedEntry"))))
+				throw ToolError(422, "newGame: NEW did not reach the selected New confirmation; do not replay");
 			return g_receipts.Snapshot(a_id);
 		}
 
 		json Confirm(MenuState& a_menu, const std::string& a_id)
 		{
 			if (g_pending != a_id || !g_receipts.IsRequested(a_id) || a_menu.state != "MainConfirm" ||
-				!IsNewEntry(Member(a_menu.list, "selectedEntry")))
+				!IsEnabledNewEntry(Member(a_menu.list, "selectedEntry")))
 				throw ToolError(409, "newGame: confirm needs this request's ready New confirmation");
 			RequireCallback(a_menu, "fadeOutStarted");
 			RequireCallback(a_menu, "StartNewGame");

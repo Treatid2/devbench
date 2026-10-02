@@ -38,13 +38,18 @@ namespace dvb::NewGameControl
 			_records.emplace(a_id, Record{ Phase::kUncertain, false, {},
 				json{ { "requestId", a_id }, { "newRow", a_row }, { "accepted", false }, { "completed", false } } });
 		}
-		void CompleteRequest(const std::string& a_id, const std::string& a_state)
+		bool CompleteRequest(const std::string& a_id, const std::string& a_state, bool a_selectedNew)
 		{
 			auto& record = _records.at(a_id);
 			if (record.phase != Phase::kUncertain || record.confirming)
 				throw std::logic_error("New Game request completion without its started mutation");
 			record.details["state"] = a_state;
-			record.phase = Phase::kRequested;  // Only after all post-dispatch reads succeeded.
+			record.details["selectedNew"] = a_selectedNew;
+			// A readable state alone is not proof NEW reached the supported confirmation.
+			if (a_state != "MainConfirm" || !a_selectedNew)
+				return false;
+			record.phase = Phase::kRequested;
+			return true;
 		}
 		void BeginConfirmation(const std::string& a_id)
 		{
