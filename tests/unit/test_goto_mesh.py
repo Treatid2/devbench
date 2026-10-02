@@ -25,6 +25,7 @@ def state(frame=1):
                                       ["--formid", "0x1", "--distance", "inf"],
                                       ["--formid", "0x1", "--distance", "0"],
                                       ["--formid", "0x1", "--timeout", "121"],
+                                      ["--formid", "0x1", "--height-offset", "nan"],
                                       ["--formid", "0x1", "--port", "65536"]])
 def test_invalid_arguments_fail_before_network(arguments):
     with pytest.raises(SystemExit):
@@ -77,6 +78,7 @@ class FakeGame:
         self.pov = "first"
         self.frame = 1
         self.pending_pose_reads = 2
+        self.pending_position = [100.0, 50.0, 0.0]
         self.never_ready, self.bad_move, self.inconclusive = never_ready, bad_move, inconclusive
 
     def tool(self, url, name, args, deadline):
@@ -92,13 +94,15 @@ class FakeGame:
             if args["kind"] == "scene":
                 self.pending_pose_reads -= 1
                 if self.pending_pose_reads <= 0 and not self.never_ready:
-                    self.position = [100.0, 50.0, 64.0]
+                    self.position = self.pending_position
                 return {"playerLoaded": True, "cell": {"formId": "0x00000002"}, "position": self.position}
         if name == "papyrus":
             function = args["function"]
             returned = None
             if function == "MoveTo" and self.bad_move:
                 return {"called": False, "returned": None}
+            if function == "MoveTo":
+                self.pending_position = [100.0 + args["args"][1], 400.0 + args["args"][2], args["args"][3]]
             if function == "Is3DLoaded":
                 returned = True
             if function == "GetAngleZ":
@@ -139,7 +143,7 @@ def test_success_uses_one_move_readbacks_and_relative_heading(monkeypatch):
     game = FakeGame()
     mesh.run(prepare(monkeypatch, game))
     assert len(mutations(game, "MoveTo")) == 1
-    assert mutations(game, "MoveTo")[0]["args"] == [{"form": "0x00000001"}, 0.0, -350.0, 64.0, False]
+    assert mutations(game, "MoveTo")[0]["args"] == [{"form": "0x00000001"}, 0.0, -350.0, 0.0, False]
     assert mutations(game, "SetAngle")[0]["args"] == [0.0, 0.0, 50.0]
     assert not any(name == "console" for name, _ in game.events)
     assert sum(name == "capture" and args["kind"] != "providers" for name, args in game.events) == 1

@@ -215,6 +215,13 @@ def positive_float(value: str) -> float:
     return parsed
 
 
+def finite_float(value: str) -> float:
+    parsed = float(value)
+    if not finite_number(parsed):
+        raise argparse.ArgumentTypeError("must be finite")
+    return parsed
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     target = parser.add_mutually_exclusive_group(required=True)
@@ -222,14 +229,17 @@ def parse_args(argv=None):
     target.add_argument("--formid", help="hex FormID")
     target.add_argument("--editorid", help="EditorID")
     parser.add_argument("--distance", type=positive_float, help="standoff game units, at most100000")
+    parser.add_argument("--height-offset", type=finite_float, default=0.0,
+                        help="player-foot offset from target origin, +/-100000; eye height comes from the camera")
     parser.add_argument("--runtime", choices=("vr", "se"), help="se selects non-VR SE/AE")
     parser.add_argument("--port", type=int)
     parser.add_argument("--provider", help="exact registered capture provider; required if more than one")
     parser.add_argument("--timeout", type=positive_float, default=90.0, help="total recipe budget, at most120s")
     parser.add_argument("--apply", action="store_true", help="permit mutation in your owned development session")
     args = parser.parse_args(argv)
-    if args.timeout > 120 or (args.distance is not None and args.distance > 100000):
-        parser.error("timeout may not exceed120s and distance may not exceed100000")
+    if (args.timeout > 120 or abs(args.height_offset) > 100000
+            or (args.distance is not None and args.distance > 100000)):
+        parser.error("timeout may not exceed120s; distance/absolute height offset may not exceed100000")
     if args.port is not None and not 1 <= args.port <= 65535:
         parser.error("port must be1..65535")
     if not (args.model or args.formid or args.editorid):
@@ -254,7 +264,7 @@ def run(args) -> None:
             raise RuntimeError("the player cannot be its own framing target")
         position = vector(target["position"])
         distance = standoff_distance(target, args.distance)
-        expected_position = vector([position[0], position[1] - distance, position[2] + 64.0])
+        expected_position = vector([position[0], position[1] - distance, position[2] + args.height_offset])
         print("plan:", json.dumps({"target": target_id, "model": target.get("model"), "standoff": expected_position}))
         if not args.apply:
             print("inspection only; --apply is required for movement/camera/capture")
@@ -272,7 +282,7 @@ def run(args) -> None:
         camera = client.call("camera", {"action": "get"})
         if camera.get("freeCam") is not False or camera.get("orbit") is True:
             raise RuntimeError("free camera/orbit active or unavailable; do not take over another camera owner")
-        client.papyrus("MoveTo", [{"form": target_id}, 0.0, -distance, 64.0, False], mutate=True)
+        client.papyrus("MoveTo", [{"form": target_id}, 0.0, -distance, args.height_offset, False], mutate=True)
 
         def pose_ready():
             if client.state().get("playerLoaded") is not True:

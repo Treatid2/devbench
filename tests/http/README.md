@@ -77,6 +77,10 @@ mutation stops without replay or rollback. Inspect the partial state before any
 retry. Bounds-based distance is a rough heuristic, not collision/occlusion or
 projected fitting; the observed game frame is not GPU presentation or visual
 acceptance. This tool does not install, launch, save or reload a game.
+The default height offset is zero for player feet; the camera already supplies
+eye height. `--height-offset` makes a fixture-specific adjustment explicit.
+If collision/terrain/physics prevent the requested position being stable within
+two game units, verification fails rather than silently capturing another pose.
 
 Host-independent fake-HTTP/clock recipe checks live separately under
 `tests/unit/test_goto_mesh.py` and can be run by a receiving task without a game:
