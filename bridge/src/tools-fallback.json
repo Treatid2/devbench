@@ -236,16 +236,17 @@
     },
     {
       "name": "game",
-      "description": "Save/load and list saves. action='list' returns { count, returned, truncated, saves: [{name, mtimeUnix}, ...] }, sorted newest-first (saves[0] is what 'loadLast' loads) — count is post-filter (how many matched), returned/saves are post-limit. 'filter' keeps only names containing a substring (case-insensitive; save names embed the location, e.g. 'Whiterun'), 'limit' caps how many are returned, 'detail'=true adds a 'meta' object per matched save (characterName, location, race, level, experience, playTime, saveNumber, saveType [inferred from the filename], screenshot, fileTimeUnix — read directly from the save's own .ess header, same bytes the vanilla Load menu shows, so it works even before anything has loaded) plus top-level metaAvailable/metaNote if none parsed; 'loadLast' loads the most recent save (a settled real-game state — avoids coc's heavy new-game init); 'load'/'save' take a 'name' ('load' skips the mod-mismatch confirmation modal). All but 'list' are fire-and-forget; watch lifecycle events / inspect playerLoaded for completion. 'advanceTime' (param 'hours', non-zero, may be negative) jumps the calendar directly — no need to fall back to console 'set timescale to N' and waiting real time — and returns { gameHour, daysPassed, day, month, year } read back the same tick; runs synchronously on the main thread. 'setTimeScale' (param 'scale', or 'freeze':true for 0) speeds up or slows down the game itself for 'holdMs' (default 60000) — which is what makes a replay or scenario run faster in wall time — then restores the previous scale; 0.1..3.0, up to 10.0 with 'allowHigh':true, and it returns { requested, effective, applied, owner, leaseRemainingMs } only once the engine is actually running at the requested scale (the reconciler applies it on the next frame and the engine then ramps). It is refused (409) while a recording or a capture is in flight, unless 'allowTimeScale':true. 'getTimeScale' returns the same object without changing anything.",
+      "description": "Save/load and list saves. action='list' returns { count, returned, truncated, saves: [{name, mtimeUnix}, ...] }, sorted newest-first (saves[0] is what 'loadLast' loads) — count is post-filter (how many matched), returned/saves are post-limit. 'filter' keeps only names containing a substring (case-insensitive; save names embed the location, e.g. 'Whiterun'), 'limit' caps how many are returned, 'detail'=true adds a 'meta' object per matched save (characterName, location, race, level, experience, playTime, saveNumber, saveType [inferred from the filename], screenshot, fileTimeUnix — read directly from the save's own .ess header, same bytes the vanilla Load menu shows, so it works even before anything has loaded) plus top-level metaAvailable/metaNote if none parsed; 'loadLast' loads the most recent save (a settled real-game state — avoids coc's heavy new-game init); 'load'/'save' take a 'name' ('load' skips the mod-mismatch confirmation modal). Save/load dispatch is fire-and-forget; inspect current playerLoaded state for completion. 'advanceTime' (param 'hours', non-zero, may be negative) jumps the calendar directly — no need to fall back to console 'set timescale to N' and waiting real time — and returns { gameHour, daysPassed, day, month, year } read back the same tick; runs synchronously on the main thread. 'setTimeScale' (param 'scale', or 'freeze':true for 0) speeds up or slows down the game itself for 'holdMs' (default 60000) — which is what makes a replay or scenario run faster in wall time — then restores the previous scale; 0.1..3.0, up to 10.0 with 'allowHigh':true, and it returns { requested, effective, applied, owner, leaseRemainingMs } only once the engine is actually running at the requested scale (the reconciler applies it on the next frame and the engine then ramps). It is refused (409) while a recording or a capture is in flight, unless 'allowTimeScale':true. 'getTimeScale' returns the same object without changing anything. VR-only 'newGame' preserves the normal main-menu confirmation/fade: phase='inspect' reports readiness; 'request' selects semantic New and asks for confirmation with a unique requestId; 'confirm' accepts only that request's ready New confirmation and requires confirmNewGame:true. Repeated IDs return retained receipts without redispatch. accepted:true proves confirmation dispatch, not world entry; verify RaceSex Menu/world state separately. After a timeout inspect the same requestId; never retry with a new ID blindly. Unresolved dispatchUncertain receipts block all fresh IDs even after menu changes/expiry; inspect reports unresolvedRequestId/newRequestsBlocked. Await definitive same-task completion or restart the process; there is no force/reset recovery.",
       "inputSchema": {
         "properties": {
           "action": {
-            "description": "list | save | load | loadLast | advanceTime | getTimeScale | setTimeScale",
+            "description": "list | save | load | loadLast | newGame | advanceTime | getTimeScale | setTimeScale",
             "enum": [
               "list",
               "save",
               "load",
               "loadLast",
+              "newGame",
               "advanceTime",
               "getTimeScale",
               "setTimeScale"
@@ -275,6 +276,21 @@
           "freeze": {
             "description": "setTimeScale: confirm scale 0 (freeze); required with a 0 scale",
             "type": "boolean"
+          },
+          "confirmNewGame": {
+            "description": "newGame confirm: explicit true required before starting normal game initialization",
+            "type": "boolean"
+          },
+          "phase": {
+            "description": "newGame: inspect (default), request confirmation, or confirm the owned New selection",
+            "enum": ["inspect", "request", "confirm"],
+            "type": "string"
+          },
+          "requestId": {
+            "description": "newGame: caller-generated unique ID, required for request/confirm; retain it across response loss",
+            "minLength": 1,
+            "maxLength": 128,
+            "type": "string"
           },
           "holdMs": {
             "description": "setTimeScale: how long the scale stays in effect before the previous scale is restored (default 60000, max 3600000)",
