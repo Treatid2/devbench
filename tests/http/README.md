@@ -30,6 +30,66 @@ $env:DEVBENCH_URL = "http://127.0.0.1:8921"; pytest tests/http -v
 DEVBENCH_URL=http://127.0.0.1:8921 pytest tests/http -v
 ```
 
+## Mesh-reference capability qualification and framing example
+
+The two mesh capability tests are opt-in, read-only qualifications. They no
+longer discover a convenient nearby mesh or pass on an empty optional-field
+loop. Supply a known, loaded positive reference with a nonempty model path,
+parent cell and nondegenerate finite ordered bounds. The fixture also binds the
+current answering PID and VR flag. Replace the illustrative values below with
+your session's observed identities; these are not a provided game fixture.
+
+```powershell
+$env:DEVBENCH_URL = "http://127.0.0.1:8921"
+$env:DEVBENCH_BOOTSTRAP = "off"
+$env:DEVBENCH_MESH_FIXTURE = '{"pid":12345,"vr":true,"formId":"0x00000001","model":"ActualLoadedMesh.nif","cellFormId":"0x00000002"}'
+pytest tests/http/test_inspect.py -v -k "reports_cell_and_model or model_filter"
+```
+
+Without `DEVBENCH_MESH_FIXTURE`, this entire capability is explicitly skipped as
+**NOT QUALIFIED**. A green suite with that skip is not mesh qualification. Once
+configured, absent model/cell/bounds, filter failure or instance mismatch fails
+instead of skipping. These tests use the explicit URL and their own read-only
+client, not the shared first-hit discovery or player bootstrap. Other tests in
+the suite retain their existing bootstrap policy. Choose a fixture whose full
+model path has fewer than 1000 loaded matches so positive membership can be
+proved without truncation; test evidence should retain fixture and producer
+identities, pass/failure/skip counts and source/artifact boundaries.
+
+`examples/goto_mesh.py` is a separate **manual mutating example**, not this
+qualification and not part of CI. It defaults to inspection only. `--apply`
+requires an explicit `DEVBENCH_URL` or `--port` and ownership of the loaded
+development session; it does not acquire controller/environment leases. Runtime
+selectors narrow inspection discovery, which refuses ambiguous or unverified
+answers. The selected pid/port/exe/vr/version is printed and rechecked around
+movement and capture. The example issues one typed `MoveTo`, verifies loaded
+context and position, applies/readbacks facing and third-person POV, and checks
+a later game frame and capture result. No fixed sleep is completion evidence.
+A sole or explicitly selected registered capture provider must be available
+before movement; `--provider` selects among multiple providers. Native fallback
+is always marked inconclusive by the host, so this qualification-oriented
+example stops before mutation when no conclusive provider is available. Provider
+inventory is not proof of runtime health; the final correlated artifact receipt
+and subsequent visual inspection remain necessary.
+The total recipe budget is capped at 120 seconds; request timeouts are bounded
+socket limits, not proof that a timed-out engine task was cancelled. Uncertain
+mutation stops without replay or rollback. Inspect the partial state before any
+retry. Bounds-based distance is a rough heuristic, not collision/occlusion or
+projected fitting; the observed game frame is not GPU presentation or visual
+acceptance. This tool does not install, launch, save or reload a game.
+
+Host-independent fake-HTTP/clock recipe checks live separately under
+`tests/unit/test_goto_mesh.py` and can be run by a receiving task without a game:
+
+```sh
+pytest tests/unit/test_goto_mesh.py -q
+```
+
+Source inspection or a compiled native DLL does not claim these assertions or
+the HTTP/example qualification passed. No native rebuild is required merely to
+change this Python recipe/test logic; retain the actual unchanged native
+producer commit/receipt instead of labelling it a build of the Python head.
+
 ## Held-key movement checks
 
 `test_input_holds.py` is opt-in. Set `DEVBENCH_TEST_INPUT=1` and

@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import numbers
+import json
+import math
+import os
+from urllib.parse import urlsplit
+import uuid
 
 import pytest
 
-from conftest import require_enum, require_tool
+from conftest import Client, require_enum, require_tool
 
 
 def _is_number(v) -> bool:
@@ -78,38 +83,82 @@ def test_refs_player_by_formid(client, inspect):
     assert all(_is_number(v) for v in rotation), ref
 
 
-@pytest.mark.requires_player
-def test_refs_enumerate_reports_cell_and_model(client, inspect):
-    require_enum(inspect, "kind", "refs")
-    body = client.ok("inspect", {"kind": "refs", "formType": "Static", "radius": 5000, "limit": 50})
-    refs = body.get("refs")
-    assert isinstance(refs, list), body
-    # Not every ref has a mesh (e.g. markers) or a parent cell (exterior worldspace refs may
-    # not), so assert on shape/type where present rather than requiring every ref to carry one.
-    for ref in refs:
-        if "model" in ref:
-            assert isinstance(ref["model"], str) and ref["model"], ref
-        if "cell" in ref:
-            assert isinstance(ref["cell"], dict) and "formId" in ref["cell"], ref
-        if "bounds" in ref:
-            bounds = ref["bounds"]
-            assert isinstance(bounds, dict) and "min" in bounds and "max" in bounds, ref
-            assert len(bounds["min"]) == 3 and len(bounds["max"]) == 3, ref
+@pytest.fixture(scope="module")
+def mesh_qualification():
+    """Explicit caller-owned positive fixture; never bootstrap or discover a game.
+
+    Missing opt-in skips this whole capability, not an empty optional-field loop.
+    Once configured, a missing field/capability/known reference is a failure.
+    """
+    raw = os.environ.get("DEVBENCH_MESH_FIXTURE")
+    if raw is None:
+        pytest.skip("mesh capability NOT QUALIFIED: DEVBENCH_MESH_FIXTURE known-positive fixture absent")
+    assert len(raw) <= 4096, "mesh fixture must be a small JSON identity contract"
+    fixture = json.loads(raw)
+    assert isinstance(fixture, dict), fixture
+    for field in ("formId", "model", "cellFormId"):
+        assert isinstance(fixture.get(field), str) and fixture[field], (field, fixture)
+    assert type(fixture.get("pid")) is int and fixture["pid"] > 0, fixture
+    assert type(fixture.get("vr")) is bool, fixture
+    url = os.environ.get("DEVBENCH_URL", "").rstrip("/")
+    parts = urlsplit(url)
+    assert (parts.scheme == "http" and parts.hostname in {"localhost", "127.0.0.1", "::1"}
+            and parts.port is not None and parts.path == "" and not parts.query and not parts.fragment
+            and parts.username is None and parts.password is None), "explicit loopback DEVBENCH_URL required"
+    client = Client(url)
+    state = client.ok("inspect", {"kind": "state"})
+    assert state.get("plugin") == "devbench" and state.get("playerLoaded") is True, state
+    assert state.get("pid") == fixture["pid"] and state.get("vr") is fixture["vr"], state
+    assert state.get("port") == parts.port and isinstance(state.get("exe"), str) and state["exe"], state
+    binding = tuple(state.get(field) for field in ("pid", "port", "exe", "vr", "version"))
+
+    def call(args):
+        current = client.ok("inspect", {"kind": "state"})
+        assert current.get("playerLoaded") is True, current
+        assert tuple(current.get(field) for field in ("pid", "port", "exe", "vr", "version")) == binding, current
+        body = client.ok("inspect", {"kind": "refs", **args})
+        after = client.ok("inspect", {"kind": "state"})
+        assert tuple(after.get(field) for field in ("pid", "port", "exe", "vr", "version")) == binding, after
+        return body
+
+    return fixture, call
 
 
-@pytest.mark.requires_player
-def test_refs_model_filter(client, inspect):
-    require_enum(inspect, "kind", "refs")
-    unfiltered = client.ok("inspect", {"kind": "refs", "formType": "Static", "radius": 5000, "limit": 50})
-    with_model = next((r for r in unfiltered.get("refs", []) if r.get("model")), None)
-    if with_model is None:
-        pytest.skip("no static ref with a mesh path in range to filter on")
-    needle = with_model["model"].split("\\")[-1].split(".")[0][:6].lower()
-    body = client.ok("inspect", {"kind": "refs", "model": needle, "radius": 5000, "limit": 50})
+def test_refs_enumerate_reports_cell_and_model(mesh_qualification):
+    fixture, call = mesh_qualification
+    body = call({"formId": fixture["formId"]})
     refs = body.get("refs")
-    assert isinstance(refs, list) and refs, body
+    assert isinstance(refs, list) and len(refs) == 1, body
+    ref = refs[0]
+    assert int(ref["formId"], 16) == int(fixture["formId"], 16), ref
+    assert isinstance(ref.get("model"), str) and ref["model"].lower() == fixture["model"].lower(), ref
+    assert isinstance(ref.get("cell"), dict), ref
+    assert int(ref["cell"]["formId"], 16) == int(fixture["cellFormId"], 16), ref
+    bounds = ref.get("bounds")
+    assert isinstance(bounds, dict), ref
+    for field in ("min", "max"):
+        values = bounds.get(field)
+        assert isinstance(values, list) and len(values) == 3, bounds
+        assert all(_is_number(value) and math.isfinite(value) for value in values), bounds
+    assert all(lo <= hi for lo, hi in zip(bounds["min"], bounds["max"])), bounds
+    assert any(lo < hi for lo, hi in zip(bounds["min"], bounds["max"])), bounds
+    # Enumerating must also publish the known fixture, not just the direct-ID path.
+    found = call({"model": fixture["model"], "limit": 1000})
+    assert found.get("truncated") is False, "choose a fixture with fewer than1000 model matches"
+    assert any(int(item["formId"], 16) == int(fixture["formId"], 16) for item in found.get("refs", [])), found
+
+
+def test_refs_model_filter(mesh_qualification):
+    fixture, call = mesh_qualification
+    needle = fixture["model"].swapcase()
+    body = call({"model": needle, "limit": 1000})
+    refs = body.get("refs")
+    assert isinstance(refs, list) and refs and body.get("truncated") is False, body
+    assert any(int(ref["formId"], 16) == int(fixture["formId"], 16) for ref in refs), body
     for ref in refs:
-        assert needle in ref.get("model", "").lower(), ref
+        assert isinstance(ref.get("model"), str) and needle.lower() in ref["model"].lower(), ref
+    missing = call({"model": f"__devbench_no_match_{uuid.uuid4().hex}__", "limit": 1})
+    assert missing.get("refs") == [] and missing.get("count") == 0, missing
 
 
 @pytest.mark.requires_player
