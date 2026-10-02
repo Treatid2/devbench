@@ -3,6 +3,7 @@
 #include "EventBus.h"
 #include "GameClock.h"
 #include "GameState.h"
+#include "KeyboardButtonEvent.h"
 #include "KeyboardInputState.h"
 #include "MainThread.h"
 #include "MainThreadTask.h"
@@ -31,9 +32,6 @@ namespace dvb
 	namespace
 	{
 		using namespace std::chrono;
-
-		// Keyboard button events have no VR wand association.
-		constexpr std::int32_t kKeyboardNoWandIndex = -1;
 
 		constexpr int         kKeyboardContractVersion = 1;
 		constexpr int         kDefaultTapMs = 50;
@@ -150,7 +148,7 @@ namespace dvb
 				}
 				if (!queued) {
 					const float heldSecs = HeldDownSeconds(key.pressedAtGameMs, gameNow);
-					queue->AddButtonEvent(RE::INPUT_DEVICE::kKeyboard, kKeyboardNoWandIndex, key.scancode, 1.0F, heldSecs);
+					EnqueueKeyboardButton(*queue, RE::INPUT_DEVICE::kKeyboard, key.scancode, true, heldSecs);
 				}
 			}
 		}
@@ -552,8 +550,8 @@ namespace dvb
 						if (g_repeatingKeys.empty())
 							DisengageForHold();
 					}
-					queue->AddButtonEvent(RE::INPUT_DEVICE::kKeyboard, kKeyboardNoWandIndex, a_lease.key.scancode,
-						a_down ? 1.0F : 0.0F, a_down ? 0.0F : a_heldSecs);
+					EnqueueKeyboardButton(*queue, RE::INPUT_DEVICE::kKeyboard, a_lease.key.scancode,
+						a_down, a_down ? 0.0F : a_heldSecs);
 					return json{ { "frame", game::CurrentFrame() } };
 				});
 				if (completion.wait_for(milliseconds(0)) != std::future_status::ready)
