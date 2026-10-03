@@ -11,6 +11,7 @@
 #include "FreeCamera.h"
 #include "GameEvents.h"
 #include "GameState.h"
+#include "HeldLightObservation.h"
 #include "HostApi.h"
 #include "HandObservation.h"
 #include "Json.h"
@@ -1035,24 +1036,17 @@ namespace dvb
 		{
 			json j = HandObservation::HandFields(a_observed.policy);
 			j["equipped"] = IdentifyForm(a_observed.equipped);
-			// Lights hung on what the hand holds (a weapon or staff light, an enchantment light), from both 3D trees, each
-			// with whether the renderer is using it: a light that is attached but not in the scene's active list lights nothing.
-			json        held = json::array();
-			std::size_t rendered = 0;
+			// Observe only the first conventional attachment node in each view tree.
+			// Keep occurrences and discovery limits; active/shadow membership is not visibility.
+			HeldLightObservation held;
+			const char* nodeName = ConventionalHeldNodeName(a_left);
 			for (const bool firstPerson : { false, true }) {
 				auto* root = a_actor->Get3D(firstPerson);
-				auto* node = root ? root->GetObjectByName(a_left ? "SHIELD" : "WEAPON") : nullptr;
-				if (!node)
-					continue;
-				for (auto& light : LightsUnder(node, a_active)) {
-					light["view"] = firstPerson ? "firstPerson" : "thirdPerson";
-					if (light.value("inScene", json(false)) != json(false))
-						++rendered;
-					held.push_back(std::move(light));
-				}
+				auto* node = root ? root->GetObjectByName(nodeName) : nullptr;
+				held.AddView(firstPerson ? "firstPerson" : "thirdPerson", nodeName,
+					root != nullptr, node != nullptr, node ? LightsUnder(node, a_active) : json::array());
 			}
-			j["heldLights"] = std::move(held);
-			j["heldLightsRendered"] = rendered;
+			std::move(held).WriteTo(j);
 			auto* caster = a_observed.caster;
 			if (!caster) {
 				j["caster"] = nullptr;
@@ -2676,7 +2670,12 @@ namespace dvb
 				"weaponStateSettledDrawn (exact kDrawn with 3D), allSpellArtObserved, handsArtObserved, "
 				"castingArtReady (deprecated allSpellArtObserved alias), visibleSpellArtProven:false, "
 				"left/right:{equipped, spellArtObserved, currentSpellMatchesEquipped (boolean or null), "
-				"heldLights, heldLightsRendered, caster:null|{state, stateValue, currentSpell, "
+				"heldLightObservationVersion:2, heldLights (view occurrences), "
+				"heldLightEntriesInScene (active/shadow entry count, not unique or visible), "
+				"heldLightCoverage (per-view rootAvailable/searchedNode/nodeFound; first conventional SHIELD/WEAPON only, "
+				"depth-limited without completeness proof), visibleIlluminationProven:false, "
+				"heldLightsRendered (deprecated entry-count alias), heldLightsRenderedSemantics, "
+				"caster:null|{state, stateValue, currentSpell, "
 				"castingArt, castingArtAttached, castingArtLoading, magicNode, light}}} }; "
 				"spellArtObserved requires an equipped spell, caster/art present, attached flag, no clone task, "
 				"and equal equipped/current spell pointers; this does not identify attached art or prove "
