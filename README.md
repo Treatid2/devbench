@@ -215,6 +215,47 @@ All tools are reachable over both MCP (`tools/call`) and REST (`POST /api/tool/<
 
 Other mods add their own tools via the C ABI (see [Use devbench from your mod](#use-devbench-from-your-mod)).
 
+`inspect kind=player` also returns `hands`, described below, in addition to the
+actor values and equipped forms listed in the table.
+
+## Hand observations
+
+The version-2 `hands` object is a main-thread observation, **not a capture-ready
+postcondition**. It returns `artObservationVersion`, `has3D`, `weaponDrawn`
+(the engine's `IsWeaponDrawn`), `weaponState`, `weaponStateSettledDrawn` (3D present
+and exact `kDrawn`), `allSpellArtObserved`, `handsArtObserved`, the deprecated
+`castingArtReady` alias for `allSpellArtObserved`, and `visibleSpellArtProven:false`.
+`weaponDrawn` and `weaponState` are omitted if actor-state is unavailable.
+
+Each `left`/`right` hand returns `equipped`, `spellArtObserved`,
+`currentSpellMatchesEquipped` (an observed pointer comparison, or null when no
+spell/caster is available), and the existing `heldLights`/`heldLightsRendered`
+observations. `caster` is null when absent; otherwise it returns `state`,
+`stateValue`, `currentSpell`, `castingArt`, `castingArtAttached`, `castingArtLoading`,
+`magicNode` (name or null), and `light` (description or null). Form identities are
+null when absent. Held-light observations retain their separate coverage limits;
+they are not proof of visible illumination.
+
+`spellArtObserved` requires an equipped spell, a caster and art pointer, an attached
+flag, no pending clone task, and equal equipped/current spell pointers.
+`allSpellArtObserved` requires that policy for each spell hand (non-spell hands are
+vacuously satisfied). `handsArtObserved` additionally requires 3D and exact settled
+drawn state. These checks reject observed loading and spell-pointer mismatch, but
+neither equality nor a generic attached flag proves which art is attached or that
+the renderer has displayed it. No SE/AE/VR spell-transition readiness invariant is
+claimed. In particular, `currentSpell` may legitimately differ in some engine
+states: this conservative diagnostic then remains false rather than guessing.
+
+Scenario hand conditions require player 3D and use the same observation policy:
+`weaponStateSettledDrawn`, `handsArtObserved`, `castingArtAttachedLeft` and
+`castingArtAttachedRight`. The last two test only the raw caster-attached flag,
+without a spell identity or loading guarantee. Deprecated aliases remain:
+`weaponDrawn` means `weaponStateSettledDrawn` in scenarios (not inspection's broader
+`IsWeaponDrawn`); `handsReady` means `handsArtObserved`; `castingArtLeft` and
+`castingArtRight` mean the corresponding raw attached-flag conditions. The legacy
+ready names no longer carry a capture-readiness promise. Runtime acceptance of a
+stronger purpose-specific gate belongs to the requesting task.
+
 ## Record, replay, and autorun
 
 Keyboard actions emit button events with the engine's signed no-wand value (`-1`)
@@ -362,7 +403,7 @@ POST /api/tool/scenario          // MCP: tools/call name=scenario — identical 
 `{ "topic": "...", "match": { ... } }`. Add `repeat` (≤1000) to loop the list and
 `continueOnError` to keep going past a failed step.
 
-`waitUntil` conditions: `playerLoaded`, `noModal`, `noMenu`, `noBlockingMenu`, and for the player's hands `weaponDrawn`, `castingArtLeft`, `castingArtRight`, `handsReady` (drawn, and every hand holding a spell has its casting art attached). A spell readied by script (`EquipSpell` + `DrawWeapon`) shows its hand art only after the draw animation finishes and the art model loads in the background, so wait on `handsReady` before a `capture`.
+`waitUntil` conditions: `playerLoaded`, `noModal`, `noMenu`, `noBlockingMenu`, and the player's hand observations `weaponStateSettledDrawn`, `castingArtAttachedLeft`, `castingArtAttachedRight`, `handsArtObserved`. Deprecated `weaponDrawn`, `castingArtLeft`, `castingArtRight`, `handsReady` aliases remain as described in [Hand observations](#hand-observations). None proves spell-art render/capture readiness; do not use it alone to certify a spell-switch capture.
 
 **Steps dispatch any registered tool — including tools other mods add over the C ABI.** A
 consumer mod such as [Open Shaders](https://github.com/alandtse/open-shaders) (a fork of

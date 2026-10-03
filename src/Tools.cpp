@@ -12,6 +12,7 @@
 #include "GameEvents.h"
 #include "GameState.h"
 #include "HostApi.h"
+#include "HandObservation.h"
 #include "Json.h"
 #include "KeyboardInput.h"
 #include "MainThread.h"
@@ -1003,19 +1004,37 @@ namespace dvb
 			return a_actor->GetActorRuntimeData().magicCasters[a_left ? RE::Actor::SlotTypes::kLeftHand : RE::Actor::SlotTypes::kRightHand];
 		}
 
-		// True when the hand holds a spell whose casting art is attached, or holds no spell.
-		bool HandArtReady(RE::Actor* a_actor, bool a_left)
+		struct EngineHandObservation
 		{
-			auto* equipped = a_actor->GetEquippedObject(a_left);
-			if (!equipped || !equipped->Is(RE::FormType::Spell))
-				return true;
-			auto* caster = HandCaster(a_actor, a_left);
-			return caster && caster->flags.any(RE::ActorMagicCaster::Flags::kCastingArtAttached);
+			HandObservation::Hand policy;
+			RE::TESForm* equipped = nullptr;
+			RE::TESForm* currentSpell = nullptr;
+			RE::TESForm* castingArt = nullptr;
+			RE::ActorMagicCaster* caster = nullptr;
+		};
+
+		EngineHandObservation ReadHand(RE::Actor* a_actor, bool a_left)
+		{
+			EngineHandObservation out;
+			out.equipped = a_actor->GetEquippedObject(a_left);
+			out.caster = HandCaster(a_actor, a_left);
+			out.policy.spellEquipped = out.equipped && out.equipped->Is(RE::FormType::Spell);
+			if (out.caster) {
+				out.currentSpell = out.caster->currentSpell;
+				out.castingArt = out.caster->castingArt;
+				out.policy.casterPresent = true;
+				out.policy.artPresent = out.castingArt != nullptr;
+				out.policy.attached = out.caster->flags.any(RE::ActorMagicCaster::Flags::kCastingArtAttached);
+				out.policy.loading = out.caster->cloneTask.get() != nullptr;
+				out.policy.currentSpellMatchesEquipped = out.policy.spellEquipped && out.currentSpell == out.equipped;
+			}
+			return out;
 		}
 
-		json DescribeHand(RE::Actor* a_actor, bool a_left, const ActiveLightIndex& a_active)
+		json DescribeHand(RE::Actor* a_actor, bool a_left, const EngineHandObservation& a_observed, const ActiveLightIndex& a_active)
 		{
-			json j{ { "equipped", IdentifyForm(a_actor->GetEquippedObject(a_left)) } };
+			json j = HandObservation::HandFields(a_observed.policy);
+			j["equipped"] = IdentifyForm(a_observed.equipped);
 			// Lights hung on what the hand holds (a weapon or staff light, an enchantment light), from both 3D trees, each
 			// with whether the renderer is using it: a light that is attached but not in the scene's active list lights nothing.
 			json        held = json::array();
@@ -1034,7 +1053,7 @@ namespace dvb
 			}
 			j["heldLights"] = std::move(held);
 			j["heldLightsRendered"] = rendered;
-			auto* caster = HandCaster(a_actor, a_left);
+			auto* caster = a_observed.caster;
 			if (!caster) {
 				j["caster"] = nullptr;
 				return j;
@@ -1042,10 +1061,10 @@ namespace dvb
 			json c{
 				{ "state", CasterStateName(caster->state.get()) },
 				{ "stateValue", caster->state.underlying() },
-				{ "currentSpell", IdentifyForm(caster->currentSpell) },
-				{ "castingArt", IdentifyForm(caster->castingArt) },
-				{ "castingArtAttached", caster->flags.any(RE::ActorMagicCaster::Flags::kCastingArtAttached) },
-				{ "castingArtLoading", caster->cloneTask.get() != nullptr },
+				{ "currentSpell", IdentifyForm(a_observed.currentSpell) },
+				{ "castingArt", IdentifyForm(a_observed.castingArt) },
+				{ "castingArtAttached", a_observed.policy.attached },
+				{ "castingArtLoading", a_observed.policy.loading },
 				{ "magicNode", caster->magicNode && caster->magicNode->name.c_str() ? json(caster->magicNode->name.c_str()) : json(nullptr) },
 			};
 			// The hand light the engine gives a readied spell (its magic effect's casting light).
@@ -1059,16 +1078,19 @@ namespace dvb
 
 		json DescribeHands(RE::Actor* a_actor)
 		{
+			const auto left = ReadHand(a_actor, true);
+			const auto right = ReadHand(a_actor, false);
+			auto* state = a_actor->AsActorState();
+			const auto weaponState = state ? std::optional(state->GetWeaponState()) : std::nullopt;
+			const HandObservation::Hands observed{ a_actor->Get3D() != nullptr, weaponState && *weaponState == RE::WEAPON_STATE::kDrawn, left.policy, right.policy };
 			const auto active = IndexActiveLights();
-			json       j{
-				{ "left", DescribeHand(a_actor, true, active) },
-				{ "right", DescribeHand(a_actor, false, active) },
-			};
-			if (auto* state = a_actor->AsActorState()) {
+			json j = HandObservation::HandsFields(observed);
+			j["left"] = DescribeHand(a_actor, true, left, active);
+			j["right"] = DescribeHand(a_actor, false, right, active);
+			if (state) {
 				j["weaponDrawn"] = state->IsWeaponDrawn();
-				j["weaponState"] = WeaponStateName(state->GetWeaponState());
+				j["weaponState"] = WeaponStateName(*weaponState);
 			}
-			j["castingArtReady"] = HandArtReady(a_actor, true) && HandArtReady(a_actor, false);
 			return j;
 		}
 
@@ -2102,7 +2124,7 @@ namespace dvb
 						return false;
 				return true;
 			}
-			if (a_cond == "weaponDrawn" || a_cond == "handsReady" || a_cond == "castingArtLeft" || a_cond == "castingArtRight") {
+			if (HandObservation::IsCondition(a_cond)) {
 				try {
 					const json r = MainThread::RunAndWait([a_cond]() -> json {
 						auto* pc = RE::PlayerCharacter::GetSingleton();
@@ -2110,12 +2132,9 @@ namespace dvb
 							return false;
 						auto*      state = pc->AsActorState();
 						const bool drawn = state && state->GetWeaponState() == RE::WEAPON_STATE::kDrawn;
-						if (a_cond == "weaponDrawn")
-							return drawn;
-						if (a_cond == "handsReady")
-							return drawn && HandArtReady(pc, true) && HandArtReady(pc, false);
-						auto* caster = HandCaster(pc, a_cond == "castingArtLeft");
-						return caster && caster->flags.any(RE::ActorMagicCaster::Flags::kCastingArtAttached);
+						const auto left = ReadHand(pc, true);
+						const auto right = ReadHand(pc, false);
+						return *HandObservation::Condition(a_cond, { true, drawn, left.policy, right.policy });
 					},
 						milliseconds(2000));
 					return r.get<bool>();
@@ -2127,7 +2146,7 @@ namespace dvb
 				return GetOpenMenus().empty();
 			if (a_cond == "noBlockingMenu")
 				return BlockingMenus().empty();
-			throw ToolError(400, std::format("unknown waitUntil condition '{}' (playerLoaded|noModal|noMenu|noBlockingMenu|weaponDrawn|handsReady|castingArtLeft|castingArtRight)", a_cond));
+			throw ToolError(400, std::format("unknown waitUntil condition '{}' (playerLoaded|noModal|noMenu|noBlockingMenu|weaponStateSettledDrawn|handsArtObserved|castingArtAttachedLeft|castingArtAttachedRight; deprecated aliases weaponDrawn|handsReady|castingArtLeft|castingArtRight)", a_cond));
 		}
 
 		// Caller must already know a_args["runId"] is present. A bare get<uint64_t>() on a
@@ -2653,9 +2672,17 @@ namespace dvb
 				"weather }; 'mods' → active load order { count, lightCount, total, plugins:[{index, name}], "
 				"lightPlugins:[…] }; 'player' → player snapshot { name, level, sex, gold, race, "
 				"actorValues:{health,magicka,stamina,carryWeight each {current,max}}, equipped:{right,left,ammo}, "
-				"hands:{weaponDrawn, weaponState, castingArtReady, left/right:{equipped, heldLights, heldLightsRendered, "
-				"caster:{state, currentSpell, "
-				"castingArt, castingArtAttached, castingArtLoading, light}}} }; "
+				"hands:{artObservationVersion:2, has3D, weaponDrawn (engine IsWeaponDrawn), weaponState, "
+				"weaponStateSettledDrawn (exact kDrawn with 3D), allSpellArtObserved, handsArtObserved, "
+				"castingArtReady (deprecated allSpellArtObserved alias), visibleSpellArtProven:false, "
+				"left/right:{equipped, spellArtObserved, currentSpellMatchesEquipped (boolean or null), "
+				"heldLights, heldLightsRendered, caster:null|{state, stateValue, currentSpell, "
+				"castingArt, castingArtAttached, castingArtLoading, magicNode, light}}} }; "
+				"spellArtObserved requires an equipped spell, caster/art present, attached flag, no clone task, "
+				"and equal equipped/current spell pointers; this does not identify attached art or prove "
+				"render/capture readiness. allSpellArtObserved is vacuously true for non-spell hands; "
+				"handsArtObserved additionally requires 3D and exact settled kDrawn. weaponDrawn/weaponState "
+				"are omitted when actor-state is unavailable. "
 				"'lights' → every NiLight under a reference's 3D (default the player: thirdPerson + firstPerson; "
 				"or 'formId' / 'selected') as {name, type, path, diffuse, radius, fade, fadeAmount, appCulled, "
 				"inScene:'active'|'shadow'|false, position}, plus an actor's hands (each hand's casting light); "
@@ -2942,10 +2969,14 @@ namespace dvb
 			"{\"waitFor\":<event>,…} block on a Skyrim EVENT — string shorthand "
 			"(\"postLoadGame\"/\"saveGame\"/\"newGame\"/\"preLoadGame\"/\"dataLoaded\"/\"deleteGame\", or "
 			"\"menuOpened\"/\"menuClosed\" with a \"name\"), or {\"topic\":\"…\",\"match\":{…}}; "
-			"{\"waitUntil\":\"playerLoaded\"|\"noModal\"|\"noMenu\"|\"noBlockingMenu\"|\"weaponDrawn\"|"
-			"\"castingArtLeft\"|\"castingArtRight\"|\"handsReady\"} poll live state (handsReady: weapon drawn "
-			"and every hand holding a spell shows its casting art — wait on it after EquipSpell + DrawWeapon "
-			"before a capture). "
+			"{\"waitUntil\":\"playerLoaded\"|\"noModal\"|\"noMenu\"|\"noBlockingMenu\"|\"weaponStateSettledDrawn\"|"
+			"\"castingArtAttachedLeft\"|\"castingArtAttachedRight\"|\"handsArtObserved\"} poll main-thread observations. "
+			"All hand waits require player 3D. weaponStateSettledDrawn requires exact kDrawn; castingArtAttachedLeft/Right test only a raw "
+			"caster-attached flag. handsArtObserved requires exact kDrawn and, for each spell hand, "
+			"caster/art present, attached, no pending clone, and equal current/equipped spell pointers. "
+			"These observations do NOT establish art identity or render/capture readiness. "
+			"Deprecated aliases weaponDrawn, castingArtLeft, castingArtRight and handsReady remain; scenario "
+			"weaponDrawn is the exact-state alias, unlike inspect hands.weaponDrawn (IsWeaponDrawn). "
 			"PREFER waitFor over a fixed wait — e.g. wait for postLoadGame to know a load truly "
 			"finished. Optional: repeat (≤1000), continueOnError, async. By default action='run' "
 			"BLOCKS the request for the run's duration and returns the transcript directly — the "
