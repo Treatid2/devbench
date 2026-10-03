@@ -55,6 +55,17 @@ def form_record(value) -> str:
     return form_id(value.get("formId"))
 
 
+def world_context(world, cell_id: str) -> tuple[str, str]:
+    """Select context from the native object-None or a concrete worldspace form."""
+    if world is None:
+        return "cell", form_id(cell_id)
+    if isinstance(world, dict) and "none" in world:
+        if set(world) == {"none"} and world["none"] is True:
+            return "cell", form_id(cell_id)
+        raise RuntimeError("malformed Papyrus null-object sentinel")
+    return "worldspace", form_record(world)
+
+
 def normalize_url(value: str) -> str:
     parts = urlsplit(value.strip())
     if (parts.scheme != "http" or parts.hostname not in {"localhost", "127.0.0.1", "::1"}
@@ -171,6 +182,53 @@ class BoundClient:
         return body["returned"]
 
 
+class MeshQualificationClient:
+    """Read-only state/refs qualification on one explicitly selected endpoint."""
+
+    def __init__(self, url: str, expected_pid: int, expected_vr: bool):
+        self.url = normalize_url(url)
+        if type(expected_pid) is not int or expected_pid <= 0 or type(expected_vr) is not bool:
+            raise RuntimeError("qualification requires a positive PID and Boolean runtime")
+        self.expected_pid, self.expected_vr = expected_pid, expected_vr
+        self.binding = None
+        self.last_frame = -1
+        self.state()
+
+    def _read(self, args: dict) -> dict:
+        endpoint = f"{self.url}/api/tool/inspect"
+        response = requests.post(endpoint, json=args, timeout=(1.0, 10.0), allow_redirects=False)
+        if response.status_code != 200:
+            raise RuntimeError(f"qualification HTTP {response.status_code}; no redirect/retry")
+        if not isinstance(response.url, str) or urlsplit(response.url) != urlsplit(endpoint):
+            raise RuntimeError("qualification response endpoint changed")
+        body = response.json()
+        if not isinstance(body, dict) or "error" in body:
+            raise RuntimeError("qualification returned malformed/error evidence")
+        return body
+
+    def state(self) -> dict:
+        current = self._read({"kind": "state"})
+        binding = identity(current)
+        if (binding[0] != self.expected_pid or binding[1] != urlsplit(self.url).port
+                or binding[3] is not self.expected_vr or current.get("playerLoaded") is not True):
+            raise RuntimeError("qualification instance/runtime/player does not match fixture")
+        if self.binding is not None and binding != self.binding:
+            raise RuntimeError("qualification instance changed")
+        frame = current.get("frame")
+        if type(frame) is not int or frame < 0 or frame < self.last_frame:
+            raise RuntimeError("qualification frame is missing or regressed")
+        self.binding, self.last_frame = binding, frame
+        return current
+
+    def refs(self, selector: dict) -> dict:
+        if not isinstance(selector, dict) or "kind" in selector:
+            raise RuntimeError("qualification selector must not override the read-only kind")
+        self.state()
+        body = self._read({"kind": "refs", **selector})
+        self.state()
+        return body
+
+
 def wait_until(client: BoundClient, label: str, condition) -> None:
     try:
         while True:
@@ -278,7 +336,7 @@ def run(args) -> None:
                                "native fallback is always inconclusive, so stop before movement")
         cell_id = form_record(target.get("cell"))
         world = client.papyrus("GetWorldSpace", [], target_id)
-        context_key, context_id = ("cell", cell_id) if world is None else ("worldspace", form_record(world))
+        context_key, context_id = world_context(world, cell_id)
         camera = client.call("camera", {"action": "get"})
         if camera.get("freeCam") is not False or camera.get("orbit") is True:
             raise RuntimeError("free camera/orbit active or unavailable; do not take over another camera owner")

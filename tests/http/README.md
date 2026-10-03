@@ -56,6 +56,13 @@ model path has fewer than 1000 loaded matches so positive membership can be
 proved without truncation; test evidence should retain fixture and producer
 identities, pass/failure/skip counts and source/artifact boundaries.
 
+The qualification client rejects HTTP redirects and an effective response
+endpoint different from the selected URL. It requires typed nonempty version
+and executable identity, the expected PID/runtime/port and a loaded player,
+and nonregressing integer game frames at its initial and pre/post-reference
+state reads. Requests use bounded socket timeouts without retries; these are
+not hard server-task cancellation or arbitrary response-streaming deadlines.
+
 `examples/goto_mesh.py` is a separate **manual mutating example**, not this
 qualification and not part of CI. It defaults to inspection only. `--apply`
 requires an explicit `DEVBENCH_URL` or `--port` and ownership of the loaded
@@ -81,6 +88,10 @@ The default height offset is zero for player feet; the camera already supplies
 eye height. `--height-offset` makes a fixture-specific adjustment explicit.
 If collision/terrain/physics prevent the requested position being stable within
 two game units, verification fails rather than silently capturing another pose.
+Interior context accepts the native Papyrus object-None representation
+`{"none":true}` (or JSON null); exterior context requires a concrete worldspace
+form. Malformed/contradictory None objects fail before movement. No general
+Papyrus coercion or native serialization change is implied.
 
 Host-independent fake-HTTP/clock recipe checks live separately under
 `tests/unit/test_goto_mesh.py` and can be run by a receiving task without a game:
@@ -88,6 +99,11 @@ Host-independent fake-HTTP/clock recipe checks live separately under
 ```sh
 pytest tests/unit/test_goto_mesh.py -q
 ```
+
+The fake-response matrix includes native interior-None and exterior contexts,
+rejection before mutation, redirect/endpoint drift, malformed initial identity,
+instance replacement and pre/post-reference frame regression. These source
+cases do not attest that assertions or live qualification have been executed.
 
 Source inspection or a compiled native DLL does not claim these assertions or
 the HTTP/example qualification passed. No native rebuild is required merely to
