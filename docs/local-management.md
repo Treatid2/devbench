@@ -32,15 +32,33 @@ continues to own requirements and runtime feedback.
 
 ## Two delivery lanes
 
-Feature branches stay focused and retain original handoff identities. Changes
-to reviewed fork `main` use PRs, automatic review and correction until pass.
+Feature branches stay focused and retain original handoff identities. Our own
+changes to reviewed fork `main` use local PRs against the fork head, automatic
+review and correction until pass. Experimental integration supports requester
+use and live testing before that pass; it is not reviewed-head promotion.
 Evaluate findings, bind the verdict to the exact reviewed commit, and complete
 the review transaction before promotion. Submit reviewed, tested changes
-upstream with accurate compile and requester-test evidence. No pass, successful
+upstream after rebasing onto the current upstream head, with accurate compile
+and requester-test evidence. A substantive rebase/conflict-resolution change
+requires proportionate checking and a fresh focused review of the changed
+source; an old pass does not cover different code. No pass, successful
 compile or upstream submission implies runtime acceptance or upstream merge.
 
-Reasonable trust in upstream permits experimental integration; it is not an
-automatic-review verdict. Product changes promoted to reviewed fork main must
+Upstream `main` is a trusted baseline. Synchronize its accepted history without
+another code-review cycle or redundant compilation/runtime testing. Before
+updating refs, verify current tips and ancestry and retain the previous head.
+If our main has unique changes, compare only those changes with the corresponding
+upstream implementation, retain the better-supported behavior and preserve
+review provenance. Do not reset or replace the experimental integration.
+
+Do not import an unmerged upstream PR unless the human explicitly directs it.
+The six already-downloaded PRs (105, 106, 107, 109, 110 and 111) are a finite
+grandfathered inventory: continue their local correction/review cycles as our
+work. This exception grants no authority to fetch and integrate other PRs.
+Post concise source-supported suggestions from those reviews on the relevant
+upstream PR, distinguishing proposed/implemented/passed changes and avoiding
+duplicate findings. Suggestions need not await a correction pass; publication
+of our correction code still does. Product changes promoted to reviewed fork main must
 also be represented in upstream main or a PR against it. Reconcile existing
 upstream PR coverage before creating duplicates. Local-only governance docs
 remain on their management branch until their upstream-coverage disposition
@@ -57,8 +75,8 @@ submissions stop without losing existing reports or correction work.
 
 Submit one focused PR or bite-size local equivalent per review; do not bundle
 independent reviews. A transport ZIP containing one scope and its necessary
-context/evidence is not an aggregate review. Split broad baseline-adoption work
-into bounded source scopes before submission. Evaluate findings as guidance to
+context/evidence is not an aggregate review. Trusted upstream baseline adoption
+does not enter this review queue. Evaluate findings as guidance to
 improve maintainability, clarity, design, robustness and correctness, not merely
 as bugs to fix or a checklist to silence. Record accepted improvements and
 reasoned dispositions, verify proportionately, and continue authorised cycles
@@ -85,6 +103,19 @@ At custody transfer on 2026-09-30 the integration was
 105, 106, 107, 109, 110 and 111. Its historical composition receipt is
 `L:\Codex\artifacts\devbench\integration\compositions\a1c00560e6bd922470f5e43c3946a2edf6e274f7.json`.
 This is provenance, not a permanently current head or reviewed status.
+
+Keep three inventory classes separate: trusted upstream baseline, explicitly
+imported unmerged upstream PRs, and our own changes. Historical inventory labels
+and review verdicts remain immutable evidence, not permission to import more
+upstream work or imply that imported PRs were our passed outbound submissions.
+The human approved this workflow correction on 2026-10-03. Local and remote
+fork main were fast-forwarded from f3e6a1a4958d733b11d7da17e41cc1dc7aa097d8
+to upstream 32823e465c18a676afc9048ac948aa22a616abd0 (39 accepted commits,
+zero fork-only main commits). GitHub marked baseline PR1 MERGED at that exact
+head; no baseline review was required. Experimental integration remained
+9e8ee3d04f2acca29c3378f9e03c138e15e8babe. These are dated receipts, not
+permanently current tips. Governance documentation remains on local management
+branches, outside product main and upstream publication.
 
 ## Compile without redundant testing
 
