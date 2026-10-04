@@ -80,7 +80,13 @@ same-generation rate storage. Server stop requests pump cleanup; process crash,
 forced termination or DLL unload cannot promise a restoration receipt.
 
 Failed restoration stays tracked for an explicit matching release; the pump
-does not enter an unbounded retry loop. A not-yet-started queued request is
+and repeated cleanup events do not enter an automatic retry loop. A failed
+save/loading-menu/pre-load/service-stop cleanup does not silently retire
+uncertain custody. Unavailable readback is uncertainty, not proven source
+replacement. Retry needs the same owner/session/lease and a still-matching
+identified source; an actual new-load generation invalidates old custody
+without writing its baseline into the new globals. Retention cannot make a
+stopped endpoint, stalled thread or superseded load releasable. A not-yet-started queued request is
 abandoned at its deadline. An already-started call may complete late; the
 receipt says so, and any resulting hold has a finite deadline and owner/command
 identity. Reconcile with status rather than blindly replay an ambiguous hold.
@@ -95,7 +101,10 @@ all mods or weather/lighting transitions are invariant. Preserve those nuisances
 and use the existing CSX weather snapshot and renderer probes independently.
 
 **Do not save during a hold.** DevBench save admission/calendar-jump entry points
-refuse observed outstanding custody; this is not an interception of a save
+(`game.advanceTime`, `wait`, `sleep`) refuse observed outstanding custody,
+including unverified cleanup. Wait/sleep check before queueing and again on
+the main thread before entering their engine path, returning 409 without
+starting their wait/sleep ticks. This is not an interception of a save
 already queued in the VM or every engine/Papyrus/third-
 party save or calendar writer. A save event ends the hold best-effort, but event
 ordering does not certify that a save never serialized a zero calendar rate.

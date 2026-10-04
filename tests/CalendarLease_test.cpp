@@ -1,5 +1,6 @@
 #include "test_framework.h"
 
+#include "CalendarAdmission.h"
 #include "CalendarLease.h"
 #include "CalendarProtocol.h"
 #include "MainThreadTask.h"
@@ -13,7 +14,7 @@ namespace
 	struct FakeBackend final : Backend
 	{
 		Snapshot snapshot;
-		int writes = 0;
+		int writes = 0, writeAttempts = 0;
 		bool failWrite = false, hideAfterWrite = false, nextReadUnavailable = false;
 
 		FakeBackend()
@@ -36,6 +37,7 @@ namespace
 		}
 		bool WriteRate(const Snapshot& a_expected, float a_rate) override
 		{
+			++writeAttempts;
 			if (failWrite || !snapshot.source.SameStorage(a_expected.source) || snapshot.rate != a_expected.rate)
 				return false;
 			++writes;
@@ -236,6 +238,154 @@ TEST_CASE("calendar failed restore requires explicit release not an automatic re
 	CHECK(f.backend.snapshot.rate == 0);
 	CHECK(f.Release().restored);
 	CHECK(f.backend.snapshot.rate == 20);
+}
+
+TEST_CASE("calendar failed lifecycle cleanup retains exact explicit retry custody")
+{
+	for (const auto* reason : { "unsupported_save_event", "loading_menu", "service_stop", "pre_load" }) {
+		Fixture f;
+		CHECK(f.Hold().ok);
+		const auto owned = *f.controller.Current();
+		f.backend.failWrite = true;
+		CHECK(!f.controller.End(reason, true).restored);
+		CHECK(f.controller.Result().code == "restore_failed_requires_explicit_release");
+		CHECK(f.controller.Current()->id == owned.id);
+		CHECK(f.controller.Current()->owner == owned.owner);
+		CHECK(f.controller.Current()->connection == owned.connection);
+		CHECK(f.controller.Current()->baseline.source == owned.baseline.source);
+		CHECK(!f.controller.NeedsPump());
+		CHECK(f.backend.snapshot.rate == 0);
+		CHECK(!f.Release("other").ok);
+		CHECK(!f.Release("mapping", "mcp:other").ok);
+		f.backend.failWrite = false;
+		const auto attempts = f.backend.writeAttempts;
+		f.controller.Tick(1000);
+		f.controller.End(reason, true);
+		CHECK(f.backend.writeAttempts == attempts);
+		CHECK(f.controller.Current().has_value());
+		CHECK(f.Release().restored);
+		CHECK(f.backend.snapshot.rate == 20);
+		CHECK(!f.controller.Current());
+	}
+}
+
+TEST_CASE("calendar unavailable cleanup readback retains uncertainty without writing")
+{
+	for (const bool lifecycle : { false, true }) {
+		Fixture f;
+		CHECK(f.Hold().ok);
+		f.backend.snapshot.available = false;
+		const auto attempts = f.backend.writeAttempts;
+		const auto result = lifecycle ? f.controller.End("loading_menu", true) : f.controller.Tick(110);
+		CHECK(result.code == "restore_failed_requires_explicit_release");
+		CHECK(f.controller.Current().has_value());
+		CHECK(!f.controller.NeedsPump());
+		CHECK(f.backend.writeAttempts == attempts);
+		f.backend.snapshot.available = true;
+		CHECK(f.Release().restored);
+		CHECK(f.backend.snapshot.rate == 20);
+	}
+}
+
+TEST_CASE("calendar unverified lifecycle restore does not claim success or replay writes")
+{
+	Fixture f;
+	CHECK(f.Hold().ok);
+	f.backend.hideAfterWrite = true;
+	CHECK(!f.controller.End("unsupported_save_event", true).restored);
+	CHECK(f.controller.Current().has_value());
+	CHECK(f.controller.Result().code == "restore_failed_requires_explicit_release");
+	CHECK(f.backend.snapshot.rate == 20);
+	const auto attempts = f.backend.writeAttempts;
+	f.controller.End("unsupported_save_event", true);
+	CHECK(f.backend.writeAttempts == attempts);
+	// Observing a nonzero rate later cannot attribute it to our earlier write.
+	CHECK(!f.Release().restored);
+	CHECK(f.controller.Result().code == "external_rate_write_without_restore");
+	CHECK(!f.controller.Current());
+	CHECK(f.backend.writeAttempts == attempts);
+}
+
+TEST_CASE("calendar allowed lifecycle cleanup retires only proven invalidation")
+{
+	for (const bool storageChanged : { false, true }) {
+		Fixture f;
+		CHECK(f.Hold().ok);
+		if (storageChanged)
+			++f.backend.snapshot.source.generation;
+		else
+			f.backend.snapshot.rate = 7;
+		const auto attempts = f.backend.writeAttempts;
+		CHECK(!f.controller.End("pre_load", true).restored);
+		CHECK(!f.controller.Current());
+		CHECK(f.backend.writeAttempts == attempts);
+	}
+}
+
+TEST_CASE("calendar wait and sleep admission refuses active and failed cleanup custody")
+{
+	for (const bool sleep : { false, true }) {
+		Fixture f;
+		CHECK(f.Hold().ok);
+		int queued = 0, started = 0, ticks = 0;
+		auto invoke = [&]() {
+			RequireIdle(f.controller.Current().has_value());
+			++queued;
+			RequireIdle(f.controller.Current().has_value());
+			++started;
+			++ticks;
+			return sleep;
+		};
+		try { invoke(); CHECK(false); }
+		catch (const dvb::ToolError& error) { CHECK(error.code == 409); }
+		CHECK(queued == 0 && started == 0 && ticks == 0);
+		f.backend.failWrite = true;
+		f.controller.End("loading_menu", true);
+		CHECK_THROWS_AS(invoke(), dvb::ToolError);
+		CHECK(queued == 0 && started == 0 && ticks == 0);
+		f.backend.failWrite = false;
+		CHECK(f.Release().restored);
+		CHECK(invoke() == sleep);
+		CHECK(queued == 1 && started == 1 && ticks == 1);
+	}
+}
+
+TEST_CASE("calendar queued wait and sleep recheck a hold admitted after listener check")
+{
+	for (const bool sleep : { false, true }) {
+		Fixture f;
+		int started = 0, ticks = 0;
+		RequireIdle(f.controller.Current().has_value());
+		const auto start = dvb::MainThread::QueuedTask::Clock::now();
+		dvb::MainThread::QueuedTask task([&]() -> dvb::json {
+			RequireIdle(f.controller.Current().has_value());
+			++started;
+			++ticks;
+			return sleep;
+		}, start + std::chrono::seconds(1));
+		auto future = task.GetFuture();
+		CHECK(f.Hold().ok);
+		task.Run(start);
+		CHECK_THROWS_AS(future.get(), dvb::ToolError);
+		CHECK(started == 0 && ticks == 0);
+		CHECK(f.backend.snapshot.rate == 0);
+	}
+}
+
+TEST_CASE("calendar wait and sleep admission resumes after verified expiry")
+{
+	for (const bool sleep : { false, true }) {
+		Fixture f;
+		CHECK(f.Hold().ok);
+		CHECK(f.controller.Tick(110).restored);
+		int ticks = 0;
+		RequireIdle(f.controller.Current().has_value());
+		RequireIdle(f.controller.Current().has_value());
+		++ticks;
+		CHECK(ticks == 1);
+		CHECK(f.backend.snapshot.rate == 20);
+		(void)sleep;
+	}
 }
 
 TEST_CASE("calendar abandoned queued invocation never applies a hold")

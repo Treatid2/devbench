@@ -739,7 +739,7 @@
     },
     {
       "name": "wait",
-      "description": "Advance time by waiting `hours`, synchronously and without touching the Wait menu's UI at all: starts the wait, then drives its completion (autosave, script events) to done before returning — no polling needed. Refuses with { completed:false, reason } on the same gate the menu itself enforces (combat, trespassing, midair, hostiles nearby, etc.).",
+      "description": "Advance time by waiting `hours`, synchronously and without touching the Wait menu's UI at all: starts the wait, then drives its completion (autosave, script events) to done before returning — no polling needed. Refuses with { completed:false, reason } on the same gate the menu itself enforces (combat, trespassing, midair, hostiles nearby, etc.). Refused with 409 while calendar custody is outstanding, including unverified cleanup.",
       "inputSchema": {
         "properties": {
           "hours": {
@@ -755,7 +755,7 @@
     },
     {
       "name": "sleep",
-      "description": "Advance time by sleeping `hours` (the rest variant — drives the well-rested / lover's-comfort bonus). Same mechanics as `wait`: synchronous, no menu UI, refuses with { completed:false, reason } on the same gate the menu enforces.",
+      "description": "Advance time by sleeping `hours` (the rest variant — drives the well-rested / lover's-comfort bonus). Same mechanics as `wait`: synchronous, no menu UI, refuses with { completed:false, reason } on the same gate the menu enforces. Refused with 409 while calendar custody is outstanding, including unverified cleanup.",
       "inputSchema": {
         "properties": {
           "hours": {
