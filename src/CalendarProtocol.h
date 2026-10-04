@@ -36,7 +36,7 @@ namespace dvb::CalendarControl
 			    a_args[field].get_ref<const std::string&>().size() > 128)
 				throw ToolError(400, std::format("calendar requires {} (1..128 characters)", field));
 		if (!a_args.contains("binding") || !a_args["binding"].is_object())
-			throw ToolError(400, "calendar requires the exact status binding object");
+			throw ToolError(400, "calendar requires the exact status (hold) or retained lease (release) binding object");
 		r.binding = a_args["binding"];
 		if (r.binding.size() != 5 || !r.binding.contains("processSession") || !r.binding["processSession"].is_string() ||
 		    r.binding["processSession"].get_ref<const std::string&>().empty() ||
@@ -68,12 +68,46 @@ namespace dvb::CalendarControl
 		return r;
 	}
 
+	inline json SourceBinding(const Source& a_source, std::uint32_t a_pid)
+	{
+		return json{ { "processSession", a_source.processSession }, { "pid", a_pid },
+			{ "loadGeneration", a_source.generation }, { "cellFormId", a_source.cell },
+			{ "globalFormIds", a_source.forms } };
+	}
+
+	// Shared native/host admission policy. A release validates retained custody,
+	// not the current scene. Controller::Restore independently re-reads SameStorage
+	// and the owned-zero rate before writing; scene drift never relaxes those guards.
+	inline Outcome ExecuteRequest(const Request& a_request, Controller& a_controller,
+		const Snapshot& a_current, std::uint32_t a_pid, const std::string& a_connection,
+		std::int64_t a_now, std::int64_t a_applyDeadline, bool a_stopping)
+	{
+		if (a_request.action == "status")
+			return { true, "observed", false };
+		if (a_stopping)
+			return { false, "service_stopping", false };
+		if (a_request.action == "hold") {
+			if (a_request.binding != SourceBinding(a_current.source, a_pid))
+				return { false, "binding_mismatch", false };
+			return a_controller.Hold(a_current.source, a_request.owner, a_connection,
+				a_request.command, a_now, a_request.duration, a_applyDeadline);
+		}
+		const auto& selected = a_controller.Current() ? a_controller.Current() : a_controller.Last();
+		if (!selected)
+			return { false, "wrong_owner_or_lease", false };
+		if (a_request.binding != SourceBinding(selected->baseline.source, a_pid))
+			return { false, "binding_mismatch", false };
+		return a_controller.Release(selected->baseline.source, a_request.owner,
+			a_connection, a_request.lease);
+	}
+
 	inline ToolDescriptor Descriptor()
 	{
 		ToolDescriptor tool;
 		tool.name = "calendar";
 		tool.description = "Read full calendar state or hold only its observed progression rate at zero. Does not set hour/date or change engine speed. "
-			"hold/release require explicit owner, commandId and exact status binding; release also requires leaseId. Holds last 1..300000 wall milliseconds, "
+			"hold/release require explicit owner and commandId. hold requires exact current status binding; release requires exact retained lease binding and leaseId, "
+			"even after a cell change, with independently verified same storage/generation and owned zero before restoring. Holds last 1..300000 wall milliseconds, "
 			"then restore captured rate on the main thread, without rewinding dates. MCP ownership also binds its session; REST ownership is cooperative, "
 			"not authentication. Disconnect recovery is expiry-bounded, not immediate. Never save during a hold. Read receipts for partial/invalidated cleanup; "
 			"a stalled main thread cannot restore at its deadline. No weather, exposure, physics or rendering control.";

@@ -97,9 +97,7 @@ namespace dvb::CalendarControl
 
 		json Binding(const Source& a_source)
 		{
-			return json{ { "processSession", a_source.processSession }, { "pid", GetCurrentProcessId() },
-				{ "loadGeneration", a_source.generation }, { "cellFormId", a_source.cell },
-				{ "globalFormIds", a_source.forms } };
+			return SourceBinding(a_source, GetCurrentProcessId());
 		}
 
 		json Values(const Snapshot& a_snapshot)
@@ -159,10 +157,7 @@ namespace dvb::CalendarControl
 		{
 			const auto request = ParseRequest(a_args);
 			const auto& action = request.action;
-			const auto& owner = request.owner;
 			const auto& command = request.command;
-			const auto& lease = request.lease;
-			const auto duration = request.duration;
 			const auto applyDeadline = Now() + 5000;
 			const auto connection = a_ctx.clientId.empty() ? std::string("rest") : "mcp:" + a_ctx.clientId;
 			try {
@@ -170,17 +165,8 @@ namespace dvb::CalendarControl
 					std::lock_guard lock(g_mutex);
 					g_controller.Tick(Now());
 					const auto s = g_backend.Read();
-					Outcome result{ true, "observed", false };
-					if (action != "status") {
-						if (g_stopping)
-							result = { false, "service_stopping", false };
-						else if (a_args["binding"] != Binding(s.source))
-							result = { false, "binding_mismatch", false };
-						else if (action == "hold")
-							result = g_controller.Hold(s.source, owner, connection, command, Now(), duration, applyDeadline);
-						else
-							result = g_controller.Release(s.source, owner, connection, lease);
-					}
+					const auto result = ExecuteRequest(request, g_controller, s, GetCurrentProcessId(),
+						connection, Now(), applyDeadline, g_stopping.load());
 					UpdatePump();
 					g_lastRead = g_backend.Read();
 					auto out = Receipt(result, g_lastRead, true);

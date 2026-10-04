@@ -59,7 +59,162 @@ namespace
 		{
 			return controller.Release(backend.snapshot.source, owner, connection, "1");
 		}
+		Outcome Invoke(const dvb::json& args, const std::string& connection = "mcp:session", bool stopping = false)
+		{
+			return ExecuteRequest(ParseRequest(args), controller, backend.Read(), 1, connection, 12, 1000, stopping);
+		}
+		dvb::json ReleaseArgs() const
+		{
+			const auto& lease = controller.Current() ? controller.Current() : controller.Last();
+			return dvb::json{ { "action", "release" }, { "owner", lease->owner },
+				{ "commandId", "release-command" }, { "leaseId", lease->id },
+				{ "binding", SourceBinding(lease->baseline.source, 1) } };
+		}
 	};
+}
+
+TEST_CASE("calendar protocol releases retained scene-loss custody with its original binding")
+{
+	Fixture f;
+	CHECK(f.Hold().ok);
+	const auto args = f.ReleaseArgs();
+	const auto baseline = f.backend.snapshot;
+	++f.backend.snapshot.source.cell;
+	f.backend.failWrite = true;
+	CHECK(!f.controller.Tick(11).restored);
+	CHECK(f.controller.Current()->cleanupAttempted);
+	CHECK(!f.controller.NeedsPump());
+	f.backend.failWrite = false;
+	const auto attempts = f.backend.writeAttempts;
+	f.controller.Tick(1000);
+	f.controller.End("loading_menu", true);
+	CHECK(f.backend.writeAttempts == attempts);
+	CHECK(f.Invoke(args).restored);
+	CHECK(f.backend.writeAttempts == attempts + 1);
+	CHECK(f.backend.writes == 2);
+	CHECK(f.backend.snapshot.rate == 20);
+	CHECK(f.backend.snapshot.source.cell != baseline.source.cell);
+	CHECK(f.backend.snapshot.date == baseline.date);
+	CHECK(f.backend.snapshot.engineMultiplier == baseline.engineMultiplier);
+	CHECK(!f.controller.Current());
+	CHECK(f.controller.Last()->command == "hold-command");
+	CHECK(f.Invoke(args).restored);
+	CHECK(f.backend.writeAttempts == attempts + 1);
+}
+
+TEST_CASE("calendar protocol cell drift does not weaken exact release custody")
+{
+	Fixture f;
+	CHECK(f.Hold().ok);
+	const auto args = f.ReleaseArgs();
+	++f.backend.snapshot.source.cell;
+	f.backend.failWrite = true;
+	f.controller.Tick(11);
+	f.backend.failWrite = false;
+	const auto attempts = f.backend.writeAttempts;
+	for (const auto* field : { "owner", "leaseId" }) {
+		auto wrong = args;
+		wrong[field] = "other";
+		CHECK(f.Invoke(wrong).code == "wrong_owner_or_lease");
+	}
+	CHECK(f.Invoke(args, "mcp:other").code == "wrong_owner_or_lease");
+	CHECK(f.Invoke(args, "rest").code == "wrong_owner_or_lease");
+	for (const auto* field : { "pid", "loadGeneration", "cellFormId" }) {
+		auto wrong = args;
+		wrong["binding"][field] = 999;
+		CHECK(f.Invoke(wrong).code == "binding_mismatch");
+	}
+	auto current = args;
+	current["binding"] = SourceBinding(f.backend.snapshot.source, 1);
+	CHECK(f.Invoke(current).code == "binding_mismatch");
+	CHECK(f.Invoke(args, "mcp:session", true).code == "service_stopping");
+	CHECK(f.backend.writeAttempts == attempts);
+	CHECK(f.controller.Current().has_value());
+	CHECK(f.Invoke(args).restored);
+	CHECK(f.Hold().ok);
+	CHECK(f.Invoke(args).code == "binding_mismatch");
+	CHECK(f.Invoke(f.ReleaseArgs()).restored);
+}
+
+TEST_CASE("calendar protocol release independently invalidates changed storage without writing")
+{
+	for (int change = 0; change < 6; ++change) {
+		Fixture f;
+		CHECK(f.Hold().ok);
+		const auto args = f.ReleaseArgs();
+		++f.backend.snapshot.source.cell;
+		f.backend.failWrite = true;
+		f.controller.Tick(11);
+		f.backend.failWrite = false;
+		if (change == 0) ++f.backend.snapshot.source.generation;
+		if (change == 1) f.backend.snapshot.source.processSession = "new-process";
+		if (change == 2) ++f.backend.snapshot.source.calendar;
+		if (change == 3) ++f.backend.snapshot.source.forms[5];
+		if (change == 4) ++f.backend.snapshot.source.storage[5];
+		if (change == 5) f.backend.snapshot.rate = 7;
+		const auto rate = f.backend.snapshot.rate;
+		const auto attempts = f.backend.writeAttempts;
+		const auto result = f.Invoke(args);
+		CHECK(!result.restored);
+		CHECK(result.code == (change == 5 ? "external_rate_write_without_restore" : "source_invalidated_without_restore"));
+		CHECK(!f.controller.Current());
+		CHECK(f.backend.writeAttempts == attempts);
+		CHECK(f.backend.snapshot.rate == rate);
+	}
+}
+
+TEST_CASE("calendar protocol cell-drift release retains unavailable current storage without blind write")
+{
+	Fixture f;
+	CHECK(f.Hold().ok);
+	const auto args = f.ReleaseArgs();
+	++f.backend.snapshot.source.cell;
+	f.backend.failWrite = true;
+	f.controller.Tick(11);
+	f.backend.failWrite = false;
+	f.backend.snapshot.available = false;
+	const auto attempts = f.backend.writeAttempts;
+	CHECK(f.Invoke(args).code == "restore_failed_requires_explicit_release");
+	CHECK(f.controller.Current().has_value());
+	CHECK(f.backend.writeAttempts == attempts);
+	f.backend.snapshot.available = true;
+	f.controller.Tick(1000);
+	CHECK(f.backend.writeAttempts == attempts);
+	CHECK(f.Invoke(args).restored);
+	CHECK(f.backend.writeAttempts == attempts + 1);
+}
+
+TEST_CASE("calendar protocol cell-drift unverified restore cannot be claimed or replayed")
+{
+	Fixture f;
+	CHECK(f.Hold().ok);
+	const auto args = f.ReleaseArgs();
+	++f.backend.snapshot.source.cell;
+	f.backend.hideAfterWrite = true;
+	CHECK(!f.controller.Tick(11).restored);
+	CHECK(f.controller.Current()->cleanupAttempted);
+	CHECK(f.backend.snapshot.rate == 20);
+	const auto attempts = f.backend.writeAttempts;
+	f.controller.Tick(1000);
+	CHECK(f.backend.writeAttempts == attempts);
+	CHECK(f.Invoke(args).code == "external_rate_write_without_restore");
+	CHECK(!f.controller.Current());
+	CHECK(!f.controller.Result().restored);
+	CHECK(f.backend.writeAttempts == attempts);
+}
+
+TEST_CASE("calendar protocol hold still requires the exact current scene binding")
+{
+	Fixture f;
+	dvb::json args{ { "action", "hold" }, { "owner", "mapping" }, { "commandId", "hold-command" },
+		{ "holdMs", 100 }, { "binding", SourceBinding(f.backend.snapshot.source, 1) } };
+	++f.backend.snapshot.source.cell;
+	CHECK(f.Invoke(args).code == "binding_mismatch");
+	CHECK(f.backend.writeAttempts == 0);
+	args["binding"] = SourceBinding(f.backend.snapshot.source, 1);
+	CHECK(f.Invoke(args).code == "held");
+	CHECK(f.backend.writes == 1);
+	CHECK(f.Invoke(f.ReleaseArgs()).restored);
 }
 
 TEST_CASE("calendar hold and exact release change rate only")
