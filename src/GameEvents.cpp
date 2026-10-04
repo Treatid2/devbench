@@ -1,5 +1,7 @@
 #include "GameEvents.h"
 
+#include "CalendarControl.h"
+
 #include "EventBus.h"
 #include "Json.h"
 #include "NewGameControl.h"
@@ -31,6 +33,8 @@ namespace dvb
 				if (a_event) {
 					NewGameControl::OnMenuEvent(*a_event);
 					const std::string name = a_event->menuName.c_str();
+					if (a_event->opening && name == RE::LoadingMenu::MENU_NAME)
+						CalendarControl::OnLoadingMenu();
 					{
 						std::lock_guard lock(g_menuMutex);
 						if (a_event->opening)
@@ -125,6 +129,7 @@ namespace dvb
 
 	void OnSKSEMessage(std::uint32_t a_type)
 	{
+		CalendarControl::OnLifecycle(a_type);
 		if (!g_bus)
 			return;
 		const char* event = nullptr;

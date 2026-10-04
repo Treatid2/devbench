@@ -2,6 +2,8 @@
 #include "CameraOrbit.h"
 #include <RE/T/ThirdPersonState.h>
 
+#include "CalendarControl.h"
+
 #include "Capture.h"
 #include "ConsoleLogCapture.h"
 #include "EventBus.h"
@@ -371,6 +373,8 @@ namespace dvb
 		json GameHandler(const json& a_args, const ToolContext& a_ctx)
 		{
 			const std::string action = a_args.value("action", std::string{});
+			if ((action == "save" || action == "advanceTime") && CalendarControl::Outstanding())
+				throw ToolError(409, "release the calendar lease before saving or changing calendar time");
 
 			if (action == "newGame")
 				return NewGameControl::Handle(a_args);
@@ -415,6 +419,8 @@ namespace dvb
 				if (std::fabs(hours) > kMaxAbsHours)
 					throw ToolError(400, std::format("game advanceTime: 'hours' must be within +/-{}", kMaxAbsHours));
 				return MainThread::RunAndWait([hours]() -> json {
+					if (CalendarControl::Outstanding())
+						throw ToolError(409, "release the calendar lease before changing calendar time");
 					auto* cal = RE::Calendar::GetSingleton();
 					if (!cal || !cal->gameHour || !cal->gameDaysPassed)
 						throw ToolError(503, "Calendar unavailable (no loaded world?)");
@@ -2731,6 +2737,7 @@ namespace dvb
 
 	void RegisterCoreTools(ToolRegistry& a_registry, EventBus& a_events)
 	{
+		CalendarControl::Register(a_registry);
 		RegisterInputTool(a_registry, a_events);
 
 		ToolDescriptor console;

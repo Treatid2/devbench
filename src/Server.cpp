@@ -1,5 +1,7 @@
 #include "Server.h"
 
+#include "CalendarControl.h"
+
 #include "McpAdapter.h"
 #include "RestAdapter.h"
 #include "Version.h"
@@ -199,6 +201,7 @@ namespace dvb
 
 	void Server::Stop()
 	{
+		CalendarControl::RequestStop();
 		if (m_mcp) {
 			m_mcp->stop();
 			m_mcp.reset();

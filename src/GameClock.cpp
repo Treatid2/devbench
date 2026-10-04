@@ -1,5 +1,7 @@
 #include "GameClock.h"
 
+#include "CalendarControl.h"
+
 #include "GameState.h"
 #include "TimeScaleControl.h"
 
@@ -61,6 +63,7 @@ namespace dvb::GameClock
 
 	void Tick()
 	{
+		CalendarControl::Reconcile();
 		const int  frame = game::CurrentFrame();
 		const auto now = Clock::now();
 		if (g_rebase.exchange(false, std::memory_order_acq_rel)) {
