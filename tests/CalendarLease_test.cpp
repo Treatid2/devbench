@@ -1,0 +1,316 @@
+#include "test_framework.h"
+
+#include "CalendarLease.h"
+#include "CalendarProtocol.h"
+#include "MainThreadTask.h"
+
+#include <limits>
+
+using namespace dvb::CalendarControl;
+
+namespace
+{
+	struct FakeBackend final : Backend
+	{
+		Snapshot snapshot;
+		int writes = 0;
+		bool failWrite = false, hideAfterWrite = false, nextReadUnavailable = false;
+
+		FakeBackend()
+		{
+			snapshot.source = { "process:created", 1, 42, { 1, 2, 3, 4, 5, 6 }, { 11, 12, 13, 14, 15, 16 }, 100 };
+			snapshot.available = snapshot.worldLoaded = true;
+			snapshot.date = { 201, 7, 17, 7.212f, 12.3f };
+			snapshot.rate = 20;
+			snapshot.engineMultiplier = 1;
+			snapshot.frame = 55;
+		}
+		Snapshot Read() override
+		{
+			auto result = snapshot;
+			if (nextReadUnavailable) {
+				result.available = false;
+				nextReadUnavailable = false;
+			}
+			return result;
+		}
+		bool WriteRate(const Snapshot& a_expected, float a_rate) override
+		{
+			if (failWrite || !snapshot.source.SameStorage(a_expected.source) || snapshot.rate != a_expected.rate)
+				return false;
+			++writes;
+			snapshot.rate = a_rate;
+			nextReadUnavailable = hideAfterWrite;
+			return true;
+		}
+	};
+
+	struct Fixture
+	{
+		FakeBackend backend;
+		Controller controller{ backend };
+		Outcome Hold(std::int64_t duration = 100)
+		{
+			return controller.Hold(backend.snapshot.source, "mapping", "mcp:session", "hold-command", 10, duration, 1000);
+		}
+		Outcome Release(const std::string& owner = "mapping", const std::string& connection = "mcp:session")
+		{
+			return controller.Release(backend.snapshot.source, owner, connection, "1");
+		}
+	};
+}
+
+TEST_CASE("calendar hold and exact release change rate only")
+{
+	Fixture f;
+	const auto before = f.backend.Read();
+	CHECK(f.Hold().ok);
+	CHECK(f.backend.snapshot.rate == 0);
+	CHECK(f.controller.Current()->baseline.source == before.source);
+	CHECK(f.controller.Current()->deadline == 110);
+	CHECK(f.Release().restored);
+	CHECK(f.backend.snapshot.rate == 20);
+	CHECK(f.backend.snapshot.date == before.date);
+	CHECK(f.backend.snapshot.engineMultiplier == before.engineMultiplier);
+	CHECK(f.Release().restored);
+	CHECK(f.backend.writes == 2);
+}
+
+TEST_CASE("calendar expiry is monotonic even when frame does not change")
+{
+	Fixture f;
+	CHECK(f.Hold().ok);
+	f.controller.Tick(109);
+	CHECK(f.backend.snapshot.rate == 0);
+	CHECK(f.controller.NeedsPump());
+	CHECK(f.controller.Tick(110).restored);
+	CHECK(f.controller.Result().code == "expired");
+	CHECK(f.backend.snapshot.frame == 55);
+	CHECK(!f.controller.NeedsPump());
+	f.controller.Tick(2000);
+	CHECK(f.backend.writes == 2);
+}
+
+TEST_CASE("calendar owner connection lease and binding mismatches cannot release")
+{
+	Fixture f;
+	CHECK(f.Hold().ok);
+	CHECK(!f.Release("other").ok);
+	CHECK(!f.Release("mapping", "mcp:other").ok);
+	CHECK(!f.controller.Release(f.backend.snapshot.source, "mapping", "mcp:session", "2").ok);
+	auto wrong = f.backend.snapshot.source;
+	++wrong.generation;
+	CHECK(!f.controller.Release(wrong, "mapping", "mcp:session", "1").ok);
+	CHECK(!f.Hold().ok);
+	CHECK(f.backend.snapshot.rate == 0);
+	CHECK(f.backend.writes == 1);
+}
+
+TEST_CASE("calendar refuses unsupported state duration stale identity and expired apply")
+{
+	Fixture f;
+	CHECK(!f.Hold(0).ok);
+	CHECK(!f.Hold(kMaximumHoldMs + 1).ok);
+	CHECK(!f.controller.Hold(f.backend.snapshot.source, "mapping", "rest", "command", 1000, 100, 1000).ok);
+	CHECK(!f.controller.Hold(f.backend.snapshot.source, "mapping", "rest", "command",
+		std::numeric_limits<std::int64_t>::max() - 1, 100, std::numeric_limits<std::int64_t>::max()).ok);
+	for (const float rate : { 0.f, -1.f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN() }) {
+		f.backend.snapshot.rate = rate;
+		CHECK(!f.Hold().ok);
+	}
+	f.backend.snapshot.rate = 20;
+	f.backend.snapshot.worldLoaded = false;
+	CHECK(!f.Hold().ok);
+	f.backend.snapshot.worldLoaded = true;
+	auto old = f.backend.snapshot.source;
+	++f.backend.snapshot.source.generation;
+	CHECK(!f.controller.Hold(old, "mapping", "rest", "command", 10, 100, 1000).ok);
+	CHECK(f.backend.writes == 0);
+}
+
+TEST_CASE("calendar external rate writer is never overwritten")
+{
+	Fixture f;
+	CHECK(f.Hold().ok);
+	f.backend.snapshot.rate = 5;
+	CHECK(!f.controller.Tick(110).restored);
+	CHECK(f.controller.Result().code == "external_rate_write_without_restore");
+	CHECK(f.backend.snapshot.rate == 5);
+	CHECK(f.backend.writes == 1);
+}
+
+TEST_CASE("calendar external date change cancels hold without rewinding")
+{
+	Fixture f;
+	CHECK(f.Hold().ok);
+	f.backend.snapshot.date[3] = 19.647f;
+	CHECK(f.controller.Tick(11).restored);
+	CHECK(f.controller.Result().code == "external_calendar_change");
+	CHECK(f.backend.snapshot.date[3] == 19.647f);
+	CHECK(f.backend.snapshot.rate == 20);
+}
+
+TEST_CASE("calendar engine multiplier change ends hold but never changes that multiplier")
+{
+	Fixture f;
+	CHECK(f.Hold().ok);
+	f.backend.snapshot.engineMultiplier = 0.5;
+	CHECK(f.controller.Tick(11).restored);
+	CHECK(f.controller.Result().code == "engine_multiplier_changed");
+	CHECK(f.backend.snapshot.engineMultiplier == 0.5);
+}
+
+TEST_CASE("calendar storage process and load changes invalidate without stale restore")
+{
+	for (int changed = 0; changed < 4; ++changed) {
+		Fixture f;
+		CHECK(f.Hold().ok);
+		if (changed == 0) ++f.backend.snapshot.source.generation;
+		if (changed == 1) ++f.backend.snapshot.source.storage[5];
+		if (changed == 2) ++f.backend.snapshot.source.forms[5];
+		if (changed == 3) f.backend.snapshot.source.processSession = "new-process";
+		f.backend.snapshot.rate = 30;
+		CHECK(!f.controller.Tick(110).restored);
+		CHECK(!f.controller.Current());
+		CHECK(f.backend.snapshot.rate == 30);
+		CHECK(f.backend.writes == 1);
+	}
+}
+
+TEST_CASE("calendar scene loss restores only still-identified same-generation globals")
+{
+	Fixture f;
+	CHECK(f.Hold().ok);
+	f.backend.snapshot.worldLoaded = false;
+	CHECK(f.controller.Tick(11).restored);
+	CHECK(f.controller.Result().code == "scene_lost");
+	CHECK(f.backend.snapshot.rate == 20);
+	Fixture other;
+	CHECK(other.Hold().ok);
+	other.backend.snapshot.available = false;
+	CHECK(!other.controller.Tick(11).restored);
+	CHECK(other.backend.writes == 1);
+}
+
+TEST_CASE("calendar lifecycle cleanup does not restore into a later generation")
+{
+	Fixture f;
+	CHECK(f.Hold().ok);
+	CHECK(f.controller.End("pre_load", true).restored);
+	CHECK(f.backend.snapshot.rate == 20);
+	CHECK(f.Hold().ok);
+	++f.backend.snapshot.source.generation;
+	f.backend.snapshot.rate = 7;
+	CHECK(!f.controller.End("new_load_generation", false).restored);
+	CHECK(f.backend.snapshot.rate == 7);
+	CHECK(!f.controller.NeedsPump());
+}
+
+TEST_CASE("calendar unverified apply stays tracked only after a committed zero write")
+{
+	Fixture f;
+	f.backend.failWrite = true;
+	CHECK(!f.Hold().ok);
+	CHECK(!f.controller.Current());
+	CHECK(f.backend.snapshot.rate == 20);
+	f.backend.failWrite = false;
+	f.backend.hideAfterWrite = true;
+	CHECK(!f.Hold().ok);
+	CHECK(f.controller.Current().has_value());
+	CHECK(f.backend.snapshot.rate == 0);
+	f.backend.hideAfterWrite = false;
+	CHECK(f.controller.Tick(110).restored);
+	CHECK(f.backend.snapshot.rate == 20);
+}
+
+TEST_CASE("calendar failed restore requires explicit release not an automatic retry loop")
+{
+	Fixture f;
+	CHECK(f.Hold().ok);
+	f.backend.failWrite = true;
+	CHECK(!f.controller.Tick(110).restored);
+	CHECK(f.controller.Current()->cleanupAttempted);
+	CHECK(!f.controller.NeedsPump());
+	f.backend.failWrite = false;
+	f.controller.Tick(1000);
+	CHECK(f.backend.snapshot.rate == 0);
+	CHECK(f.Release().restored);
+	CHECK(f.backend.snapshot.rate == 20);
+}
+
+TEST_CASE("calendar abandoned queued invocation never applies a hold")
+{
+	Fixture f;
+	const auto deadline = dvb::MainThread::QueuedTask::Clock::now();
+	dvb::MainThread::QueuedTask task([&]() -> dvb::json { return f.Hold().ok; }, deadline);
+	task.Run(deadline);
+	CHECK(f.backend.writes == 0);
+	CHECK(!f.controller.Current());
+}
+
+TEST_CASE("calendar already-started late completion leaves a bounded identifiable lease")
+{
+	Fixture f;
+	dvb::MainThread::QueuedTask* running = nullptr;
+	const auto start = dvb::MainThread::QueuedTask::Clock::now();
+	dvb::MainThread::QueuedTask task([&]() -> dvb::json {
+		CHECK(!running->Abandon());
+		CHECK(f.Hold().ok);
+		CHECK(f.controller.Current()->command == "hold-command");
+		CHECK(f.controller.Current()->deadline == 110);
+		return true;
+	}, start + std::chrono::seconds(1));
+	running = &task;
+	task.Run(start);
+	CHECK(f.controller.Tick(110).restored);
+	CHECK(f.backend.snapshot.engineMultiplier == 1);
+	CHECK(f.backend.snapshot.rate == 20);
+}
+
+TEST_CASE("calendar runtime protocol refuses unknown controls and mistyped bindings")
+{
+	using dvb::json;
+	CHECK(ParseRequest(json{ { "action", "status" } }).action == "status");
+	CHECK_THROWS_AS(ParseRequest(json{ { "action", "status" }, { "holdMs", 100 } }), dvb::ToolError);
+	json hold{ { "action", "hold" }, { "owner", "mapping" }, { "commandId", "command" }, { "holdMs", 100 },
+		{ "binding", { { "processSession", "process:created" }, { "pid", 1 }, { "loadGeneration", 1 },
+			{ "cellFormId", 42 }, { "globalFormIds", json::array({ 1, 2, 3, 4, 5, 6 }) } } } };
+	CHECK(ParseRequest(hold).duration == 100);
+	for (const auto* unsupported : { "hour", "date", "freeze", "scale", "leaseId" }) {
+		auto invalid = hold;
+		invalid[unsupported] = 0;
+		CHECK_THROWS_AS(ParseRequest(invalid), dvb::ToolError);
+	}
+	auto invalid = hold;
+	invalid["binding"]["pid"] = "1";
+	CHECK_THROWS_AS(ParseRequest(invalid), dvb::ToolError);
+	invalid = hold;
+	invalid["binding"]["globalFormIds"][0] = 1.5;
+	CHECK_THROWS_AS(ParseRequest(invalid), dvb::ToolError);
+	invalid = hold;
+	invalid["binding"]["loadGeneration"] = -1;
+	CHECK_THROWS_AS(ParseRequest(invalid), dvb::ToolError);
+	invalid = hold;
+	invalid["holdMs"] = true;
+	CHECK_THROWS_AS(ParseRequest(invalid), dvb::ToolError);
+	invalid = hold;
+	invalid["owner"] = "";
+	CHECK_THROWS_AS(ParseRequest(invalid), dvb::ToolError);
+	invalid = hold;
+	invalid["action"] = "release";
+	invalid.erase("holdMs");
+	invalid["leaseId"] = "1";
+	CHECK(ParseRequest(invalid).lease == "1");
+}
+
+TEST_CASE("calendar descriptor publishes the same typed protocol used by the native tool")
+{
+	const auto descriptor = Descriptor();
+	CHECK(descriptor.name == "calendar");
+	CHECK(!descriptor.readOnly);
+	CHECK(descriptor.inputSchema["properties"]["holdMs"]["maximum"] == kMaximumHoldMs);
+	CHECK(descriptor.inputSchema["properties"]["binding"]["properties"]["globalFormIds"]["maxItems"] == 6);
+	CHECK(descriptor.inputSchema["oneOf"][0]["maxProperties"] == 1);
+	std::printf("CALENDAR_DESCRIPTOR_JSON=%s\n", dvb::json{ { "name", descriptor.name },
+		{ "description", descriptor.description }, { "inputSchema", descriptor.inputSchema }, { "readOnly", descriptor.readOnly } }.dump().c_str());
+}
