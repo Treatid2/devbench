@@ -1,6 +1,125 @@
 {
   "tools": [
     {
+      "name": "calendar",
+      "description": "Read full calendar state or hold only its observed progression rate at zero. Does not set hour/date or change engine speed. hold/release require explicit owner and commandId. hold requires exact current status binding; release requires exact retained lease binding and leaseId, even after a cell change, with independently verified same storage/generation and owned zero before restoring. Holds last 1..300000 wall milliseconds, then restore captured rate on the main thread, without rewinding dates. MCP ownership also binds its session; REST ownership is cooperative, not authentication. Disconnect recovery is expiry-bounded, not immediate. Never save during a hold. Read receipts for partial/invalidated cleanup; a stalled main thread cannot restore at its deadline. No weather, exposure, physics or rendering control.",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "status",
+              "hold",
+              "release"
+            ]
+          },
+          "owner": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "commandId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "binding": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "processSession",
+              "pid",
+              "loadGeneration",
+              "cellFormId",
+              "globalFormIds"
+            ],
+            "properties": {
+              "processSession": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "pid": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "loadGeneration": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "cellFormId": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "globalFormIds": {
+                "type": "array",
+                "minItems": 6,
+                "maxItems": 6,
+                "items": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          },
+          "holdMs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 300000
+          },
+          "leaseId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "action": {
+                "const": "status"
+              }
+            },
+            "maxProperties": 1
+          },
+          {
+            "properties": {
+              "action": {
+                "const": "hold"
+              }
+            },
+            "required": [
+              "owner",
+              "commandId",
+              "binding",
+              "holdMs"
+            ],
+            "maxProperties": 5
+          },
+          {
+            "properties": {
+              "action": {
+                "const": "release"
+              }
+            },
+            "required": [
+              "owner",
+              "commandId",
+              "binding",
+              "leaseId"
+            ],
+            "maxProperties": 5
+          }
+        ]
+      },
+      "readOnly": false
+    },
+    {
       "name": "input",
       "description": "Versioned synthetic input interface. action='capabilities' (default) returns the exact contract/version, readiness, limits, injection path, supported actions, and complete keyboard name→DirectInput-scan-code catalog; clients MUST capability-negotiate rather than assuming this tool exists. Contract v1 implements device='keyboard' using Skyrim's own BSInputEventQueue (not Windows SendInput, so window focus is irrelevant). 'status' reports readiness and every synthetic held key with owner/lease timing. 'down' starts a bounded owned hold (default maxHoldMs 5000; automatic up on expiry); repeated down by the same owner is idempotent and another owner gets 409. 'up' releases that owner's key; cross-owner force is reserved for internal cleanup. Releasing an unheld key is an idempotent no-op. 'tap' emits down, waits durationMs (default 50), then up. 'sequence' executes a prevalidated balanced array of tap/down/up/wait events (optional afterMs); it rejects an unbalanced hold before injecting anything and releases keys acquired by the sequence on failure. 'releaseAll' releases this owner only; all-owner cleanup is internal-only. Pending releases retain their leases until completion. 'up' returns pending=true and released=false, and 'releaseAll' lists those keys in pending rather than released. Every lease watchdog retries a failed automatic release until it succeeds or becomes obsolete. owner defaults to the MCP session id or rest:anonymous; automation should supply a stable task owner. DevBench also releases owned keys on load/new-game and emits input.keyboard events for accepted down/up transitions. Contract v2 also implements device='vrTrackedSet': read-only observe returns the current physical OpenVR HMD and both controllers; one prevalidated timestamped sequence whose every frame atomically contains HMD, left-controller, and right-controller pose plus both controllers' complete OpenVR button/touch/axis state. It is applied at the OpenVR compositor/system boundary, is always asynchronous, has one owner, passes the real runtime through when inactive, and returns a controlToken required for external stop. Failed controller-index restoration remains retryable through that token. Ad-hoc sequences stop on lifecycle boundaries; recording replay may explicitly survive the load/new-game events it is reproducing. There are deliberately no per-device or per-button VR mutation actions: submit the coherent tracked set so poses and controls cannot come from different clocks.",
       "inputSchema": {
@@ -562,7 +681,7 @@
     },
     {
       "name": "wait",
-      "description": "Advance time by waiting `hours`, synchronously and without touching the Wait menu's UI at all: starts the wait, then drives its completion (autosave, script events) to done before returning — no polling needed. Refuses with { completed:false, reason } on the same gate the menu itself enforces (combat, trespassing, midair, hostiles nearby, etc.).",
+      "description": "Advance time by waiting `hours`, synchronously and without touching the Wait menu's UI at all: starts the wait, then drives its completion (autosave, script events) to done before returning — no polling needed. Refuses with { completed:false, reason } on the same gate the menu itself enforces (combat, trespassing, midair, hostiles nearby, etc.). Refused with 409 while calendar custody is outstanding, including unverified cleanup.",
       "inputSchema": {
         "properties": {
           "hours": {
@@ -578,7 +697,7 @@
     },
     {
       "name": "sleep",
-      "description": "Advance time by sleeping `hours` (the rest variant — drives the well-rested / lover's-comfort bonus). Same mechanics as `wait`: synchronous, no menu UI, refuses with { completed:false, reason } on the same gate the menu enforces.",
+      "description": "Advance time by sleeping `hours` (the rest variant — drives the well-rested / lover's-comfort bonus). Same mechanics as `wait`: synchronous, no menu UI, refuses with { completed:false, reason } on the same gate the menu enforces. Refused with 409 while calendar custody is outstanding, including unverified cleanup.",
       "inputSchema": {
         "properties": {
           "hours": {

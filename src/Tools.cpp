@@ -1,5 +1,8 @@
 #include "Tools.h"
 
+#include "CalendarAdmission.h"
+#include "CalendarControl.h"
+
 #include "Capture.h"
 #include "ConsoleLogCapture.h"
 #include "EventBus.h"
@@ -361,6 +364,8 @@ namespace dvb
 		json GameHandler(const json& a_args, const ToolContext& a_ctx)
 		{
 			const std::string action = a_args.value("action", std::string{});
+			if ((action == "save" || action == "advanceTime") && CalendarControl::Outstanding())
+				throw ToolError(409, "release the calendar lease before saving or changing calendar time");
 
 			if (action == "list") {
 				const fs::path saveDir = ResolveSaveDir(a_args);
@@ -402,6 +407,8 @@ namespace dvb
 				if (std::fabs(hours) > kMaxAbsHours)
 					throw ToolError(400, std::format("game advanceTime: 'hours' must be within +/-{}", kMaxAbsHours));
 				return MainThread::RunAndWait([hours]() -> json {
+					if (CalendarControl::Outstanding())
+						throw ToolError(409, "release the calendar lease before changing calendar time");
 					auto* cal = RE::Calendar::GetSingleton();
 					if (!cal || !cal->gameHour || !cal->gameDaysPassed)
 						throw ToolError(503, "Calendar unavailable (no loaded world?)");
@@ -751,8 +758,10 @@ namespace dvb
 				throw ToolError(400, "'hours' must be a positive integer");
 			if (hours > kMaxWaitHours)
 				throw ToolError(400, std::format("'hours' must be <= {}", kMaxWaitHours));
+			CalendarControl::RequireIdle(CalendarControl::Outstanding());
 
 			return MainThread::RunAndWait([hours, a_sleep]() -> json {
+				CalendarControl::RequireIdle(CalendarControl::Outstanding());
 				auto* pc = RE::PlayerCharacter::GetSingleton();
 				if (!pc)
 					return json{ { "completed", false }, { "reason", "no PlayerCharacter" } };
@@ -2322,6 +2331,7 @@ namespace dvb
 
 	void RegisterCoreTools(ToolRegistry& a_registry, EventBus& a_events)
 	{
+		CalendarControl::Register(a_registry);
 		RegisterInputTool(a_registry, a_events);
 
 		ToolDescriptor console;
@@ -2916,7 +2926,7 @@ namespace dvb
 			"menu's UI at all: starts the wait, then drives its completion (autosave, script "
 			"events) to done before returning — no polling needed. Refuses with "
 			"{ completed:false, reason } on the same gate the menu itself enforces (combat, "
-			"trespassing, midair, hostiles nearby, etc.).";
+			"trespassing, midair, hostiles nearby, etc.). Refused with 409 while calendar custody is outstanding, including unverified cleanup.";
 		wait.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
@@ -2933,7 +2943,7 @@ namespace dvb
 		sleep.description =
 			"Advance time by sleeping `hours` (the rest variant — drives the well-rested / "
 			"lover's-comfort bonus). Same mechanics as `wait`: synchronous, no menu UI, "
-			"refuses with { completed:false, reason } on the same gate the menu enforces.";
+			"refuses with { completed:false, reason } on the same gate the menu enforces. Refused with 409 while calendar custody is outstanding, including unverified cleanup.";
 		sleep.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
