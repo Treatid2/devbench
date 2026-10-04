@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 
 namespace dvb::PapyrusDefaults
 {
@@ -20,7 +21,7 @@ namespace dvb::PapyrusDefaults
 		constexpr Value Int(int a_value) { return { Value::Kind::kInt, static_cast<double>(a_value) }; }
 		constexpr Value Float(double a_value) { return { Value::Kind::kFloat, a_value }; }
 
-		// Only non-neutral defaults; a neutral one is what an unlisted parameter gets anyway.
+		// Retained unverified hints only; an unlisted slot receives nothing.
 		constexpr Entry kEntries[] = {
 			{ "ObjectReference", "PlaceAtMe", "aiCount", 1, Int(1) },
 			{ "ObjectReference", "PlaceActorAtMe", "aiLevelMod", 1, Int(4) },
@@ -74,20 +75,25 @@ namespace dvb::PapyrusDefaults
 			});
 		}
 
-		// A native function carries no parameter names at run time; the VM reports "param1", "param2", ...
-		bool Unnamed(std::string_view a_param)
+		bool UnnamedAt(std::string_view a_param, std::uint32_t a_index)
 		{
-			return a_param.size() > 5 && Same(a_param.substr(0, 5), "param") &&
-			       std::ranges::all_of(a_param.substr(5), [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; });
+			if (a_param.size() <= 5 || !Same(a_param.substr(0, 5), "param"))
+				return false;
+			const auto suffix = a_param.substr(5);
+			std::uint64_t number = 0;
+			const auto [end, error] = std::from_chars(suffix.data(), suffix.data() + suffix.size(), number);
+			return error == std::errc{} && end == suffix.data() + suffix.size() &&
+			       number == static_cast<std::uint64_t>(a_index) + 1;
 		}
 	}
 
 	std::optional<Value> Find(std::string_view a_script, std::string_view a_function, std::string_view a_param,
-		std::optional<std::uint32_t> a_index)
+		std::uint32_t a_index, Value::Kind a_kind)
 	{
-		const bool byIndex = a_index.has_value() && Unnamed(a_param);  // an unnamed parameter is matched by its position
+		const bool byIndex = UnnamedAt(a_param, a_index);
 		for (const auto& e : kEntries)
-			if (Same(e.script, a_script) && Same(e.function, a_function) && (byIndex ? e.index == *a_index : Same(e.param, a_param)))
+			if (Same(e.script, a_script) && Same(e.function, a_function) &&
+				e.index == a_index && e.value.kind == a_kind && (byIndex || Same(e.param, a_param)))
 				return e.value;
 		return std::nullopt;
 	}

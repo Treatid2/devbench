@@ -2915,23 +2915,7 @@ namespace dvb
 		ToolDescriptor papyrus;
 		papyrus.name = "papyrus";
 		papyrus.description =
-			"Inspect the live Papyrus surface and invoke global functions, returning the value. "
-			"action='list' returns loaded script class names { total, returned, truncated, scripts } "
-			"(optional 'filter' substring, 'limit' default 200). 'describe' takes a 'script' (class "
-			"name) and returns its { globalFunctions, memberFunctions, properties }, each function "
-			"with params + returnType — use it to discover what 'call' can invoke. 'call' runs a "
-			"function via the VM: 'script' + 'function' (+ optional 'args' array, 'timeoutMs' "
-			"default 3000) and returns { called, returned, returnedType }. Omitted trailing optional "
-			"args are filled from a table of known Papyrus defaults (PlaceAtMe aiCount=1, MoveTo "
-			"abMatchRotation=true, ...) or else None/0/false/\"\", listed under 'filledArgs' with a "
-			"'warning' for any guess — pass them explicitly when the real default is not neutral. "
-			"Unlike console 'cgf', "
-			"this hands the return value back (e.g. Utility.GetCurrentGameTime → a Float). Pass "
-			"'self' to call a MEMBER function on a target: { \"form\": \"0x14 | EditorID\" } targets "
-			"any form, or \"selected\" uses the console/crosshair ref (set via prid); without 'self' "
-			"only global/native functions are callable. args and returns support bool/number/string, "
-			"{ \"form\": … } (a form return resolves to { formId, formType, editorId, name }), and "
-			"arrays of scalars.";
+			"Inspect the live Papyrus surface and invoke global functions, returning the value. action='list' returns loaded script class names { total, returned, truncated, scripts } (optional 'filter' substring, 'limit' default 200). 'describe' takes a 'script' (class name) and returns its { globalFunctions, memberFunctions, properties }, each function with params + returnType — use it to discover what 'call' can invoke. 'call' runs a function via the VM: 'script' + 'function' (+ 'args' array, 'timeoutMs' default 3000, range 1..60000) and returns { called, returned, returnedType, callReceipt }. Supply exactly one explicit value per loaded parameter, including optional parameters: loaded metadata does not prove defaults and no table or neutral guesses are applied. Omit args only for zero-parameter functions. Explicit null (None) is accepted only for object/array parameters. Every admitted call has a response-time receipt with supplied JSON, resolved function metadata when available, dispatch phase and uncertainty; it is not a durable status endpoint or proof of execution. Timeout abandons calls before VM entry, but VM-entered calls may still execute: never automatically retry. REST failure details.callReceipt and MCP isError JSON text retain the receipt. Unlike console 'cgf', this hands the return value back (e.g. Utility.GetCurrentGameTime → a Float). Pass 'self' to call a MEMBER function on a target: { \"form\": \"0x14 | EditorID\" } targets any form, or \"selected\" uses the console/crosshair ref (set via prid); without 'self' only global/native functions are callable. args and returns support bool/number/string, { \"form\": … } (a form return resolves to { formId, formType, editorId, name }), and arrays of scalars.";
 		papyrus.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
@@ -2939,10 +2923,10 @@ namespace dvb
 								{ "script", json{ { "type", "string" }, { "description", "describe/call: the Papyrus script class name, e.g. Utility, Game, Actor" } } },
 								{ "function", json{ { "type", "string" }, { "description", "call: the function name, e.g. GetCurrentGameTime or GetActorValue" } } },
 								{ "self", json{ { "description", "call: target a member function — { \"form\": \"0x14 | EditorID\" } or \"selected\" (console/crosshair ref). Omit for global/native functions." } } },
-								{ "args", json{ { "type", "array" }, { "description", "call: arguments; each a bool/number/string, { \"form\": \"0x14 | EditorID\" }, or an array of scalars" } } },
+								{ "args", json{ { "type", "array" }, { "description", "call: exactly one explicit value per loaded parameter (use describe); bool/number/string, { \"form\": \"0x14 | EditorID\" }, array of scalars, or null (None) for object/array parameters only" } } },
 								{ "filter", json{ { "type", "string" }, { "description", "list: case-insensitive substring to match class names" } } },
 								{ "limit", json{ { "type", "integer" }, { "description", "list: max class names to return (default 200)" } } },
-								{ "timeoutMs", json{ { "type", "integer" }, { "description", "call: ms to wait for the result before 504 (default 3000)" } } },
+								{ "timeoutMs", json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 60000 }, { "description", "call: total dispatch/result admission deadline in ms, 1..60000 (default 3000); timeout never permits automatic retry" } } },
 							} },
 		};
 		a_registry.Register(std::move(papyrus), &Papyrus::Handle);

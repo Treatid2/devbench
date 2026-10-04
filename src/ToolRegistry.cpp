@@ -77,7 +77,7 @@ namespace dvb
 			return result;
 		} catch (const ToolError& e) {
 			logs::warn("tool '{}' failed [{}]: {}", a_name, e.code, e.what());
-			return ToolResult::Failure(e.code, e.what());
+			return ToolResult::Failure(e.code, e.what(), e.details);
 		} catch (const json::type_error& e) {
 			// .value()/.get<T>() throwing type_error specifically means the caller sent an
 			// argument of the wrong JSON type — a 400, not a 500. Deliberately NOT the broader

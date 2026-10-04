@@ -2,10 +2,11 @@
 
 #include "Json.h"
 #include "MainThread.h"
-#include "PapyrusDefaults.h"
+#include "PapyrusCallPolicy.h"
 #include "ToolRegistry.h"
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 
 #include "RE/O/Object.h"
@@ -205,7 +206,10 @@ namespace dvb::Papyrus
 		BSScript::Variable JsonToVariable(BSScript::Internal::VirtualMachine* a_vm, const json& a_arg, const BSScript::TypeInfo* a_paramType)
 		{
 			BSScript::Variable v;
-			if (a_arg.is_boolean()) {
+			if (a_arg.is_null()) {
+				if (!a_paramType || (!a_paramType->IsObject() && !a_paramType->IsArray()))
+					throw ToolError(400, "papyrus call: explicit null (None) is only valid for an object or array parameter");
+			} else if (a_arg.is_boolean()) {
 				v.SetBool(a_arg.get<bool>());
 			} else if (a_arg.is_number_float()) {
 				v.SetFloat(static_cast<float>(a_arg.get<double>()));
@@ -227,63 +231,6 @@ namespace dvb::Papyrus
 			} else {
 				throw ToolError(400, "papyrus call: each arg must be a bool, number, string, array, or { \"form\": \"0x.. | EditorID\" }");
 			}
-			return v;
-		}
-
-		// A type-neutral default (None / 0 / 0.0 / false / "") for an OMITTED optional param.
-		// DispatchMethodCall/DispatchStaticCall don't fill Papyrus optional defaults, so a short arg
-		// list leaves the native reading unset slots — reference ops (MoveTo/Disable/Kill) then run
-		// yet do nothing. Neutral matches Papyrus's own defaults in nearly all vanilla cases; a rare
-		// non-neutral one (MoveTo's abMatchRotation=true) pads neutral but position/effect still apply.
-		BSScript::Variable DefaultVariable(const BSScript::TypeInfo& a_type)
-		{
-			BSScript::Variable v;  // default-constructed → None
-			if (a_type.IsBool())
-				v.SetBool(false);
-			else if (a_type.IsInt())
-				v.SetSInt(0);
-			else if (a_type.IsFloat())
-				v.SetFloat(0.0f);
-			else if (a_type.IsString())
-				v.SetString("");
-			return v;  // object / array → leave as None
-		}
-
-		// The declared default when the table knows it, else a type-neutral one. Records which in
-		// a_filled so the caller can see what was sent in its place.
-		BSScript::Variable FillOmitted(const BSScript::IFunction* a_fn, std::uint32_t a_index, json& a_filled)
-		{
-			RE::BSFixedString  name;
-			BSScript::TypeInfo type;
-			a_fn->GetParam(a_index, name, type);
-			const char*        script = a_fn->GetObjectTypeName().c_str();
-			const char*        param = name.c_str();
-			json               entry{ { "name", Str(param) }, { "type", type.TypeAsString() } };
-			BSScript::Variable v;
-			const auto         declared = PapyrusDefaults::Find(script ? script : "", a_fn->GetName().c_str() ? a_fn->GetName().c_str() : "", param ? param : "", a_index);
-			if (declared && ((declared->kind == PapyrusDefaults::Value::Kind::kBool && type.IsBool()) ||
-								(declared->kind == PapyrusDefaults::Value::Kind::kInt && type.IsInt()) ||
-								(declared->kind == PapyrusDefaults::Value::Kind::kFloat && type.IsFloat()))) {
-				if (type.IsBool()) {
-					v.SetBool(declared->number != 0.0);
-					entry["value"] = declared->number != 0.0;
-				} else if (type.IsInt()) {
-					v.SetSInt(static_cast<std::int32_t>(declared->number));
-					entry["value"] = static_cast<std::int32_t>(declared->number);
-				} else {
-					v.SetFloat(static_cast<float>(declared->number));
-					entry["value"] = declared->number;
-				}
-				entry["source"] = "declared";
-			} else {
-				v = DefaultVariable(type);
-				entry["value"] = type.IsBool() ? json(false) : type.IsInt() ? json(0) :
-				                                           type.IsFloat()   ? json(0.0) :
-				                                           type.IsString()  ? json("") :
-				                                                              json(nullptr);
-				entry["source"] = "neutral";
-			}
-			a_filled.push_back(std::move(entry));
 			return v;
 		}
 
@@ -317,9 +264,11 @@ namespace dvb::Papyrus
 			}
 			return json{
 				{ "name", Str(a_fn->GetName().c_str()) },
+				{ "declaringScript", Str(a_fn->GetObjectTypeName().c_str()) },
 				{ "returnType", a_fn->GetReturnType().TypeAsString() },
 				{ "params", std::move(params) },
 				{ "native", a_fn->GetIsNative() },
+				{ "argumentPolicy", "explicit_exact_count" },
 			};
 		}
 
@@ -344,6 +293,9 @@ namespace dvb::Papyrus
 		// already returned) writes into live memory, never a freed functor's fields.
 		struct CallState
 		{
+			explicit CallState(json request, PapyrusCallPolicy::Lifecycle::Clock::time_point deadline) :
+				lifecycle(std::move(request), deadline) {}
+			PapyrusCallPolicy::Lifecycle lifecycle;  // guarded by m, including response snapshots
 			std::mutex              m;
 			std::condition_variable cv;
 			bool                    done = false;
@@ -363,6 +315,7 @@ namespace dvb::Papyrus
 				std::lock_guard<std::mutex> lk(_state->m);
 				_state->result = a_result;
 				_state->done = true;
+				_state->lifecycle.Completed();
 				_state->cv.notify_all();
 			}
 
@@ -499,27 +452,19 @@ namespace dvb::Papyrus
 			return true;
 		}
 
-		// Lists the omitted arguments that were filled, and warns when any was a guess.
-		void AddFilledDefaults(json& a_out, const json& a_filled)
-		{
-			if (a_filled.empty())
-				return;
-			a_out["filledArgs"] = a_filled;
-			std::string guessed;
-			for (const auto& f : a_filled)
-				if (f.value("source", std::string{}) == "neutral")
-					guessed += (guessed.empty() ? "" : ", ") + f.value("name", std::string{});
-			if (!guessed.empty())
-				a_out["warning"] = std::format("omitted argument(s) {} were sent as None/0/false/\"\" because their Papyrus defaults are not known at run time; if the result is wrong, pass them explicitly", guessed);
-		}
-
 		json HandleCall(const json& a_args, bool a_waitForResult)
 		{
 			const std::string script = a_args.value("script", std::string{});
 			const std::string function = a_args.value("function", std::string{});
 			if (script.empty() || function.empty())
 				throw ToolError(400, "papyrus call requires 'script' and 'function'");
-			const int  timeoutMs = a_args.value("timeoutMs", 3000);
+			const json timeout = a_args.contains("timeoutMs") ? a_args["timeoutMs"] : json(a_waitForResult ? 3000 : 5000);
+			if ((!timeout.is_number_integer() && !timeout.is_number_unsigned()) ||
+				(timeout.is_number_unsigned() ? timeout.get<std::uint64_t>() > PapyrusCallPolicy::kMaximumTimeoutMs :
+					timeout.get<std::int64_t>() > PapyrusCallPolicy::kMaximumTimeoutMs || timeout.get<std::int64_t>() < 1) ||
+				timeout == 0)
+				throw ToolError(400, "papyrus call: 'timeoutMs' must be an integer in 1..60000");
+			const int timeoutMs = timeout.get<int>();
 			const json argsJson = a_args.contains("args") ? a_args["args"] : json::array();
 			if (!argsJson.is_array())
 				throw ToolError(400, "papyrus call: 'args' must be an array");
@@ -529,121 +474,147 @@ namespace dvb::Papyrus
 			auto* task = SKSE::GetTaskInterface();
 			if (!task)
 				throw ToolError(500, "SKSE TaskInterface unavailable");
+			using Clock = PapyrusCallPolicy::Lifecycle::Clock;
+			static std::atomic<std::uint64_t> nextCall{ 0 };
+			const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+			auto state = std::make_shared<CallState>(json{
+				{ "callId", std::format("papyrus-{}-{}", GetCurrentProcessId(), ++nextCall) },
+				{ "script", script }, { "function", function }, { "suppliedArgs", argsJson },
+				{ "suppliedSelf", selfJson }, { "timeoutMs", timeoutMs },
+			}, deadline);
+			auto receipt = [state] {
+				std::lock_guard lock(state->m);
+				return json{ { "callReceipt", state->lifecycle.Snapshot() } };
+			};
 
 			const RE::BSFixedString cls(script.c_str());
 			const RE::BSFixedString fn(function.c_str());
-
-			auto filled = std::make_shared<json>(json::array());
-			auto dispatch = [cls, fn, argsJson, selfJson, hasSelf, filled](RE::BSTSmartPointer<BSScript::IStackCallbackFunctor> a_callback) {
-				auto* vm = BSScript::Internal::VirtualMachine::GetSingleton();
-				if (!vm)
-					throw ToolError(503, "Papyrus VM unavailable");
-
-				// Resolve self first (member) — the bound object's type is where we look up the
-				// function, and where args bind. For a global, the script type holds the function.
+			auto dispatch = [cls, fn, argsJson, selfJson, hasSelf, state](RE::BSTSmartPointer<BSScript::IStackCallbackFunctor> callback) {
+				{
+					std::lock_guard lock(state->m);
+					if (!state->lifecycle.BeginPreparation(Clock::now()))
+						throw ToolError(504, "papyrus call expired before preparation; no function dispatch");
+				}
+				auto* vm = GetVM();
+				// Keep the established object binding and actual resolved-function lookup.
+				// Binding/argument preparation may touch VM objects, but no target function
+				// is dispatched until exact count and the final deadline gate succeed.
 				RE::BSTSmartPointer<BSScript::Object> selfObj;
 				if (hasSelf) {
 					std::string err;
 					if (!ResolveSelf(vm, selfJson, cls, selfObj, err))
 						throw ToolError(400, err);
 				}
-				RE::BSTSmartPointer<BSScript::ObjectTypeInfo> scriptType;  // keeps a global's type alive
-				BSScript::ObjectTypeInfo*                     fnType = nullptr;
+				RE::BSTSmartPointer<BSScript::ObjectTypeInfo> scriptType;
+				BSScript::ObjectTypeInfo* fnType = nullptr;
 				if (hasSelf)
 					fnType = selfObj->GetTypeInfo();
 				else if (vm->GetScriptObjectType(cls, scriptType) && scriptType)
 					fnType = scriptType.get();
-
-				// Resolve the function up front — REQUIRED, not just for param types: a
-				// `DispatchStaticCall` to a non-existent global function null-derefs in the VM (a
-				// hard CTD, confirmed live), so a function that can't be resolved must fail cleanly
-				// here and never reach the dispatch.
 				const BSScript::IFunction* ifn = fnType ? FindFunction(fnType, std::string_view(fn.c_str() ? fn.c_str() : ""), !hasSelf) : nullptr;
 				if (!ifn)
-					throw ToolError(404, std::format("no such {} function '{}' on script '{}'", hasSelf ? "member" : "global/native", fn.c_str() ? fn.c_str() : "", cls.c_str() ? cls.c_str() : ""));
-				// Declared param types so a form arg can be packed to a base-typed param.
-				std::vector<BSScript::TypeInfo> paramTypes;
+					throw ToolError(404, std::format("no such {} function '{}' on script '{}'", hasSelf ? "member" : "global/native", fn.c_str(), cls.c_str()));
+				{
+					std::lock_guard lock(state->m);
+					state->lifecycle.Resolved(DescribeFunction(ifn),
+						hasSelf ? json(std::format("0x{:016X}", selfObj->GetHandle())) : json(nullptr));
+				}
+				if (!PapyrusCallPolicy::ExactArgumentCount(argsJson.size(), ifn->GetParamCount()))
+					throw ToolError(400, std::format("papyrus call: expected exactly {} explicit arguments, got {}; loaded metadata does not prove optional defaults — use describe and supply every parameter", ifn->GetParamCount(), argsJson.size()));
+
+				// RAII until VM entry; preserve the original raw-pointer handoff at
+				// Dispatch*Call. Do not introduce a competing post-entry deletion.
+				auto rawArgs = std::make_unique<RuntimeArgs>();
 				for (std::uint32_t p = 0; p < ifn->GetParamCount(); ++p) {
-					RE::BSFixedString  pn;
-					BSScript::TypeInfo pt;
-					ifn->GetParam(p, pn, pt);
-					paramTypes.push_back(pt);
+					RE::BSFixedString name;
+					BSScript::TypeInfo type;
+					ifn->GetParam(p, name, type);
+					rawArgs->args.push_back(JsonToVariable(vm, argsJson[p], &type));
 				}
-
-				auto* rawArgs = new RuntimeArgs();
-				try {
-					std::size_t i = 0;
-					for (const auto& a : argsJson) {
-						const BSScript::TypeInfo* pt = (i < paramTypes.size()) ? &paramTypes[i] : nullptr;
-						rawArgs->args.push_back(JsonToVariable(vm, a, pt));
-						++i;
-					}
-				} catch (const ToolError&) {
-					delete rawArgs;
-					throw;
-				} catch (const std::exception& e) {
-					delete rawArgs;
-					throw ToolError(400, e.what());
+				{
+					std::lock_guard lock(state->m);
+					if (!state->lifecycle.BeginDispatch(Clock::now()))
+						throw ToolError(504, "papyrus call expired before dispatch; no function dispatch");
 				}
-
-				// Pad omitted trailing optionals — the VM won't, and a short arg list makes
-				// reference ops (MoveTo/Disable/Kill) run yet do nothing. Papyrus defaults live
-				// in the .psc and are compiled into each call site, so the VM cannot say what
-				// they are: the known ones come from a table, the rest are neutral and reported.
-				for (std::size_t p = rawArgs->args.size(); p < paramTypes.size(); ++p)
-					rawArgs->args.push_back(FillOmitted(ifn, static_cast<std::uint32_t>(p), *filled));
-
-				const bool ok = hasSelf ? vm->DispatchMethodCall(selfObj, fn, rawArgs, a_callback) : vm->DispatchStaticCall(cls, fn, rawArgs, a_callback);
+				// Never hold the state mutex across VM dispatch: a synchronous callback
+				// acquires it. A timeout at/after this boundary is conservatively uncertain.
+				auto* handedOff = rawArgs.release();
+				const bool ok = hasSelf ? vm->DispatchMethodCall(selfObj, fn, handedOff, callback) : vm->DispatchStaticCall(cls, fn, handedOff, callback);
 				if (!ok)
-					throw ToolError(400, hasSelf ? "method dispatch refused — unknown function, wrong arg count, or not a member of that object's script" : "dispatch refused — unknown function, wrong arg count, or not a global/native function");
+					throw ToolError(400, "Papyrus VM refused dispatch; receipt conservatively retains VM-entry uncertainty, do not automatically replay");
+				std::lock_guard lock(state->m);
+				state->lifecycle.Accepted();
 			};
 
-			if (!a_waitForResult) {
-				return MainThread::RunAndWait([dispatch, filled]() -> json {
-					dispatch(nullptr);
-					json out{ { "queued", true } };
-					AddFilledDefaults(out, *filled);
-					return out;
-				});
-			}
-
-			auto state = std::make_shared<CallState>();
-			auto fail = [state](int a_status, std::string a_msg) {
-				std::lock_guard<std::mutex> lk(state->m);
-				state->status = a_status;
-				state->error = std::move(a_msg);
+			auto fail = [state](int status, const std::string& message) {
+				std::lock_guard lock(state->m);
+				if (state->done)
+					return;
+				state->lifecycle.Failed();
+				state->status = status;
+				state->error = message;
 				state->done = true;
 				state->cv.notify_all();
 			};
-			task->AddTask([dispatch, state, fail]() {
+			if (!a_waitForResult) {
 				try {
-					dispatch(RE::BSTSmartPointer<BSScript::IStackCallbackFunctor>(new CallFunctor(state)));
+					return MainThread::RunAndWait([dispatch, receipt] {
+						dispatch(nullptr);
+						return json{ { "queued", true }, { "callReceipt", receipt()["callReceipt"] } };
+					}, std::chrono::milliseconds(timeoutMs));
+				} catch (const MainThread::TaskTimeout& e) {
+					std::lock_guard lock(state->m);
+					state->lifecycle.TimedOut();
+					throw ToolError(e.code, e.what(), json{ { "callReceipt", state->lifecycle.Snapshot() } });
 				} catch (const ToolError& e) {
 					fail(e.code, e.what());
+					throw ToolError(e.code, e.what(), receipt());
+				} catch (const std::exception& e) {
+					fail(500, e.what());
+					throw ToolError(500, e.what(), receipt());
 				}
-			});
+			}
 
-			std::unique_lock<std::mutex> lk(state->m);
-			const bool                   completed = state->cv.wait_for(lk, std::chrono::milliseconds(timeoutMs),
-				[&] { return state->done; });
-			if (!completed)
-				throw ToolError(504, std::format("papyrus call '{}.{}' did not complete within {}ms (latent call or VM stalled?)", script, function, timeoutMs));
+			try {
+				task->AddTask([dispatch, state, fail] {
+					try {
+						dispatch(RE::BSTSmartPointer<BSScript::IStackCallbackFunctor>(new CallFunctor(state)));
+					} catch (const ToolError& e) {
+						fail(e.code, e.what());
+					} catch (const json::type_error& e) {
+						fail(400, e.what());
+					} catch (const std::exception& e) {
+						fail(500, e.what());
+					} catch (...) {
+						fail(500, "unknown exception before Papyrus completion");
+					}
+				});
+			} catch (const std::exception& e) {
+				fail(500, e.what());
+				throw ToolError(500, e.what(), receipt());
+			}
+			std::unique_lock lock(state->m);
+			if (!state->cv.wait_until(lock, deadline, [&] { return state->done; })) {
+				state->lifecycle.TimedOut();
+				throw ToolError(504, "papyrus call timed out; inspect callReceipt before any manual recovery — timeout does not cancel VM-entered calls or permit automatic retry",
+					json{ { "callReceipt", state->lifecycle.Snapshot() } });
+			}
 			if (!state->error.empty())
-				throw ToolError(state->status, std::format("papyrus call '{}.{}': {}", script, function, state->error));
-
+				throw ToolError(state->status, state->error, json{ { "callReceipt", state->lifecycle.Snapshot() } });
 			BSScript::Variable result = state->result;
-			lk.unlock();
-
-			return MainThread::RunAndWait([result, filled]() -> json {
-				auto* vm = GetVM();
-				json  out{
-					{ "called", true },
-					{ "returned", VariableToJson(vm, result) },
-					{ "returnedType", result.GetType().TypeAsString() },
-				};
-				AddFilledDefaults(out, *filled);
-				return out;
-			});
+			const json completedReceipt = state->lifecycle.Snapshot();
+			lock.unlock();
+			try {
+				return MainThread::RunAndWait([result, completedReceipt] {
+					auto* vm = GetVM();
+					return json{ { "called", true }, { "returned", VariableToJson(vm, result) },
+						{ "returnedType", result.GetType().TypeAsString() }, { "callReceipt", completedReceipt } };
+				});
+			} catch (const ToolError& e) {
+				throw ToolError(e.code, e.what(), json{ { "callReceipt", completedReceipt } });
+			} catch (const std::exception& e) {
+				throw ToolError(500, e.what(), json{ { "callReceipt", completedReceipt } });
+			}
 		}
 	}
 

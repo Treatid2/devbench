@@ -95,7 +95,7 @@ namespace dvb
 			if (r.ok)
 				WriteJson(res, 200, r.value);
 			else
-				WriteJson(res, r.errorCode ? r.errorCode : 500, json{ { "error", r.errorMessage }, { "code", r.errorCode } });
+				WriteJson(res, r.errorCode ? r.errorCode : 500, ToolErrorBody(r));
 		});
 
 		// Deliberately GET, not POST (a bodyless POST stalls on httplib's read timeout; see

@@ -84,6 +84,24 @@ TEST_CASE("a non-ToolError exception folds to a 500 result")
 	CHECK(r.errorCode == 500);
 }
 
+TEST_CASE("structured error receipts survive registry and actual adapter formatters")
+{
+	ToolRegistry reg;
+	const json details{ { "callReceipt", json{ { "phase", "dispatched" }, { "mayStillExecute", true } } } };
+	reg.Register(Desc("latent"), [details](const json&, const ToolContext&) -> json {
+		throw ToolError{ 504, "latent call timed out", details };
+	});
+	const auto result = reg.Invoke("latent", json::object(), ToolContext{});
+	CHECK(!result.ok);
+	CHECK(result.errorCode == 504);
+	CHECK(result.errorDetails == details);
+	CHECK(dvb::ToolErrorBody(result)["details"] == details);
+	CHECK(json::parse(dvb::ToolErrorText(result)) == dvb::ToolErrorBody(result));
+	const auto legacy = ToolResult::Failure(400, "bad argument");
+	CHECK(dvb::ToolErrorText(legacy) == "[400] bad argument");
+	CHECK(!dvb::ToolErrorBody(legacy).contains("details"));
+}
+
 TEST_CASE("re-registering the same name reports replacement")
 {
 	ToolRegistry reg;

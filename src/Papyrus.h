@@ -8,7 +8,8 @@ namespace dvb
 
 	namespace Papyrus
 	{
-		/// Dispatch a call and report acceptance without waiting for its return value.
+		/// Dispatch an exact explicit-argument call and report VM acceptance, not execution.
+		/// Includes a response-time callReceipt; timeout never authorizes automatic retry.
 		json QueueCall(const json& a_args);
 
 		/// papyrus tool: list/describe the live Papyrus callable surface and invoke functions,

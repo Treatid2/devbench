@@ -6,10 +6,9 @@
 
 namespace dvb::PapyrusDefaults
 {
-	/// A default a Papyrus source file declares for an optional parameter. The compiler writes these
-	/// into each call site, so the running VM never sees them; this is the table of the non-neutral
-	/// ones (anything other than None / 0 / 0.0 / false / "") for commonly called vanilla and SKSE
-	/// functions.
+	/// Historical, unverified source hints, NOT defaults from a loaded declaration.
+	/// No source/version/signature provenance binds this corpus to a running VM.
+	/// Papyrus call never applies it: every runtime argument must be explicit.
 	struct Value
 	{
 		enum class Kind
@@ -22,8 +21,9 @@ namespace dvb::PapyrusDefaults
 		double number;
 	};
 
-	/// Matches the declaring script, function, and parameter names, ignoring case. A native function's parameters
-	/// have no names at run time ("param1", "param2", ...); pass the 0-based position and those match by position.
+	/// Lookup requires script/function, zero-based position and kind, plus either
+	/// the case-insensitive stored name or a coherent one-based paramN placeholder.
+	/// A match is still only an unverified hint, never optionality/default authority.
 	std::optional<Value> Find(std::string_view a_script, std::string_view a_function, std::string_view a_param,
-		std::optional<std::uint32_t> a_index = std::nullopt);
+		std::uint32_t a_index, Value::Kind a_kind);
 }

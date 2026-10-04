@@ -27,8 +27,9 @@ namespace dvb
 	struct ToolError : std::runtime_error
 	{
 		int code;  ///< 400 bad args, 404 not found, 409 conflict, 422 unprocessable, 500 internal
-		ToolError(int a_code, const std::string& a_msg) :
-			std::runtime_error(a_msg), code(a_code) {}
+		json details = nullptr;  ///< optional copied receipt; no live status/engine objects
+		ToolError(int a_code, const std::string& a_msg, json a_details = nullptr) :
+			std::runtime_error(a_msg), code(a_code), details(std::move(a_details)) {}
 	};
 
 	/// A handler: JSON arguments in, JSON result out. Invoked on the server's listener
@@ -60,13 +61,30 @@ namespace dvb
 		json        value;  ///< result payload when ok
 		int         errorCode = 0;
 		std::string errorMessage;
+		json        errorDetails = nullptr;
 
 		static ToolResult Success(json a_value) { return { true, std::move(a_value), 0, {} }; }
-		static ToolResult Failure(int a_code, std::string a_msg)
+		static ToolResult Failure(int a_code, std::string a_msg, json a_details = nullptr)
 		{
-			return { false, json::object(), a_code, std::move(a_msg) };
+			return { false, json::object(), a_code, std::move(a_msg), std::move(a_details) };
 		}
 	};
+
+	// Shared by actual adapters and host tests. Preserve legacy error text/shape
+	// unless a handler deliberately supplies structured failure evidence.
+	inline json ToolErrorBody(const ToolResult& a_result)
+	{
+		json out{ { "error", a_result.errorMessage }, { "code", a_result.errorCode } };
+		if (!a_result.errorDetails.is_null())
+			out["details"] = a_result.errorDetails;
+		return out;
+	}
+	inline std::string ToolErrorText(const ToolResult& a_result)
+	{
+		if (!a_result.errorDetails.is_null())
+			return ToolErrorBody(a_result).dump();
+		return "[" + std::to_string(a_result.errorCode) + "] " + a_result.errorMessage;
+	}
 
 	/// Transport-agnostic registry. Adapters (MCP, REST) reflect this and never
 	/// reference individual tool names, so registering a tool exposes it on every
