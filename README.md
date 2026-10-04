@@ -199,7 +199,7 @@ MCP clients (which speak `tools/call`, not REST GET) get the same off-thread sig
 The player and reference-light inspection responses preserve `equipped` and
 `caster` and add `heldLightObservationVersion: 2` per hand. `heldLights` keeps
 every discovered view occurrence under the first conventional `SHIELD` (left)
-or `WEAPON` (right) node. An aliased subtree, a duplicate entry, or distinct
+or `WEAPON` (right) node. Across selected views, an aliased subtree or distinct
 first-/third-person instances may appear more than once. Native pointers are
 deduplicated within each selected graph, not across views or as logical equipped
 light identities.

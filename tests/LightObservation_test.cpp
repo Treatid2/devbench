@@ -190,3 +190,14 @@ TEST_CASE("held-light bounded coverage keeps version2 aliases and cross-view occ
 	CHECK(hand["heldLightCoverage"][0]["traversalCoverage"] == "bounded-unique-pointer-subgraph");
 	CHECK(hand["heldLightCoverage"][0]["graphCoverage"]["traversal"]["complete"] == false);
 }
+
+TEST_CASE("light bounded names do not split a UTF-8 codepoint at the cap")
+{
+	Budget budget;
+	const auto name = std::string(255, 'x') + "\xE2\x82\xAC";
+	CHECK(BoundedName(name.c_str(), budget) == std::string(255, 'x'));
+	CHECK(budget.reasons.contains("name-length-budget"));
+	Budget exact;
+	CHECK(BoundedName((std::string(253, 'x') + "\xE2\x82\xAC").c_str(), exact).size() == 256);
+	CHECK(BoundedName(nullptr, exact).empty());
+}

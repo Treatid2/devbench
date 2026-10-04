@@ -219,4 +219,22 @@ namespace dvb::LightObservation
 				std::tuple(a_other.distance.value_or(std::numeric_limits<double>::infinity()), a_other.owner, a_other.path, a_other.name, a_other.type, a_other.pointer);
 		}
 	};
+	inline std::string BoundedName(const char* a_name, Budget& a_budget)
+	{
+		if (!a_name) return {};
+		constexpr std::size_t cap = 256;
+		std::size_t length = 0;
+		while (length < cap && a_name[length]) ++length;
+		if (length == cap) {
+			a_budget.reasons.emplace("name-length-budget");
+			// Do not introduce an incomplete UTF-8 character when clipping an
+			// otherwise valid engine name. Existing invalid encodings are not repaired.
+			std::size_t lead = length - 1;
+			while (lead > 0 && (static_cast<unsigned char>(a_name[lead]) & 0xC0) == 0x80) --lead;
+			const auto byte = static_cast<unsigned char>(a_name[lead]);
+			const std::size_t width = byte >= 0xF0 ? 4 : byte >= 0xE0 ? 3 : byte >= 0xC0 ? 2 : 1;
+			if (length - lead < width) length = lead;
+		}
+		return std::string(a_name, length);
+	}
 }

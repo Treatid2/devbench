@@ -921,12 +921,7 @@ namespace dvb
 
 		std::string LightName(const char* a_name, LightContext& a_context)
 		{
-			if (!a_name) return {};
-			constexpr std::size_t cap = 256;
-			std::size_t length = 0;
-			while (length < cap && a_name[length]) ++length;
-			if (length == cap) a_context.budget.reasons.emplace("name-length-budget");
-			return std::string(a_name, length);
+			return LightObservation::BoundedName(a_name, a_context.budget);
 		}
 		struct NativeLightChildren
 		{
@@ -1117,7 +1112,7 @@ namespace dvb
 			const auto* light = caster->light ? caster->light->light.get() : nullptr;
 			const bool admitted = light && a_context.budget.Emit(light);
 			c["lightSourceAvailable"] = light != nullptr;
-			c["lightObservationComplete"] = !light || admitted;
+			c["lightDescriptionAdmitted"] = admitted;
 			if (admitted)
 				c["light"] = DescribeLight(light, nullptr, a_context);
 			else
