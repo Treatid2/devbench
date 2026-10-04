@@ -137,7 +137,9 @@ namespace dvb::CalendarControl
 			if (!_lease || _lease->cleanupAttempted)
 				return _result;
 			const auto s = _backend.Read();
-			if (!s.available || !s.source.SameStorage(_lease->baseline.source))
+			if (!s.available)
+				return RetainFailedCleanup();
+			if (!s.source.SameStorage(_lease->baseline.source))
 				return Forget({ false, "source_invalidated_without_restore", false });
 			if (s.rate != 0)
 				return Forget({ false, "external_rate_write_without_restore", false });
@@ -157,10 +159,11 @@ namespace dvb::CalendarControl
 			if (!_lease)
 				return _result;
 			if (a_restoreAllowed)
-				Restore(a_reason);
-			if (_lease)
-				return Forget({ false, a_reason + "_invalidated_without_restore", false });
-			return _result;
+				// A failed cleanup needs the exact owner's explicit release, not
+				// repeated lifecycle/pump writes. Restore itself retires only
+				// verified restoration or proven source/foreign-rate invalidation.
+				return _lease->cleanupAttempted ? _result : Restore(a_reason);
+			return Forget({ false, a_reason + "_invalidated_without_restore", false });
 		}
 
 	private:
@@ -176,7 +179,9 @@ namespace dvb::CalendarControl
 		Outcome Restore(const std::string& a_reason)
 		{
 			const auto s = _backend.Read();
-			if (!s.available || !s.source.SameStorage(_lease->baseline.source))
+			if (!s.available)
+				return RetainFailedCleanup();
+			if (!s.source.SameStorage(_lease->baseline.source))
 				return Forget({ false, "source_invalidated_without_restore", false });
 			if (s.rate != 0)
 				return Forget({ false, "external_rate_write_without_restore", false });
@@ -185,6 +190,13 @@ namespace dvb::CalendarControl
 			const auto after = _backend.Read();
 			if (wrote && after.available && after.source.SameStorage(s.source) && after.rate == _lease->baseline.rate)
 				return Forget({ true, a_reason, true });
+			return RetainFailedCleanup();
+		}
+
+		Outcome RetainFailedCleanup()
+		{
+			// Unavailable readback cannot prove storage replacement or restoration.
+			_lease->cleanupAttempted = true;
 			_result = { false, "restore_failed_requires_explicit_release", false };
 			return _result;
 		}

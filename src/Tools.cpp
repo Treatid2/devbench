@@ -1,5 +1,6 @@
 #include "Tools.h"
 
+#include "CalendarAdmission.h"
 #include "CalendarControl.h"
 
 #include "Capture.h"
@@ -757,8 +758,10 @@ namespace dvb
 				throw ToolError(400, "'hours' must be a positive integer");
 			if (hours > kMaxWaitHours)
 				throw ToolError(400, std::format("'hours' must be <= {}", kMaxWaitHours));
+			CalendarControl::RequireIdle(CalendarControl::Outstanding());
 
 			return MainThread::RunAndWait([hours, a_sleep]() -> json {
+				CalendarControl::RequireIdle(CalendarControl::Outstanding());
 				auto* pc = RE::PlayerCharacter::GetSingleton();
 				if (!pc)
 					return json{ { "completed", false }, { "reason", "no PlayerCharacter" } };
@@ -2923,7 +2926,7 @@ namespace dvb
 			"menu's UI at all: starts the wait, then drives its completion (autosave, script "
 			"events) to done before returning — no polling needed. Refuses with "
 			"{ completed:false, reason } on the same gate the menu itself enforces (combat, "
-			"trespassing, midair, hostiles nearby, etc.).";
+			"trespassing, midair, hostiles nearby, etc.). Refused with 409 while calendar custody is outstanding, including unverified cleanup.";
 		wait.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
@@ -2940,7 +2943,7 @@ namespace dvb
 		sleep.description =
 			"Advance time by sleeping `hours` (the rest variant — drives the well-rested / "
 			"lover's-comfort bonus). Same mechanics as `wait`: synchronous, no menu UI, "
-			"refuses with { completed:false, reason } on the same gate the menu enforces.";
+			"refuses with { completed:false, reason } on the same gate the menu enforces. Refused with 409 while calendar custody is outstanding, including unverified cleanup.";
 		sleep.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
