@@ -13,8 +13,10 @@ not values previously read by a client. Absolute time/date adjustment is absent.
    current runtime/artifact binding before mutation.
 2. `hold` requires `owner`, `commandId`, the exact returned `binding` object,
    and integer `holdMs` in 1..300000. There is no renewal or implicit extension.
-3. `release` requires the same owner and exact source binding, `leaseId` from
-   the hold receipt, and a caller-selected `commandId`. A matching release of
+3. `release` requires the same owner, the exact retained `lease.binding` and
+   `leaseId` from the hold receipt, and a caller-selected `commandId` for this
+   release operation (not the original hold command). Do not substitute the
+   current status binding after a cell change. A matching release of
    the most recently completed lease is repeatable without another write.
 
 ```python
@@ -40,7 +42,12 @@ never substitute guessed IDs. The live tool schema lists every required field.
 processSession (PID + native process creation time), PID, loadGeneration,
 cellFormId and six globalFormIds, ordered year/month/day/gameHour/daysPassed/
 calendarRate. Months are zero-based engine values. Internally, source storage
-identities are also compared; raw pointers are never returned.
+identities are also compared; raw pointers are never returned. The recorded
+cell belongs to the lease's acquisition context. An explicit cleanup release
+can restore in a different cell only after an independent current read proves
+the same process, generation, calendar object and global storage, with the rate
+still at the extension-owned zero. Hold admission still requires the exact
+current scene binding. Cell drift is not authority to adopt a different lease.
 
 MCP ownership additionally binds its actual transport session. Stateless REST
 has only the explicit cooperative owner/lease/source binding; these are audit
@@ -83,8 +90,9 @@ Failed restoration stays tracked for an explicit matching release; the pump
 and repeated cleanup events do not enter an automatic retry loop. A failed
 save/loading-menu/pre-load/service-stop cleanup does not silently retire
 uncertain custody. Unavailable readback is uncertainty, not proven source
-replacement. Retry needs the same owner/session/lease and a still-matching
-identified source; an actual new-load generation invalidates old custody
+replacement. Retry needs the same owner/session/lease and exact recorded lease
+binding, even after cell drift. Current storage identity is independently
+re-read before any restore; an actual new-load generation invalidates old custody
 without writing its baseline into the new globals. Retention cannot make a
 stopped endpoint, stalled thread or superseded load releasable. A not-yet-started queued request is
 abandoned at its deadline. An already-started call may complete late; the
