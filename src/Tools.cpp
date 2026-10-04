@@ -16,6 +16,7 @@
 #include "HandObservation.h"
 #include "Json.h"
 #include "KeyboardInput.h"
+#include "LightObservation.h"
 #include "MainThread.h"
 #include "NewGameControl.h"
 #include "Papyrus.h"
@@ -878,88 +879,136 @@ namespace dvb
 			return j;
 		}
 
-		// ---- lights: which NiLights hang under a reference's 3D, and whether the renderer uses them ----
+		// ---- bounded light observation; renderer membership is not visibility ----
 
-		// NiLight -> "active" / "shadow" for every light the world ShadowSceneNode is lighting with.
 		using ActiveLightIndex = std::unordered_map<const RE::NiLight*, const char*>;
-
-		ActiveLightIndex IndexActiveLights()
+		struct LightContext
 		{
-			ActiveLightIndex index;
-			auto*            ssn = RE::BSShaderManager::State::GetSingleton().shadowSceneNode[0];
-			if (!ssn)
-				return index;
-			auto& data = ssn->GetRuntimeData();
-			for (const auto& bl : data.activeLights)
-				if (bl && bl->light)
-					index.emplace(bl->light.get(), "active");
-			for (const auto& bl : data.activeShadowLights)
-				if (bl && bl->light)
-					index[bl->light.get()] = "shadow";
-			return index;
-		}
-
-		// "NPC Root [Root] > ... > MagicRight" from a_root (or the top of the graph) down to the
-		// light's parent node.
-		std::string NodePath(const RE::NiAVObject* a_object, const RE::NiAVObject* a_root)
-		{
-			std::vector<std::string> names;
-			for (const RE::NiAVObject* n = a_object->parent; n; n = n->parent) {
-				names.emplace_back(n->name.c_str() ? n->name.c_str() : "");
-				if (n == a_root || names.size() >= 64)
-					break;
+			LightObservation::Budget budget;
+			ActiveLightIndex active;
+			bool rendererAvailable = false, rendererComplete = true;
+			json Source() const
+			{
+				return json{ { "source", "BSShaderManager.shadowSceneNode[0]" }, { "index", 0 },
+					{ "lists", json::array({ "activeShadowLights", "activeLights" }) },
+					{ "available", rendererAvailable }, { "complete", rendererAvailable && rendererComplete },
+					{ "observedUniqueLights", active.size() }, { "visibleIlluminationProven", false } };
 			}
-			std::string path;
-			for (auto it = names.rbegin(); it != names.rend(); ++it)
-				path += (path.empty() ? "" : " > ") + (it->empty() ? std::string("(unnamed)") : *it);
-			return path;
-		}
-
-		// The reference whose 3D this object hangs under, from the nearest ancestor that carries one.
-		RE::TESObjectREFR* OwnerOf(const RE::NiAVObject* a_object)
+		};
+		void IndexActiveLights(LightContext& a_context)
 		{
-			for (const RE::NiAVObject* n = a_object; n; n = n->parent)
-				if (auto* ref = n->GetUserData())
-					return ref;
-			return nullptr;
+			auto* ssn = RE::BSShaderManager::State::GetSingleton().shadowSceneNode[0];
+			a_context.rendererAvailable = ssn != nullptr;
+			if (!ssn) return;
+			auto& data = ssn->GetRuntimeData();
+			const auto scan = [&](const auto& a_list, const char* a_membership) {
+				for (const auto& bl : a_list) {
+					if (!a_context.budget.Take(a_context.budget.rendererEntries,
+						a_context.budget.limits.rendererEntries, "renderer-entry-budget")) return false;
+					if (!bl || !bl->light) continue;
+					auto* light = bl->light.get();
+					if (!a_context.budget.TrackLight(light)) return false;
+					a_context.active.emplace(light, a_membership);
+				}
+				return true;
+			};
+			// Shadow precedence, including when the scan is truncated. Every slot,
+			// including null and duplicate slots, consumes the renderer-entry budget.
+			a_context.rendererComplete = scan(data.activeShadowLights, "shadow");
+			if (a_context.rendererComplete)
+				a_context.rendererComplete = scan(data.activeLights, "active");
 		}
 
-		json DescribeLight(const RE::NiLight* a_light, const RE::NiAVObject* a_root, const ActiveLightIndex& a_active)
+		std::string LightName(const char* a_name, LightContext& a_context)
+		{
+			if (!a_name) return {};
+			constexpr std::size_t cap = 256;
+			std::size_t length = 0;
+			while (length < cap && a_name[length]) ++length;
+			if (length == cap) a_context.budget.reasons.emplace("name-length-budget");
+			return std::string(a_name, length);
+		}
+		struct NativeLightChildren
+		{
+			std::size_t Count(const RE::NiAVObject* a_object) const
+			{
+				auto* node = const_cast<RE::NiAVObject*>(a_object)->AsNode();
+				return node ? node->GetChildren().size() : 0;
+			}
+			const RE::NiAVObject* Child(const RE::NiAVObject* a_object, std::size_t a_index) const
+			{
+				return const_cast<RE::NiAVObject*>(a_object)->AsNode()->GetChildren()[a_index].get();
+			}
+		};
+		struct LightLineage
+		{
+			std::string path;
+			RE::TESObjectREFR* owner = nullptr;
+			LightObservation::WalkReport coverage;
+		};
+		LightLineage DescribeLightLineage(const RE::NiAVObject* a_object,
+			const RE::NiAVObject* a_root, LightContext& a_context)
+		{
+			LightLineage lineage;
+			std::vector<std::string> names;
+			lineage.coverage = LightObservation::Parents(a_object, a_context.budget,
+				[](const RE::NiAVObject* n) -> const RE::NiAVObject* { return n->parent; },
+				[&](const RE::NiAVObject* n) {
+					if (!lineage.owner) lineage.owner = n->GetUserData();
+					if (n != a_object) names.push_back(LightName(n->name.c_str(), a_context));
+					return n == a_root;
+				});
+			for (auto it = names.rbegin(); it != names.rend(); ++it)
+				lineage.path += (lineage.path.empty() ? "" : " > ") + (it->empty() ? std::string("(unnamed)") : *it);
+			return lineage;
+		}
+		json DescribeLight(const RE::NiLight* a_light, const RE::NiAVObject* a_root,
+			LightContext& a_context, RE::TESObjectREFR** a_owner = nullptr)
 		{
 			const auto& data = a_light->GetLightRuntimeData();
-			const auto  pos = a_light->world.translate;
-			const auto  scene = a_active.find(a_light);
-			json        j{
-				{ "name", a_light->name.c_str() ? a_light->name.c_str() : "" },
-				{ "type", a_light->GetRTTI() && a_light->GetRTTI()->GetName() ? a_light->GetRTTI()->GetName() : "" },
-				{ "path", NodePath(a_light, a_root) },
+			const auto pos = a_light->world.translate;
+			const auto scene = a_context.active.find(a_light);
+			const auto lineage = DescribeLightLineage(a_light, a_root, a_context);
+			if (a_owner) *a_owner = lineage.owner;
+			return json{
+				{ "name", LightName(a_light->name.c_str(), a_context) },
+				{ "type", LightName(a_light->GetRTTI() ? a_light->GetRTTI()->GetName() : nullptr, a_context) },
+				{ "path", lineage.path }, { "lineageCoverage", lineage.coverage.Fields() },
 				{ "diffuse", json::array({ data.diffuse.red, data.diffuse.green, data.diffuse.blue }) },
-				{ "radius", data.radius.x },
-				{ "fade", data.fade },
-				{ "fadeAmount", a_light->fadeAmount },
+				{ "radius", data.radius.x }, { "fade", data.fade }, { "fadeAmount", a_light->fadeAmount },
 				{ "appCulled", a_light->GetAppCulled() },
-				{ "inScene", scene != a_active.end() ? json(scene->second) : json(false) },
-				{ "position", json::array({ pos.x, pos.y, pos.z }) },
+				{ "inScene", scene != a_context.active.end() ? json(scene->second) :
+					(a_context.rendererAvailable && a_context.rendererComplete ? json(false) : json(nullptr)) },
+				{ "position", json::array({ pos.x, pos.y, pos.z }) }
 			};
-			return j;
 		}
-
-		void CollectLights(const RE::NiAVObject* a_object, const RE::NiAVObject* a_root, const ActiveLightIndex& a_active, json& a_out, int a_depth = 0)
-		{
-			if (!a_object || a_depth > 256)
-				return;
-			if (const auto* light = netimmerse_cast<const RE::NiLight*>(a_object))
-				a_out.push_back(DescribeLight(light, a_root, a_active));
-			if (auto* node = const_cast<RE::NiAVObject*>(a_object)->AsNode())
-				for (const auto& child : node->GetChildren())
-					CollectLights(child.get(), a_root, a_active, a_out, a_depth + 1);
-		}
-
-		json LightsUnder(const RE::NiAVObject* a_root, const ActiveLightIndex& a_active)
+		json LightsUnder(const RE::NiAVObject* a_root, LightContext& a_context, json& a_coverage)
 		{
 			json out = json::array();
-			CollectLights(a_root, a_root, a_active, out);
+			bool outputCut = false;
+			auto report = LightObservation::Walk(a_root, a_context.budget, NativeLightChildren{},
+				[&](const RE::NiAVObject* object) {
+					if (const auto* light = netimmerse_cast<const RE::NiLight*>(object)) {
+						if (a_context.budget.Emit(light)) out.push_back(DescribeLight(light, a_root, a_context));
+						else outputCut = true;
+					}
+					return false;
+				});
+			if (outputCut) report.Cut(a_context.budget, "light-output-incomplete");
+			a_coverage = report.Fields();
 			return out;
+		}
+		const RE::NiAVObject* FindHeldNode(const RE::NiAVObject* a_root, const char* a_name,
+			LightContext& a_context, json& a_coverage)
+		{
+			const RE::NiAVObject* found = nullptr;
+			const auto report = LightObservation::Walk(a_root, a_context.budget, NativeLightChildren{},
+				[&](const RE::NiAVObject* object) {
+					if (object->name == a_name) { found = object; return true; }
+					return false;
+				});
+			a_coverage = report.Fields();
+			return found;
 		}
 
 		// ---- hands: what each hand holds, whether it is out, and whether its casting art is on ----
@@ -1032,7 +1081,7 @@ namespace dvb
 			return out;
 		}
 
-		json DescribeHand(RE::Actor* a_actor, bool a_left, const EngineHandObservation& a_observed, const ActiveLightIndex& a_active)
+		json DescribeHand(RE::Actor* a_actor, bool a_left, const EngineHandObservation& a_observed, LightContext& a_context)
 		{
 			json j = HandObservation::HandFields(a_observed.policy);
 			j["equipped"] = IdentifyForm(a_observed.equipped);
@@ -1042,9 +1091,12 @@ namespace dvb
 			const char* nodeName = ConventionalHeldNodeName(a_left);
 			for (const bool firstPerson : { false, true }) {
 				auto* root = a_actor->Get3D(firstPerson);
-				auto* node = root ? root->GetObjectByName(nodeName) : nullptr;
+				json search, traversal;
+				const auto* node = FindHeldNode(root, nodeName, a_context, search);
+				auto lights = LightsUnder(node, a_context, traversal);
 				held.AddView(firstPerson ? "firstPerson" : "thirdPerson", nodeName,
-					root != nullptr, node != nullptr, node ? LightsUnder(node, a_active) : json::array());
+					root != nullptr, node != nullptr, std::move(lights),
+					json{ { "search", std::move(search) }, { "traversal", std::move(traversal) } });
 			}
 			std::move(held).WriteTo(j);
 			auto* caster = a_observed.caster;
@@ -1062,30 +1114,41 @@ namespace dvb
 				{ "magicNode", caster->magicNode && caster->magicNode->name.c_str() ? json(caster->magicNode->name.c_str()) : json(nullptr) },
 			};
 			// The hand light the engine gives a readied spell (its magic effect's casting light).
-			if (caster->light && caster->light->light)
-				c["light"] = DescribeLight(caster->light->light.get(), nullptr, a_active);
+			const auto* light = caster->light ? caster->light->light.get() : nullptr;
+			const bool admitted = light && a_context.budget.Emit(light);
+			c["lightSourceAvailable"] = light != nullptr;
+			c["lightObservationComplete"] = !light || admitted;
+			if (admitted)
+				c["light"] = DescribeLight(light, nullptr, a_context);
 			else
 				c["light"] = nullptr;
 			j["caster"] = std::move(c);
 			return j;
 		}
 
-		json DescribeHands(RE::Actor* a_actor)
+		json DescribeHands(RE::Actor* a_actor, LightContext& a_context)
 		{
 			const auto left = ReadHand(a_actor, true);
 			const auto right = ReadHand(a_actor, false);
 			auto* state = a_actor->AsActorState();
 			const auto weaponState = state ? std::optional(state->GetWeaponState()) : std::nullopt;
 			const HandObservation::Hands observed{ a_actor->Get3D() != nullptr, weaponState && *weaponState == RE::WEAPON_STATE::kDrawn, left.policy, right.policy };
-			const auto active = IndexActiveLights();
 			json j = HandObservation::HandsFields(observed);
-			j["left"] = DescribeHand(a_actor, true, left, active);
-			j["right"] = DescribeHand(a_actor, false, right, active);
+			j["left"] = DescribeHand(a_actor, true, left, a_context);
+			j["right"] = DescribeHand(a_actor, false, right, a_context);
+			j["lightObservation"] = json{ { "source", a_context.Source() }, { "budget", a_context.budget.Fields() } };
 			if (state) {
 				j["weaponDrawn"] = state->IsWeaponDrawn();
 				j["weaponState"] = WeaponStateName(*weaponState);
 			}
 			return j;
+		}
+
+		json DescribeHands(RE::Actor* a_actor)
+		{
+			LightContext context;
+			IndexActiveLights(context);
+			return DescribeHands(a_actor, context);
 		}
 
 		// Normalize a form-type filter to a substring needle. The engine's type strings are 4-char
@@ -1505,32 +1568,52 @@ namespace dvb
 			//   'selected'    → the console-selected / crosshair ref (set via prid/click)
 			//   else enumerate the loaded references in the grid (on-screen or not), with optional
 			//                   'formType' filter, 'radius' (from player), and 'limit' (default 100).
-			// lights: every NiLight under a reference's 3D (default the player, both 3rd- and
-			// 1st-person), or scope='scene' for every light the renderer is using, nearest first.
+			// lights: bounded unique-pointer observations under reference/view roots, or
+			// the observed world shadow-scene lists. List membership is not visibility.
 			if (kind == "lights") {
-				const std::string formId = a_args.value("formId", std::string{});
-				const bool        selected = a_args.value("selected", false);
-				const bool        scene = a_args.value("scope", std::string{}) == "scene";
-				const double      radius = a_args.value("radius", 0.0);
-				const int         limit = a_args.value("limit", 100);
-				if (radius < 0.0 || limit < 0)
-					throw ToolError(400, "inspect lights: 'radius' and 'limit' must be >= 0");
+				LightObservation::Request request;
+				try { request = LightObservation::ParseRequest(a_args); }
+				catch (const std::invalid_argument& error) {
+					throw ToolError(400, std::string("inspect lights: ") + error.what());
+				}
+				const auto& formId = request.formId;
+				const bool selected = request.selected, scene = request.scene;
+				const double radius = request.radius;
+				const int limit = request.limit;
 				return MainThread::RunAndWait([=]() -> json {
-					const auto active = IndexActiveLights();
+					LightContext context;
+					IndexActiveLights(context);
 					auto*      pc = RE::PlayerCharacter::GetSingleton();
 
 					if (scene) {
-						const RE::NiPoint3                  origin = pc ? pc->GetPosition() : RE::NiPoint3{};
-						std::vector<std::pair<float, json>> found;
-						for (const auto& entry : active) {
+						std::optional<LightObservation::Position> origin;
+						if (pc && pc->Is3DLoaded()) {
+							const auto pos = pc->GetPosition();
+							LightObservation::Position candidate{ pos.x, pos.y, pos.z };
+							if (LightObservation::Finite(candidate)) origin = candidate;
+						}
+						if (radius > 0 && !origin)
+							throw ToolError(503, "inspect lights: radius requires a loaded player with finite position");
+						std::vector<std::pair<LightObservation::SortKey, json>> found;
+						for (const auto& entry : context.active) {
 							const RE::NiLight* light = entry.first;
-							const float        distance = pc ? origin.GetDistance(light->world.translate) : 0.0f;
-							if (radius > 0.0 && distance > radius)
+							const auto pos = light->world.translate;
+							const auto distance = LightObservation::Distance(origin, { pos.x, pos.y, pos.z });
+							if (radius > 0 && !distance) {
+								context.budget.reasons.emplace("radius-geometry-unavailable");
 								continue;
-							json j = DescribeLight(light, nullptr, active);
-							j["distance"] = distance;
-							j["owner"] = IdentifyRef(OwnerOf(light));
-							found.emplace_back(distance, std::move(j));
+							}
+							if (radius > 0.0 && *distance > radius)
+								continue;
+							if (!context.budget.Emit(light)) break;
+							RE::TESObjectREFR* owner = nullptr;
+							json j = DescribeLight(light, nullptr, context, &owner);
+							j["distance"] = distance ? json(*distance) : json(nullptr);
+							j["owner"] = IdentifyRef(owner);
+							LightObservation::SortKey key{ distance, owner ? owner->GetFormID() : 0,
+								j["path"].get<std::string>(), j["name"].get<std::string>(), j["type"].get<std::string>(),
+								reinterpret_cast<std::uintptr_t>(light) };
+							found.emplace_back(std::move(key), std::move(j));
 						}
 						std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
 						json lights = json::array();
@@ -1540,7 +1623,11 @@ namespace dvb
 							{ "scope", "scene" },
 							{ "count", found.size() },
 							{ "returned", lights.size() },
-							{ "truncated", found.size() > lights.size() },
+							{ "truncated", found.size() > lights.size() || !context.budget.reasons.empty() || !context.rendererAvailable || !context.rendererComplete },
+							{ "countScope", "filtered-observed-subset-before-limit" },
+							{ "playerPositionAvailable", origin.has_value() },
+							{ "ordering", "distance-ownerFormId-path-name-type-pointer; pointer tie-break is process-local" },
+							{ "lightObservation", { { "source", context.Source() }, { "budget", context.budget.Fields() } } },
 							{ "lights", std::move(lights) },
 						};
 					}
@@ -1568,15 +1655,20 @@ namespace dvb
 					if (!ref)
 						throw ToolError(404, "inspect lights: reference not found");
 
-					json out{ { "ref", IdentifyRef(ref) }, { "sceneActiveLights", active.size() } };
+					json out{ { "scope", "ref" }, { "ref", IdentifyRef(ref) }, { "sceneActiveLights", context.active.size() } };
+					json coverage;
 					if (auto* actor = ref->As<RE::Actor>(); actor && actor == pc) {
-						out["thirdPerson"] = LightsUnder(pc->Get3D(false), active);
-						out["firstPerson"] = LightsUnder(pc->Get3D(true), active);
+						out["thirdPerson"] = LightsUnder(pc->Get3D(false), context, coverage);
+						out["graphCoverage"]["thirdPerson"] = coverage;
+						out["firstPerson"] = LightsUnder(pc->Get3D(true), context, coverage);
+						out["graphCoverage"]["firstPerson"] = coverage;
 					} else {
-						out["lights"] = LightsUnder(ref->Get3D(), active);
+						out["lights"] = LightsUnder(ref->Get3D(), context, coverage);
+						out["graphCoverage"]["lights"] = coverage;
 					}
 					if (auto* actor = ref->As<RE::Actor>())
-						out["hands"] = DescribeHands(actor);
+						out["hands"] = DescribeHands(actor, context);
+					out["lightObservation"] = json{ { "source", context.Source() }, { "budget", context.budget.Fields() } };
 					return out;
 				});
 			}
@@ -2673,7 +2765,7 @@ namespace dvb
 				"heldLightObservationVersion:2, heldLights (view occurrences), "
 				"heldLightEntriesInScene (active/shadow entry count, not unique or visible), "
 				"heldLightCoverage (per-view rootAvailable/searchedNode/nodeFound; first conventional SHIELD/WEAPON only, "
-				"depth-limited without completeness proof), visibleIlluminationProven:false, "
+				"bounded search/traversal graphCoverage), visibleIlluminationProven:false, "
 				"heldLightsRendered (deprecated entry-count alias), heldLightsRenderedSemantics, "
 				"caster:null|{state, stateValue, currentSpell, "
 				"castingArt, castingArtAttached, castingArtLoading, magicNode, light}}} }; "
@@ -2682,11 +2774,16 @@ namespace dvb
 				"render/capture readiness. allSpellArtObserved is vacuously true for non-spell hands; "
 				"handsArtObserved additionally requires 3D and exact settled kDrawn. weaponDrawn/weaponState "
 				"are omitted when actor-state is unavailable. "
-				"'lights' → every NiLight under a reference's 3D (default the player: thirdPerson + firstPerson; "
+				"'lights' → bounded unique-pointer NiLight observations under a reference's 3D (default player views; "
 				"or 'formId' / 'selected') as {name, type, path, diffuse, radius, fade, fadeAmount, appCulled, "
-				"inScene:'active'|'shadow'|false, position}, plus an actor's hands (each hand's casting light); "
-				"scope='scene' instead lists every light the renderer is using, nearest first, each with its "
-				"'owner' reference and 'distance' ('radius', 'limit'); "
+				"inScene:'active'|'shadow'|false|null, position, lineageCoverage}, plus actor hands; graphCoverage "
+				"and lightObservation expose shared work budgets and partial discovery. Membership is not visibility. "
+				"scope='scene' observes only shadowSceneNode[0] activeShadowLights/activeLights, not all renderer lights. "
+				"Rows have owner and distance (null without loaded finite player/light geometry); positive radius "
+				"requires player geometry and excludes unavailable light geometry with partial-coverage reason. "
+				"Stable distance/ownerFormId/path/name/type/process-local-pointer ordering precedes limit; count is "
+				"the filtered observed subset, not an unknown global total. scope admits only omitted/ref/scene; "
+				"scene rejects even empty/false formId/selected. radius/limit apply to scene rows only; "
 				"'inventory' → items held by the player (or a container 'formId') { owner, count, items:[{formId, "
 				"name, formType, count, value, weight, equipped}] } (filters: 'formType', 'limit'); "
 				"'quests' → journal (running/completed) { count, quests:[{formId, name, stage, type, active, "
@@ -2723,7 +2820,7 @@ namespace dvb
 									{ "kind", json{ { "type", "string" }, { "enum", kinds }, { "description", "state | health | vm | scene | mods | player | inventory | quests | effects | refs | lights | registrants | screenshots | extensions (health answers off-thread for liveness+identity; or a registered mod kind — listed here + via kind=extensions)" } } },
 									{ "formId", json{ { "type", "string" }, { "description", "refs: identify this form; inventory: the container ref to read (default player); effects: the actor to read (default player); lights: the reference whose 3D to read (default player) (hex formId, e.g. 0x14, or EditorID)" } } },
 									{ "selected", json{ { "type", "boolean" }, { "description", "refs/lights: use the console-selected / crosshair ref instead" } } },
-									{ "scope", json{ { "type", "string" }, { "enum", json::array({ "ref", "scene" }) }, { "description", "lights: 'ref' (default) reads one reference's 3D; 'scene' lists every light the renderer is using, nearest the player first, each with the reference it hangs under" } } },
+									{ "scope", json{ { "type", "string" }, { "enum", json::array({ "ref", "scene" }) }, { "description", "lights: omitted/ref observes one reference's bounded 3D graph; scene observes only shadowSceneNode[0] active/shadow lists with explicit availability/coverage and stable ordering; scene forbids presence of formId/selected" } } },
 									{ "formType", json{ { "type", "string" }, { "description", "refs/inventory: keep only entries whose type matches (e.g. Actor, Weapon, Potion)" } } },
 									{ "model", json{ { "type", "string" }, { "description", "refs enumerate: keep only refs whose base object's mesh path contains this substring (case-insensitive, e.g. 'wrcity01')" } } },
 									{ "radius", json{ { "type", "number" }, { "description", "refs enumerate / lights scope=scene: only those within this distance of the player (0 = no limit)" } } },

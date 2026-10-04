@@ -19,16 +19,21 @@ namespace dvb
 	{
 	public:
 		void AddView(const char* a_view, const char* a_nodeName, bool a_rootAvailable,
-			bool a_nodeFound, json a_lights)
+			bool a_nodeFound, json a_lights, json a_coverage = nullptr)
 		{
 			const bool found = a_rootAvailable && a_nodeFound;
-			_views.push_back(json{
+			json view{
 				{ "view", a_view }, { "rootAvailable", a_rootAvailable },
 				{ "searchedNode", a_nodeName }, { "nodeFound", found },
 				{ "coverage", "conventional-first-named-node-only" },
 				{ "traversalCoverage", "depth-limited-no-completeness-proof" },
 				{ "maxTraversalDepth", 256 }
-			});
+			};
+			if (!a_coverage.is_null()) {
+				view["traversalCoverage"] = "bounded-unique-pointer-subgraph";
+				view["graphCoverage"] = std::move(a_coverage);
+			}
+			_views.push_back(std::move(view));
 			if (!found)
 				return;
 			for (auto& light : a_lights) {

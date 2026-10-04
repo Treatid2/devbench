@@ -200,8 +200,9 @@ The player and reference-light inspection responses preserve `equipped` and
 `caster` and add `heldLightObservationVersion: 2` per hand. `heldLights` keeps
 every discovered view occurrence under the first conventional `SHIELD` (left)
 or `WEAPON` (right) node. An aliased subtree, a duplicate entry, or distinct
-first-/third-person instances may appear more than once; no native-pointer or
-logical-equipped-light deduplication is claimed.
+first-/third-person instances may appear more than once. Native pointers are
+deduplicated within each selected graph, not across views or as logical equipped
+light identities.
 
 `heldLightEntriesInScene` counts entries whose `inScene` is exactly `active` or
 `shadow`. This is renderer-list membership only. `appCulled`, fade and other
@@ -212,12 +213,54 @@ unique lights or visible illumination. New consumers should use the new name.
 
 `heldLightCoverage` records each view's `rootAvailable`, `searchedNode`, and
 `nodeFound`, with `coverage: conventional-first-named-node-only` and
-`traversalCoverage: depth-limited-no-completeness-proof` (maximum depth 256).
+`traversalCoverage: bounded-unique-pointer-subgraph` and `graphCoverage` for the
+first-match search and selected-subtree traversal (maximum depth 256).
 Missing roots or nodes are incomplete discovery, not proof of no held light.
 Even a found empty node does not establish absence outside that selected
 subtree or beyond the depth limit. Duplicate names and custom skeleton,
 torch/staff or alternative attachment layouts are not exhaustively searched.
-No extra engine traversal or runtime visibility test is performed.
+No runtime visibility test is performed.
+
+### Bounded light observation
+
+`inspect lights` accepts only omitted/`ref`/`scene` scope. Invalid types or values
+return 400 before main-thread dispatch. Scene scope rejects the **presence** of
+`formId` or `selected`, even empty/false selectors. Reference scope rejects an
+active `selected` combined with nonempty `formId`. `radius` must be finite and
+nonnegative, and `limit` an integer in 0..INT_MAX; these filters apply only to
+scene rows. `limit=0` returns no rows while retaining observed count/coverage.
+
+One operation budget covers all player/actor views, held-node searches, casting
+lights, scene-list indexing and lineage lookup: 4096 unique node visits across
+walks, 16384 child slots, 32768 parent steps, 4096 renderer-list slots (including
+null/duplicate slots), 512 distinct light pointers and 512 description rows.
+Depth is limited to 256 edges and each lineage to 64 ancestors including the
+light. Names are clipped to 256 bytes with an explicit reason. Graph traversal
+is iterative, lazily reads child slots and deduplicates pointer identities within
+each walk; parent cycles stop with partial lineage. Repeated views still consume
+the shared budget. `lightObservation.budget` exposes limits, used counts,
+completeness and reasons; `graphCoverage`/`lineageCoverage` qualify each walk.
+These finite work bounds are not a wall-clock deadline, engine-pointer validity
+guarantee or cancellation of an already-running main-thread engine call.
+
+Scene observation is only `BSShaderManager.shadowSceneNode[0]`'s
+`activeShadowLights` and `activeLights` lists, with shadow membership taking
+precedence. It is not all renderer lights or visible illumination. Source index,
+availability, completeness and observed unique count accompany results. `inScene`
+is `active`/`shadow` when observed, false only after a complete available scan,
+otherwise null for unobserved membership. An empty unavailable source is not
+proof of no lights. Reference/hand fields retain their existing shapes and
+version2 policies; completeness applies only to that named/selected pointer
+graph, not every skeleton attachment or renderer visibility.
+
+`playerPositionAvailable` requires loaded player 3D and finite coordinates.
+Without it, distance is null, never invented zero; a positive radius returns 503.
+Unavailable light geometry is excluded from radius-filtered rows and marks
+partial coverage. Distance/owner-formID/path/name/type ordering is applied before
+limit, with a final pointer tie-break stable only within the process. `count` is
+the filtered **observed subset** before the caller's limit; `returned` is its
+returned row count. `truncated` includes limit reduction or bounded-work/geometry
+omissions. Truncated source discovery cannot promise globally nearest results.
 
 ## Built-in tools
 
