@@ -197,7 +197,24 @@ TEST_CASE("light bounded names do not split a UTF-8 codepoint at the cap")
 	const auto name = std::string(255, 'x') + "\xE2\x82\xAC";
 	CHECK(BoundedName(name.c_str(), budget) == std::string(255, 'x'));
 	CHECK(budget.reasons.contains("name-length-budget"));
+	CHECK(budget.Fields()["complete"] == false);
 	Budget exact;
-	CHECK(BoundedName((std::string(253, 'x') + "\xE2\x82\xAC").c_str(), exact).size() == 256);
+	const auto exactName = std::string(253, 'x') + "\xE2\x82\xAC";
+	CHECK(BoundedName(exactName.c_str(), exact) == exactName);
+	CHECK(exact.reasons.empty());
+	CHECK(exact.Fields()["complete"] == true);
 	CHECK(BoundedName(nullptr, exact).empty());
+}
+
+TEST_CASE("light bounded ASCII names report partial only beyond the cap")
+{
+	Budget exact;
+	const auto exactName = std::string(256, 'x');
+	CHECK(BoundedName(exactName.c_str(), exact) == exactName);
+	CHECK(exact.reasons.empty());
+	CHECK(exact.Fields()["complete"] == true);
+	Budget clipped;
+	CHECK(BoundedName(std::string(257, 'x').c_str(), clipped) == exactName);
+	CHECK(clipped.reasons.contains("name-length-budget"));
+	CHECK(clipped.Fields()["complete"] == false);
 }

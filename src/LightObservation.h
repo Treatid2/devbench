@@ -225,7 +225,9 @@ namespace dvb::LightObservation
 		constexpr std::size_t cap = 256;
 		std::size_t length = 0;
 		while (length < cap && a_name[length]) ++length;
-		if (length == cap) {
+		// Engine names are NUL-terminated: one bounded lookahead distinguishes
+		// an exact-cap name from actual clipping without marking complete data partial.
+		if (length == cap && a_name[cap] != '\0') {
 			a_budget.reasons.emplace("name-length-budget");
 			// Do not introduce an incomplete UTF-8 character when clipping an
 			// otherwise valid engine name. Existing invalid encodings are not repaired.
