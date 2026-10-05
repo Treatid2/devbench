@@ -13,6 +13,12 @@ using dvb::TimeScaleControl::Validate;
 
 namespace
 {
+	std::optional<float> Apply(Reconciler& a_reconciler, std::int64_t a_now)
+	{
+		// Pure fixture simulates a successfully issued setter; production owns the native call.
+		return a_reconciler.Reconcile(a_now, [](float) { return true; });
+	}
+
 	constexpr double kClamp = dvb::GameClock::kMaxFrameDeltaMs;
 
 	double Advance(double a_fromGameMs, double a_wallMs, double a_multiplier)
@@ -143,42 +149,42 @@ TEST_CASE("a lease applies its value once and restores the captured baseline on 
 	CHECK(reconciler.Leased(500));
 	CHECK(reconciler.LeaseRemainingMs(500) == 500);
 
-	const auto applied = reconciler.Reconcile(500);
+	const auto applied = Apply(reconciler, 500);
 	CHECK(applied.has_value());
 	CHECK(*applied == 2.0F);
 	CHECK(reconciler.Effective() == 2.0F);
 
 	// Already at the requested value: the engine must not be written again (that restarts a ramp).
-	CHECK(!reconciler.Reconcile(600).has_value());
+	CHECK(!Apply(reconciler, 600).has_value());
 
 	// Expiry restores the value captured when the lease was taken, not a hardcoded 1.0.
-	const auto restored = reconciler.Reconcile(1000);
+	const auto restored = Apply(reconciler, 1000);
 	CHECK(restored.has_value());
 	CHECK(*restored == 1.0F);
 	CHECK(!reconciler.Leased(1000));
 	CHECK(reconciler.LeaseRemainingMs(1000) == 0);
-	CHECK(!reconciler.Reconcile(1001).has_value());
+	CHECK(!Apply(reconciler, 1001).has_value());
 }
 
 TEST_CASE("a lease taken while another is live keeps the original baseline, not the leased value")
 {
 	Reconciler reconciler;
 	reconciler.Request(0.5F, "first", 1000);
-	CHECK(*reconciler.Reconcile(1) == 0.5F);
+	CHECK(*Apply(reconciler, 1) == 0.5F);
 	reconciler.Request(2.0F, "second", 2000);
-	CHECK(*reconciler.Reconcile(1) == 2.0F);
-	CHECK(*reconciler.Reconcile(2000) == 1.0F);  // back to normal, not stuck at the first lease
+	CHECK(*Apply(reconciler, 1) == 2.0F);
+	CHECK(*Apply(reconciler, 2000) == 1.0F);  // back to normal, not stuck at the first lease
 }
 
 TEST_CASE("renewing a lease keeps a long run from expiring mid-flight")
 {
 	Reconciler reconciler;
 	reconciler.Request(3.0F, "run", 1000);
-	CHECK(*reconciler.Reconcile(1) == 3.0F);
+	CHECK(*Apply(reconciler, 1) == 3.0F);
 	reconciler.RenewLease("run", 5000);
-	CHECK(!reconciler.Reconcile(1000).has_value());  // would have expired without the renewal
+	CHECK(!Apply(reconciler, 1000).has_value());  // would have expired without the renewal
 	CHECK(reconciler.Leased(4999));
-	CHECK(*reconciler.Reconcile(5000) == 1.0F);
+	CHECK(*Apply(reconciler, 5000) == 1.0F);
 }
 
 TEST_CASE("a displaced holder cannot renew or release a lease it no longer owns")
@@ -186,9 +192,9 @@ TEST_CASE("a displaced holder cannot renew or release a lease it no longer owns"
 	Reconciler reconciler;
 	reconciler.Request(3.0F, "run", 1000);
 	reconciler.Request(2.0F, "ad-hoc", 2000);
-	CHECK(*reconciler.Reconcile(1) == 2.0F);
+	CHECK(*Apply(reconciler, 1) == 2.0F);
 	reconciler.RenewLease("run", 9000);
-	CHECK(*reconciler.Reconcile(2000) == 1.0F);  // the ad-hoc lease expired on time
+	CHECK(*Apply(reconciler, 2000) == 1.0F);  // the ad-hoc lease expired on time
 	reconciler.Release("run");
 	CHECK(reconciler.Requested() == 1.0F);
 
@@ -205,10 +211,10 @@ TEST_CASE("a release still needs one more push even though nothing is leased any
 	// Release() must still be followed by one more Pending()-gated pump, not just Leased().
 	Reconciler reconciler;
 	reconciler.Request(3.0F, "run", 1000);
-	CHECK(*reconciler.Reconcile(1) == 3.0F);
+	CHECK(*Apply(reconciler, 1) == 3.0F);
 	reconciler.Release("run");
 	CHECK(!reconciler.Leased(2));
 	CHECK(reconciler.Pending());  // the engine still reports 3.0; Leased() alone would miss this
-	CHECK(*reconciler.Reconcile(2) == 1.0F);
+	CHECK(*Apply(reconciler, 2) == 1.0F);
 	CHECK(!reconciler.Pending());
 }

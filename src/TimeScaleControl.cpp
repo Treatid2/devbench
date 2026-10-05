@@ -2,7 +2,6 @@
 
 #include "Capture.h"
 #include "GameClock.h"
-#include "MainThread.h"
 #include "Recording.h"
 #include "ToolRegistry.h"
 
@@ -13,6 +12,7 @@
 #include <chrono>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <vector>
 
 namespace dvb::TimeScaleControl
@@ -31,6 +31,7 @@ namespace dvb::TimeScaleControl
 		bool                g_runActive = false;
 		std::string         g_runOwner;
 		std::vector<Change> g_changes;
+		thread_local bool g_inWrite = false;
 
 		// Written by the main-thread reconciler, read by any thread.
 		std::atomic<float> g_liveMultiplier{ static_cast<float>(kNormalScale) };
@@ -42,8 +43,8 @@ namespace dvb::TimeScaleControl
 			    .count();
 		}
 
-		// Called with g_mutex held. Returns the engagement change to apply after unlocking, so the
-		// pump keeps running exactly while a lease is outstanding.
+		// Called with g_mutex held. Apply the returned transition under that same lock,
+		// so competing reservations cannot reorder pump engagement effects.
 		std::optional<bool> LatchEngagement(bool a_leased)
 		{
 			if (g_leaseEngaged == a_leased)
@@ -66,7 +67,7 @@ namespace dvb::TimeScaleControl
 		// Reconciler::Pending() clears too early, mid-ramp, and would stop the pump prematurely.
 		bool NeedsPump(std::int64_t a_now)
 		{
-			return g_reconciler.Leased(a_now) ||
+			return g_reconciler.Leased(a_now) || g_reconciler.Pending() ||
 			       std::fabs(g_liveMultiplier.load(std::memory_order_acquire) - g_reconciler.Requested()) >
 			           kEffectiveTolerance;
 		}
@@ -77,24 +78,12 @@ namespace dvb::TimeScaleControl
 	SetResult Set(float a_scale, std::int64_t a_holdMs, const std::string& a_owner,
 		bool a_allowTimeScale)
 	{
+		// An engine hook must not re-enter reservation while the synchronous setter
+		// holds the publication mutex. The public ABI reports refusal, never self-waits.
+		if (g_inWrite) return { false, "reentrant time-scale request during native setter", {} };
 		const std::int64_t holdMs = a_holdMs > 0 ? std::min<std::int64_t>(a_holdMs, kMaximumLeaseMs) : kDefaultLeaseMs;
 
-		// The cached Effective() can be stale until the pump has run at least once (e.g. an
-		// external console change before any devbench lease ever engaged the clock), which would
-		// make Resync below compare the cache against itself and see no drift. Sample the engine
-		// directly on the main thread first; on timeout (main thread stalled) fall back to the
-		// cached value rather than fail Set() outright.
-		float liveNow = Effective();
-		try {
-			const json sampled = MainThread::RunAndWait([]() -> json {
-				return json{ { "live", static_cast<double>(RE::BSTimer::QGlobalTimeMultiplier()) } };
-			},
-				std::chrono::milliseconds(2000));
-			liveNow = static_cast<float>(sampled.value("live", static_cast<double>(liveNow)));
-		} catch (const std::exception&) {
-		}
-
-		std::optional<bool> engagement;
+		Request request;
 		{
 			// The admission check and the reservation it gates must be atomic with respect to
 			// Recording::start/Capture::Handle's own check-and-commit (same mutex) — otherwise a
@@ -107,29 +96,44 @@ namespace dvb::TimeScaleControl
 					return { false, "a capture is in flight — retry once it finishes, or pass allowTimeScale:true to change the game's speed anyway" };
 			}
 			const std::int64_t now = NowWallMs();
-			g_liveMultiplier.store(liveNow, std::memory_order_release);
+			// Same direct read used by the existing any-thread Effective() API, not a
+			// stale cache or queued main-thread round trip (including main-thread ABI callers).
+			// This is an observation, not engine-wide locking against other mods.
+			const float liveNow = Effective();
 			if (a_scale == static_cast<float>(kNormalScale))
 				// Request kNormalScale directly rather than Release()'s lease-restore baseline:
 				// an explicit "set scale to 1" means exactly that, not "whatever it was before
 				// devbench's current hold started".
-				g_reconciler.Request(static_cast<float>(kNormalScale), {}, 0, liveNow);
+				request = g_reconciler.Request(static_cast<float>(kNormalScale), {}, 0, liveNow, now);
 			else
-				g_reconciler.Request(a_scale, a_owner, now + holdMs, liveNow);
+				request = g_reconciler.Request(a_scale, a_owner, now + holdMs, liveNow, now);
 			// Catches a scale that drifted externally (console sgtm, another mod) while our own
 			// bookkeeping still matches the new request, which would otherwise make Reconcile
 			// think there's nothing to write.
 			g_reconciler.Resync(liveNow);
-			engagement = LatchEngagement(NeedsPump(now));
+			ApplyEngagement(LatchEngagement(NeedsPump(now)));
 		}
-		ApplyEngagement(engagement);
-		return { true, {} };
+		return { true, {}, std::move(request) };
+	}
+
+	json SetAndWait(float a_scale, std::int64_t a_holdMs, const std::string& a_owner,
+		bool a_allowTimeScale, int a_waitMs)
+	{
+		const auto started = NowWallMs();
+		const auto set = Set(a_scale, a_holdMs, a_owner, a_allowTimeScale);
+		if (!set.ok) throw ToolError(409, std::format("game setTimeScale: {}", set.error));
+		const auto admitted = NowWallMs();
+		return AwaitReceipt(started, admitted, a_waitMs, [&] {
+			std::lock_guard lock(g_mutex);
+			const float live = Effective();  // exactly one live sample for this immutable receipt
+			return g_reconciler.Receipt(set.request, NowWallMs(), live);
+		}, &NowWallMs, [](std::int64_t a_ms) { std::this_thread::sleep_for(std::chrono::milliseconds(a_ms)); });
 	}
 
 	void Reconcile()
 	{
 		const std::int64_t   now = NowWallMs();
 		std::optional<float> value;
-		std::optional<bool>  engagement;
 		{
 			std::lock_guard lock(g_mutex);
 			const float     previousLive = g_liveMultiplier.load(std::memory_order_relaxed);
@@ -138,7 +142,19 @@ namespace dvb::TimeScaleControl
 			// A run in flight keeps its own lease alive, so a long one never expires mid-run.
 			if (g_runActive)
 				g_reconciler.RenewLease(g_runOwner, now + kDefaultLeaseMs);
-			value = g_reconciler.Reconcile(now);
+			// Publication, native invocation and acknowledgement are one controller
+			// critical section: a later request cannot be acknowledged for an earlier write.
+			// The void native setter only proves issuance, not convergence or exclusivity.
+			value = g_reconciler.Reconcile(now, [](float a_value) {
+				auto* timer = RE::BSTimer::GetSingleton();
+				if (!timer) return false;
+				struct Writing {
+					Writing() { g_inWrite = true; }
+					~Writing() { g_inWrite = false; }
+				} writing;
+				timer->SetGlobalTimeMultiplier(a_value, false);
+				return true;
+			});
 			if (g_runActive) {
 				if (value)
 					g_changes.push_back({ GameClock::Now(), *value });
@@ -147,13 +163,8 @@ namespace dvb::TimeScaleControl
 					// the run must still be flagged ineligible for a golden comparison.
 					g_changes.push_back({ GameClock::Now(), live });
 			}
-			engagement = LatchEngagement(NeedsPump(now));
+			ApplyEngagement(LatchEngagement(NeedsPump(now)));
 		}
-		ApplyEngagement(engagement);
-		if (!value)
-			return;
-		if (auto* timer = RE::BSTimer::GetSingleton())
-			timer->SetGlobalTimeMultiplier(*value, false);
 	}
 
 	float Effective()
@@ -170,8 +181,9 @@ namespace dvb::TimeScaleControl
 
 	json Status()
 	{
-		const std::int64_t now = NowWallMs();
+		if (g_inWrite) throw ToolError(409, "time-scale status unavailable during reentrant native setter");
 		std::lock_guard    lock(g_mutex);
+		const std::int64_t now = NowWallMs();
 		return json{
 			{ "requested", g_reconciler.Requested() },
 			{ "effective", Effective() },
@@ -211,7 +223,6 @@ namespace dvb::TimeScaleControl
 	{
 		if (!m_open)
 			return;
-		std::optional<bool> engagement;
 		{
 			std::lock_guard lock(g_mutex);
 			g_runActive = false;
@@ -220,9 +231,8 @@ namespace dvb::TimeScaleControl
 				g_reconciler.Release(m_owner);
 			// NeedsPump, not just Leased: keeps pumping until the engine actually converges.
 			const std::int64_t now = NowWallMs();
-			engagement = LatchEngagement(NeedsPump(now));
+			ApplyEngagement(LatchEngagement(NeedsPump(now)));
 		}
-		ApplyEngagement(engagement);
 		GameClock::Disengage();
 	}
 

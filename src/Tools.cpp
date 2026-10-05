@@ -246,11 +246,10 @@ namespace dvb
 			"async — watch lifecycle 'postLoadGame' / inspect playerLoaded for completion. "
 			"A content-mismatch MessageBoxMenu (Yes/No) may gate it; check `menu` action=list.";
 
-		// game setTimeScale: how long to wait for the engine to actually reach the requested speed
+		// game setTimeScale: convergence budget after admission, not a total latency bound
 		// (the reconciler applies it on the next main-thread frame, and the engine then ramps).
 		constexpr int kScaleApplyTimeoutMs = 2000;
-		constexpr int kScaleMaxWaitMs = 30000;
-		constexpr int kScalePollMs = 5;
+		constexpr int kScaleMaxWaitMs = TimeScaleControl::kMaximumWaitMs;
 
 		// A Pascal-style string in the .ess header: uint16 length + that many raw (non-UTF16,
 		// despite the community name "wstring") bytes.
@@ -516,35 +515,14 @@ namespace dvb
 
 				int waitMs = kScaleApplyTimeoutMs;
 				if (const auto waitArg = a_args.find("waitMs"); waitArg != a_args.end()) {
-					if (!waitArg->is_number_integer() || waitArg->get<std::int64_t>() < 0 || waitArg->get<std::int64_t>() > kScaleMaxWaitMs)
+					const auto parsed = TimeScaleControl::ParseWaitMs(*waitArg);
+					if (!parsed)
 						throw ToolError(400, std::format("game setTimeScale: 'waitMs' must be an integer 0..{}", kScaleMaxWaitMs));
-					waitMs = waitArg->get<int>();
+					waitMs = *parsed;
 				}
 
-				const TimeScaleControl::SetResult set = TimeScaleControl::Set(validation.value, holdMs,
-					LeaseOwner(a_ctx), BooleanArgument(a_args, "allowTimeScale", false));
-				if (!set.ok)
-					throw ToolError(409, std::format("game setTimeScale: {}", set.error));
-
-				// The reconciler applies this on the next engine frame and the engine then ramps
-				// toward it over a few seconds. The lease is already set, so a wait that runs out
-				// is reported as reached:false, not as an error.
-				const auto start = std::chrono::steady_clock::now();
-				const auto deadline = start + std::chrono::milliseconds(waitMs);
-				bool       reached = false;
-				while (true) {
-					reached = std::fabs(TimeScaleControl::Effective() - validation.value) <= TimeScaleControl::kEffectiveTolerance;
-					if (reached || std::chrono::steady_clock::now() >= deadline)
-						break;
-					std::this_thread::sleep_for(std::chrono::milliseconds(kScalePollMs));
-				}
-				json out = TimeScaleControl::Status();
-				out["applied"] = true;
-				out["reached"] = reached;
-				out["waitedMs"] = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-				if (!reached)
-					out["note"] = std::format("the engine ramps toward the new scale; it was at {} after {}ms (requested {}). Poll getTimeScale or pass a longer waitMs.", TimeScaleControl::Effective(), waitMs, validation.value);
-				return out;
+				return TimeScaleControl::SetAndWait(validation.value, holdMs, LeaseOwner(a_ctx),
+					BooleanArgument(a_args, "allowTimeScale", false), waitMs);
 			}
 
 			auto* task = SKSE::GetTaskInterface();
@@ -2915,12 +2893,20 @@ namespace dvb
 			"'scale', or 'freeze':true for 0) speeds up or slows down the game itself for "
 			"'holdMs' (default 60000) — which is what makes a replay or scenario run faster in wall "
 			"time — then restores the previous scale; 0.1..3.0, up to 10.0 with 'allowHigh':true, and "
-			"it returns { requested, effective, applied, reached, waitedMs, owner, leaseRemainingMs }. "
-			"The engine ramps toward a new scale over a few seconds, so it waits up to 'waitMs' "
-			"(default 2000, 0..30000) for effective to reach it; reached:false means still ramping "
-			"(the change is in effect, never an error) — poll getTimeScale if it matters. It is refused (409) while a recording or a capture is "
-			"in flight, unless 'allowTimeScale':true. 'getTimeScale' returns the same object without "
-			"changing anything. VR-only 'newGame' preserves the normal main-menu confirmation/fade: "
+			"it returns one request-correlated snapshot: { requestId, requested, owner, accepted, "
+			"applied, reached, atTarget, state, ownsController, effective, sampledWallMs, leased, "
+			"leaseRemainingMs, currentRequestId, currentRequested, currentOwner }. accepted means "
+			"reservation; applied means this request's native setter was issued, not current ownership. "
+			"reached requires that acknowledgement, current controller ownership and a matching live sample. "
+			"atTarget is numeric equality only; state is accepted/written/reached/unchanged/expired/displaced/released. "
+			"unchanged means already at target without a newly issued setter; reached:false is not proof of a ramp or an applied change. "
+			"'waitMs' (default 2000, 0..30000) budgets convergence polling AFTER admission; "
+			"admissionMs, convergenceWaitedMs (legacy waitedMs alias), totalElapsedMs, convergenceBudgetMs "
+			"and convergenceDeadlineExceeded separate phases and expose overshoot. Mutex/native/scheduler/transport "
+			"latency is not absolutely bounded; snapshots do not guarantee future state or engine-wide exclusivity. "
+			"It is refused (409) while a recording or capture is in flight unless 'allowTimeScale':true. "
+			"'getTimeScale' reports current { requested, effective, owner, leased, leaseRemainingMs }, "
+			"not an earlier request's receipt. VR-only 'newGame' preserves the normal main-menu confirmation/fade: "
 			"phase='inspect' reports readiness; 'request' selects semantic New and asks for confirmation "
 			"with a unique requestId; 'confirm' accepts only that request's ready New confirmation and "
 			"requires confirmNewGame:true. Repeated IDs return retained receipts without redispatch. "
@@ -2947,7 +2933,7 @@ namespace dvb
 								{ "freeze", json{ { "type", "boolean" }, { "description", "setTimeScale: confirm scale 0 (freeze); required with a 0 scale" } } },
 								{ "allowHigh", json{ { "type", "boolean" }, { "description", "setTimeScale: permit a scale above 3.0, up to 10.0" } } },
 								{ "allowTimeScale", json{ { "type", "boolean" }, { "description", "setTimeScale: change the scale even while a recording or capture is in flight (default false)" } } },
-								{ "waitMs", json{ { "type", "integer" }, { "description", "setTimeScale: how long to wait for the engine to reach the new scale before answering (default 2000, 0..30000); the answer is always applied:true with reached true/false, never an error for a change still ramping" } } },
+								{ "waitMs", json{ { "type", "integer" }, { "minimum", 0 }, { "maximum", kScaleMaxWaitMs }, { "description", "setTimeScale: convergence polling budget after admission (default 2000, 0..30000), not a total latency bound; admissionMs/convergenceWaitedMs/totalElapsedMs report separate phases. applied acknowledges this request's issued setter, not reservation or numeric equality" } } },
 							} },
 		};
 		a_registry.Register(std::move(game), &GameHandler);

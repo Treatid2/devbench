@@ -89,10 +89,12 @@ namespace DevBenchAPI
 		// Set the game's global time scale — the same control as `game setTimeScale`, so a consumer
 		// can speed up or slow down a run (e.g. 3.0 to finish a benchmark sooner). a_scale is
 		// 0.1..3.0; a_leaseMs is how long it stays in effect before the previous scale is restored
-		// (0 = 60000), so an interrupted consumer still leaves the game at normal speed.
-		// NON-BLOCKING and callable from ANY thread (including the main thread): the change is
-		// applied on a later main-thread frame; there is no RunAndWait. Returns false when the scale
-		// is out of range, or when a recording/capture is in flight and would be made incomparable.
+		// (0 = 60000); expiry restores the captured baseline, which need not be normal speed.
+		// Callable from ANY thread (including the main thread), with no queued engine wait or
+		// RunAndWait. Admission is serialized and can contend with the reconciler's native call.
+		// true acknowledges reservation only, not an issued setter or convergence; another request
+		// can displace it before a later main-thread frame. Returns false when out of range, when a
+		// recording/capture would be made incomparable, or on reentry during the native setter.
 		// a_owner identifies the lease for `game getTimeScale` (nullptr = an anonymous owner).
 		//
 		// ABI: appended after RegisterToolExtension — call only when GetBuildNumber() >= 12000
