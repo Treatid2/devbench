@@ -6,6 +6,97 @@
 
 using namespace dvb::TimeScaleControl;
 
+namespace
+{
+	void SeedAndRestoreNormal(Reconciler& a_reconciler)
+	{
+		a_reconciler.Request(2.0F, "seed", 10, 1.0F, 0);
+		CHECK(a_reconciler.Reconcile(1, [](float) { return true; }) == 2.0F);
+		CHECK(a_reconciler.Reconcile(10, [](float) { return true; }) == 1.0F);
+		CHECK(!a_reconciler.Leased(10));
+	}
+}
+
+TEST_CASE("seeded idle time-scale admission captures external drift before its target")
+{
+	for (const bool release : { false, true }) {
+		Reconciler r;
+		SeedAndRestoreNormal(r);
+		const auto request = r.Request(3.0F, "new", 100, 0.5F, 20);
+		CHECK(r.Effective() == 0.5F);
+		CHECK(r.Receipt(request, 20, 0.5F).at("applied") == false);
+		CHECK(r.Reconcile(21, [](float value) { return value == 3.0F; }) == 3.0F);
+		if (release) r.Release("new");
+		CHECK(r.Reconcile(release ? 22 : 100, [](float value) { return value == 0.5F; }) == 0.5F);
+		CHECK(r.Requested() == 0.5F);
+		CHECK(r.Receipt(request, 100, 0.5F).at("state") == (release ? "released" : "expired"));
+	}
+}
+
+TEST_CASE("seeded idle already-target admission does not issue or acknowledge a redundant setter")
+{
+	Reconciler r;
+	SeedAndRestoreNormal(r);
+	const auto request = r.Request(3.0F, "new", 100, 3.0F, 20);
+	int calls = 0;
+	CHECK(!r.Reconcile(21, [&](float) { ++calls; return true; }));
+	const auto receipt = r.Receipt(request, 21, 3.0F);
+	CHECK(calls == 0);
+	CHECK(receipt.at("state") == "unchanged");
+	CHECK(receipt.at("atTarget") == true);
+	CHECK(receipt.at("applied") == false);
+	CHECK(receipt.at("reached") == false);
+	CHECK(!r.Reconcile(100, [&](float) { ++calls; return true; }));
+	CHECK(calls == 0);
+	CHECK(r.Requested() == 3.0F);  // fresh observed baseline, not the stale prior1
+}
+
+TEST_CASE("time-scale deadline boundary separates continuing lease from fresh live acquisition")
+{
+	for (const std::int64_t now : { 99, 100, 101 }) {
+		Reconciler r;
+		const auto first = r.Request(3.0F, "first", 100, 1.0F, 0);
+		CHECK(r.Reconcile(1, [](float) { return true; }) == 3.0F);
+		// No expiry reconciliation occurs before replacement; direct current live is0.5.
+		const auto second = r.Request(2.0F, "second", 200, 0.5F, now);
+		CHECK(r.Effective() == 0.5F);
+		CHECK(r.Receipt(first, now, 0.5F).at("state") == (now < 100 ? "displaced" : "expired"));
+		CHECK(r.Reconcile(now, [](float) { return true; }) == 2.0F);
+		const float expectedBaseline = now < 100 ? 1.0F : 0.5F;
+		CHECK(r.Reconcile(200, [=](float value) { return value == expectedBaseline; }) == expectedBaseline);
+		CHECK(r.Receipt(second, 200, expectedBaseline).at("state") == "expired");
+	}
+}
+
+TEST_CASE("expired unreconciled time-scale replacement deliberately captures the current live value")
+{
+	Reconciler r;
+	const auto first = r.Request(3.0F, "first", 100, 1.0F, 0);
+	CHECK(r.Reconcile(1, [](float) { return true; }) == 3.0F);
+	// Old3 is still live at the deadline. The new explicit command supersedes pending
+	// restoration; its fresh baseline is3, NOT a claim that the old lease restored1.
+	const auto second = r.Request(2.0F, "second", 200, 3.0F, 100);
+	CHECK(r.Receipt(first, 100, 3.0F).at("state") == "expired");
+	CHECK(r.Reconcile(100, [](float) { return true; }) == 2.0F);
+	CHECK(r.Reconcile(200, [](float value) { return value == 3.0F; }) == 3.0F);
+	CHECK(r.Receipt(second, 200, 3.0F).at("reached") == false);
+}
+
+TEST_CASE("live-lease already-target replacement preserves its baseline without a redundant setter")
+{
+	Reconciler r;
+	const auto first = r.Request(3.0F, "first", 100, 0.5F, 0);
+	CHECK(r.Reconcile(1, [](float) { return true; }) == 3.0F);
+	const auto second = r.Request(3.0F, "second", 200, 3.0F, 99);
+	int calls = 0;
+	CHECK(!r.Reconcile(99, [&](float) { ++calls; return true; }));
+	CHECK(calls == 0);
+	CHECK(r.Receipt(first, 99, 3.0F).at("state") == "displaced");
+	CHECK(r.Receipt(second, 99, 3.0F).at("state") == "unchanged");
+	CHECK(r.Receipt(second, 99, 3.0F).at("applied") == false);
+	CHECK(r.Reconcile(200, [](float value) { return value == 0.5F; }) == 0.5F);
+}
+
 TEST_CASE("time-scale receipt does not acknowledge expiry before the first engine write")
 {
 	Reconciler r;

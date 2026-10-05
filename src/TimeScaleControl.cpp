@@ -107,10 +107,8 @@ namespace dvb::TimeScaleControl
 				request = g_reconciler.Request(static_cast<float>(kNormalScale), {}, 0, liveNow, now);
 			else
 				request = g_reconciler.Request(a_scale, a_owner, now + holdMs, liveNow, now);
-			// Catches a scale that drifted externally (console sgtm, another mod) while our own
-			// bookkeeping still matches the new request, which would otherwise make Reconcile
-			// think there's nothing to write.
-			g_reconciler.Resync(liveNow);
+			// Request consumes that same sample atomically: idle/expired baseline capture,
+			// current bookkeeping and target publication cannot be split or reordered here.
 			ApplyEngagement(LatchEngagement(NeedsPump(now)));
 		}
 		return { true, {}, std::move(request) };

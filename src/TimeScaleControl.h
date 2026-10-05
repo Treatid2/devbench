@@ -96,29 +96,25 @@ namespace dvb::TimeScaleControl
 	class Reconciler
 	{
 	public:
-		// Sets a_value for a_owner until a_expiresAtWallMs (0 = no expiry). The first acquisition
-		// captures the currently applied value as the baseline a lease end restores to; a later
-		// request while that lease is live keeps the baseline. The very first request this
-		// Reconciler ever sees also seeds m_applied from a_liveValue (the engine's actual
-		// multiplier), not the kNormalScale default — the engine may already be off-normal from
-		// an external console command before anyone ever called Set().
+		// Sets a_value for a_owner until a_expiresAtWallMs (0 = no expiry). Every acquisition
+		// synchronizes bookkeeping with its direct live sample BEFORE publishing the target.
+		// Only a genuinely live previous lease retains its original restore baseline. Idle or
+		// at/after-deadline replacement captures a_liveValue as a fresh baseline, even if the
+		// old lease's frame-driven restoration has not run. The new command supersedes that
+		// pending restoration; this does not claim that the old request was restored.
 		TimeScaleControl::Request Request(float a_value, std::string a_owner, std::int64_t a_expiresAtWallMs,
 			float a_liveValue = static_cast<float>(kNormalScale), std::int64_t a_nowWallMs = 0)
 		{
 			if (m_generation == std::numeric_limits<std::uint64_t>::max())
 				throw std::overflow_error("time-scale request generation exhausted");
 			auto request = std::make_shared<RequestRecord>(RequestRecord{ m_generation + 1, a_value, a_owner, a_expiresAtWallMs });
+			const bool continuingLiveLease = Leased(a_nowWallMs);
+			m_applied = a_liveValue;
+			if (!continuingLiveLease) m_restoreValue = a_liveValue;
 			EndRequest(m_request && m_request->expiresAtWallMs != 0 && a_nowWallMs >= m_request->expiresAtWallMs ?
 				RequestEnd::expired : RequestEnd::displaced);
 			++m_generation;
 			m_request = request;
-			if (m_expiresAtWallMs == 0) {
-				if (!m_seeded) {
-					m_applied = a_liveValue;
-					m_seeded = true;
-				}
-				m_restoreValue = m_applied;
-			}
 			m_requested = a_value;
 			m_owner = std::move(a_owner);
 			m_expiresAtWallMs = a_expiresAtWallMs;
@@ -147,16 +143,6 @@ namespace dvb::TimeScaleControl
 			m_requested = m_restoreValue;
 		}
 
-		// Makes the next Reconcile() actually write to the engine when a_live has drifted from
-		// what we last told it, even though our own m_applied bookkeeping still matches
-		// m_requested — otherwise an external change (console sgtm, another mod) that happens
-		// to match our default is invisible to Reconcile's "nothing changed" shortcut.
-		void Resync(float a_live)
-		{
-			if (a_live != m_requested)
-				m_applied = a_live;
-		}
-
 		// Caller serializes request publication AND this synchronous writer. Only a true
 		// return after issuing the native setter acknowledges a write; absent timers retry
 		// on a later frame without publishing fictional applied bookkeeping. Not convergence.
@@ -175,7 +161,6 @@ namespace dvb::TimeScaleControl
 			const auto request = m_request;
 			if (!a_write(value)) return std::nullopt;
 			m_applied = value;
-			m_seeded = true;
 			if (request && request->end == RequestEnd::active && request->requested == value)
 				request->written = true;
 			return value;
@@ -231,7 +216,6 @@ namespace dvb::TimeScaleControl
 		std::string  m_owner;
 		float        m_restoreValue = static_cast<float>(kNormalScale);
 		std::int64_t m_expiresAtWallMs = 0;
-		bool         m_seeded = false;
 	};
 
 	// --- engine-facing (src/TimeScaleControl.cpp) ---
