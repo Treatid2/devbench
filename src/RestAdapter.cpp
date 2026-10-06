@@ -36,7 +36,8 @@ namespace dvb
 	}
 
 	RestAdapter::RestAdapter(ToolRegistry& a_registry, EventBus& a_events) :
-		m_registry(a_registry), m_events(a_events)
+		m_registry(a_registry), m_events(a_events),
+		m_callbacks(std::make_shared<CallbackLease<RestAdapter>>(*this))
 	{
 		// Track the latest lifecycle event directly rather than scanning Since(0) on every
 		// /api/health call: the bus's ring buffer caps at 256 events, so under enough traffic
@@ -50,19 +51,22 @@ namespace dvb
 				if (auto name = LifecycleEventName(ev.payload))
 					m_lastLifecycle = std::move(name);
 
-		m_lifecycleSub = m_events.Subscribe([this](const EventBus::Event& a_ev) {
-			if (a_ev.topic != "lifecycle")
-				return;
-			auto name = LifecycleEventName(a_ev.payload);
-			if (!name)
-				return;
-			std::lock_guard lock(m_lifecycleMtx);
-			m_lastLifecycle = std::move(name);
+		m_lifecycleSub = m_events.Subscribe([lease = m_callbacks](const EventBus::Event& a_ev) {
+			lease->Invoke([&](RestAdapter& self) {
+				if (a_ev.topic != "lifecycle")
+					return;
+				auto name = LifecycleEventName(a_ev.payload);
+				if (!name)
+					return;
+				std::lock_guard lock(self.m_lifecycleMtx);
+				self.m_lastLifecycle = std::move(name);
+			});
 		});
 	}
 
 	RestAdapter::~RestAdapter()
 	{
+		m_callbacks->Retire();
 		if (m_lifecycleSub)
 			m_events.Unsubscribe(m_lifecycleSub);
 	}

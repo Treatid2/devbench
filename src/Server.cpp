@@ -4,6 +4,7 @@
 
 #include "McpAdapter.h"
 #include "RestAdapter.h"
+#include "PathUtf8.h"
 #include "Version.h"
 
 #include <RE/Skyrim.h>  // REL::Module::IsVR
@@ -68,18 +69,6 @@ namespace
 		if (n == 0 || n >= std::size(buf))
 			return std::nullopt;
 		return std::filesystem::path(buf) / "devbench" / (REL::Module::IsVR() ? "vr" : "se");
-	}
-
-	// std::filesystem::path::string() converts wide->narrow using the Windows ANSI code
-	// page, NOT UTF-8 — so a non-ASCII path (a CJK user profile, an accented install dir)
-	// produces bytes nlohmann::json rejects on insertion, throwing type_error.316. That
-	// throw is unrecoverable on the kPostLoad path: it escapes Start() into SKSE's
-	// dispatch and silently kills every later plugin's kPostLoad. u8string() is UTF-8 by
-	// definition, so copy it into a std::string for json.
-	std::string Utf8(const std::filesystem::path& a_path)
-	{
-		const std::u8string u8 = a_path.u8string();
-		return { reinterpret_cast<const char*>(u8.data()), u8.size() };
 	}
 
 	// Publish the actually-bound port so fixed-URL clients can discover a non-default
@@ -204,10 +193,13 @@ namespace dvb
 		CalendarControl::RequestStop();
 		if (m_mcp) {
 			m_mcp->stop();
-			m_mcp.reset();
 		}
+		// Adapter callbacks reference the transport. Retire them while it is still
+		// alive, not after destroying it. Listener/worker rollback is a separate
+		// requirement: this ordering alone does not certify pinned stop() quiescence.
 		m_restAdapter.reset();
 		m_mcpAdapter.reset();
+		m_mcp.reset();
 		g_boundPort.store(0);
 		g_registry.store(nullptr);
 	}
@@ -303,7 +295,7 @@ namespace dvb
 		const bool        vr = REL::Module::IsVR();
 		const std::string game = vr ? "vr" : "se";
 		std::error_code   ec;
-		const std::string exePath = Utf8(std::filesystem::absolute("Data/SKSE/Plugins/devbench/devbench-bridge.exe", ec));
+		const std::string exePath = PathUtf8(std::filesystem::absolute("Data/SKSE/Plugins/devbench/devbench-bridge.exe", ec));
 		const std::string name = "devbench-" + game;
 		json              result{
 			{ "exePath", exePath },
@@ -320,7 +312,7 @@ namespace dvb
 				"are also mirrored to externalStateDir, which isn't virtualized, for exactly that reason." },
 		};
 		if (auto dir = ExternalStateDir())
-			result["externalStateDir"] = Utf8(*dir);
+			result["externalStateDir"] = PathUtf8(*dir);
 		return result;
 	}
 }

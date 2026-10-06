@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include "CallbackLease.h"
 #include <mutex>
 #include <optional>
 #include <string>
@@ -29,7 +31,8 @@ namespace dvb
 	{
 	public:
 		RestAdapter(ToolRegistry& a_registry, EventBus& a_events);
-		// Unsubscribe from the bus before we're destroyed — mirrors McpAdapter's cutoff.
+		// Revoke copied bus callbacks before unregistering; HTTP routes still
+		// require listener retirement before this object's destruction.
 		~RestAdapter();
 
 		void Mount(httplib::Server& a_http);
@@ -38,6 +41,7 @@ namespace dvb
 		ToolRegistry&              m_registry;
 		EventBus&                  m_events;
 		uint64_t                   m_lifecycleSub = 0;
+		std::shared_ptr<CallbackLease<RestAdapter>> m_callbacks;
 		mutable std::mutex         m_lifecycleMtx;
 		std::optional<std::string> m_lastLifecycle;
 	};
