@@ -15,11 +15,11 @@ namespace
 	const dvb::ConsoleLogCapture::Fence kFence{ "0123456789abcdef0123456789abcdef" };
 	// Fixture-only adapters keep the existing coverage on the same production
 	// implementation. Production supplies a new OS-random fence per window.
-	struct LineSampler : dvb::ConsoleLogCapture::LineSampler {
-		LineSampler() : dvb::ConsoleLogCapture::LineSampler(kFence) {}
+	struct FixtureLineSampler : dvb::ConsoleLogCapture::LineSampler {
+		FixtureLineSampler() : dvb::ConsoleLogCapture::LineSampler(kFence) {}
 	};
-	struct PrintCollector : dvb::ConsoleLogCapture::PrintCollector {
-		PrintCollector() : dvb::ConsoleLogCapture::PrintCollector(kFence) {}
+	struct FixturePrintCollector : dvb::ConsoleLogCapture::PrintCollector {
+		FixturePrintCollector() : dvb::ConsoleLogCapture::PrintCollector(kFence) {}
 	};
 	auto SliceFencedLines(const std::deque<std::string>& a_lines, std::size_t a_maxLines) {
 		return dvb::ConsoleLogCapture::SliceFencedLines(kFence, a_lines, a_maxLines);
@@ -113,25 +113,25 @@ TEST_CASE("line slicing matches text slicing on the same fenced window")
 
 TEST_CASE("sampler records changes and ignores an unchanged line")
 {
-	LineSampler sampler;
+	FixtureLineSampler sampler;
 	sampler.Reset("stale message");
-	CHECK(sampler.Observe("stale message") == LineSampler::Seen::kNothing);
-	CHECK(sampler.Observe("") == LineSampler::Seen::kNothing);
-	CHECK(sampler.Observe("first") == LineSampler::Seen::kLine);
-	CHECK(sampler.Observe("first") == LineSampler::Seen::kNothing);
-	CHECK(sampler.Observe("second") == LineSampler::Seen::kLine);
+	CHECK(sampler.Observe("stale message") == FixtureLineSampler::Seen::kNothing);
+	CHECK(sampler.Observe("") == FixtureLineSampler::Seen::kNothing);
+	CHECK(sampler.Observe("first") == FixtureLineSampler::Seen::kLine);
+	CHECK(sampler.Observe("first") == FixtureLineSampler::Seen::kNothing);
+	CHECK(sampler.Observe("second") == FixtureLineSampler::Seen::kLine);
 	CHECK(sampler.Samples() == 2);
 	CHECK(sampler.Ticks() == 5);
 }
 
 TEST_CASE("sampler reports each marker once and slices a complete capture")
 {
-	LineSampler sampler;
+	FixtureLineSampler sampler;
 	sampler.Reset("");
-	CHECK(sampler.Observe(BeginLine()) == LineSampler::Seen::kBegin);
+	CHECK(sampler.Observe(BeginLine()) == FixtureLineSampler::Seen::kBegin);
 	CHECK(sampler.SawBegin());
-	CHECK(sampler.Observe("GetActorValue: Health >> 100.00") == LineSampler::Seen::kLine);
-	CHECK(sampler.Observe(EndLine()) == LineSampler::Seen::kEnd);
+	CHECK(sampler.Observe("GetActorValue: Health >> 100.00") == FixtureLineSampler::Seen::kLine);
+	CHECK(sampler.Observe(EndLine()) == FixtureLineSampler::Seen::kEnd);
 	CHECK(sampler.SawEnd());
 
 	const auto slice = SliceFencedLines(sampler.Lines(), 200);
@@ -143,35 +143,35 @@ TEST_CASE("sampler reports each marker once and slices a complete capture")
 
 TEST_CASE("a stale begin marker left by an aborted capture cannot swallow the next one")
 {
-	LineSampler sampler;
+	FixtureLineSampler sampler;
 	sampler.Reset(BeginLine());  // seeded with the marker an aborted capture left showing
-	CHECK(sampler.Observe(BeginLine()) == LineSampler::Seen::kBegin);
+	CHECK(sampler.Observe(BeginLine()) == FixtureLineSampler::Seen::kBegin);
 	CHECK(sampler.SawBegin());
-	CHECK(sampler.Observe("output") == LineSampler::Seen::kLine);
-	CHECK(sampler.Observe(EndLine()) == LineSampler::Seen::kEnd);
+	CHECK(sampler.Observe("output") == FixtureLineSampler::Seen::kLine);
+	CHECK(sampler.Observe(EndLine()) == FixtureLineSampler::Seen::kEnd);
 	CHECK(SliceFencedLines(sampler.Lines(), 200).lines.size() == 1);
 }
 
 TEST_CASE("the previous capture's end marker is not taken as this capture's end")
 {
-	LineSampler sampler;
+	FixtureLineSampler sampler;
 	sampler.Reset(EndLine());  // the last capture's end marker is still showing
-	CHECK(sampler.Observe(EndLine()) == LineSampler::Seen::kNothing);
+	CHECK(sampler.Observe(EndLine()) == FixtureLineSampler::Seen::kNothing);
 	CHECK(!sampler.SawEnd());
-	CHECK(sampler.Observe(BeginLine()) == LineSampler::Seen::kBegin);
-	CHECK(sampler.Observe("output") == LineSampler::Seen::kLine);
+	CHECK(sampler.Observe(BeginLine()) == FixtureLineSampler::Seen::kBegin);
+	CHECK(sampler.Observe("output") == FixtureLineSampler::Seen::kLine);
 	CHECK(!sampler.SawEnd());
-	CHECK(sampler.Observe(EndLine()) == LineSampler::Seen::kEnd);
+	CHECK(sampler.Observe(EndLine()) == FixtureLineSampler::Seen::kEnd);
 	CHECK(sampler.SawEnd());
 	CHECK(SliceFencedLines(sampler.Lines(), 200).lines.size() == 1);
 }
 
 TEST_CASE("a command that prints nothing still ends on the end marker")
 {
-	LineSampler sampler;
+	FixtureLineSampler sampler;
 	sampler.Reset("");
 	sampler.Observe(BeginLine());
-	CHECK(sampler.Observe(EndLine()) == LineSampler::Seen::kEnd);
+	CHECK(sampler.Observe(EndLine()) == FixtureLineSampler::Seen::kEnd);
 	const auto slice = SliceFencedLines(sampler.Lines(), 200);
 	CHECK(slice.sawBegin);
 	CHECK(slice.sawEnd);
@@ -180,7 +180,7 @@ TEST_CASE("a command that prints nothing still ends on the end marker")
 
 TEST_CASE("reset clears the previous capture")
 {
-	LineSampler sampler;
+	FixtureLineSampler sampler;
 	sampler.Reset("");
 	sampler.Observe(BeginLine());
 	sampler.Observe("x");
@@ -195,7 +195,7 @@ TEST_CASE("reset clears the previous capture")
 
 TEST_CASE("the sampler ring is bounded")
 {
-	LineSampler sampler;
+	FixtureLineSampler sampler;
 	sampler.Reset("");
 	for (std::size_t i = 0; i < kRingMax + 40; ++i)
 		sampler.Observe("line " + std::to_string(i));
@@ -304,7 +304,7 @@ TEST_CASE("fence detection with no offset selects the first exact complete windo
 
 TEST_CASE("print collector keeps every line of a multi-line command between the markers")
 {
-	PrintCollector c;
+	FixturePrintCollector c;
 	c.Feed("noise before the capture");
 	c.Feed(BeginLine());
 	c.Feed("00000014 (2 lights)");
@@ -325,7 +325,7 @@ TEST_CASE("print collector keeps every line of a multi-line command between the 
 
 TEST_CASE("print collector ignores an end marker before the begin marker")
 {
-	PrintCollector c;
+	FixturePrintCollector c;
 	c.Feed(EndLine());
 	CHECK(!c.SawEnd());
 	c.Feed(BeginLine());
@@ -337,9 +337,9 @@ TEST_CASE("print collector ignores an end marker before the begin marker")
 
 TEST_CASE("print collector caps its lines, counts the drop, and still sees the end marker")
 {
-	PrintCollector c;
+	FixturePrintCollector c;
 	c.Feed(BeginLine());
-	for (std::size_t i = 0; i < PrintCollector::kMaxLines + 10; ++i)
+	for (std::size_t i = 0; i < FixturePrintCollector::kMaxLines + 10; ++i)
 		c.Feed("x");
 	c.Feed(EndLine());
 	CHECK(c.SawEnd());
@@ -352,7 +352,13 @@ TEST_CASE("print collector caps its lines, counts the drop, and still sees the e
 
 namespace
 {
-	using namespace dvb::ConsoleLogCapture;
+	using dvb::ConsoleLogCapture::FormattedPrint;
+	using dvb::ConsoleLogCapture::VFormatter;
+	using dvb::ConsoleLogCapture::PrintAllocator;
+	using dvb::ConsoleLogCapture::FormatPrint;
+	using dvb::ConsoleLogCapture::PrintLoss;
+	using dvb::ConsoleLogCapture::kMaxPrintBytes;
+	using dvb::ConsoleLogCapture::kMaxPayloadBytes;
 
 	FormattedPrint FormatWith(std::size_t a_budget, VFormatter a_formatter,
 		PrintAllocator a_allocator, const char* a_format, ...)
@@ -436,12 +442,12 @@ TEST_CASE("print preallocation budget rejects oversize and clamps caller limits"
 TEST_CASE("fences do not consume 19999 20000 or 20001 payload line capacity")
 {
 	for (std::size_t count : {19999u, 20000u, 20001u}) {
-		PrintCollector c;
+		FixturePrintCollector c;
 		c.Feed(BeginLine());
 		for (std::size_t i = 0; i < count; ++i) c.Feed("x");
 		c.Feed(EndLine());
 		CHECK(c.SawEnd());
-		CHECK(c.PayloadLines() == (count > PrintCollector::kMaxLines ? PrintCollector::kMaxLines : count));
+		CHECK(c.PayloadLines() == (count > FixturePrintCollector::kMaxLines ? FixturePrintCollector::kMaxLines : count));
 		CHECK(c.Lines().size() == c.PayloadLines() + 2);
 		CHECK(c.Loss().lineLimit == (count == 20001 ? 1u : 0u));
 		CHECK(c.Dropped() == c.Loss().lineLimit);
@@ -450,7 +456,7 @@ TEST_CASE("fences do not consume 19999 20000 or 20001 payload line capacity")
 
 TEST_CASE("payload byte budget refuses extra data but preserves end control and loss counters")
 {
-	PrintCollector c;
+	FixturePrintCollector c;
 	c.Feed(BeginLine());
 	const std::string block(kMaxPrintBytes, 'x');
 	for (std::size_t i = 0; i < kMaxPayloadBytes / kMaxPrintBytes; ++i) c.Feed(block);
@@ -487,7 +493,7 @@ TEST_CASE("exact nonce fencing rejects token-like payload old windows and combin
 	CHECK(state.hasBegin && state.hasEnd);
 	const auto sliced = SliceFencedText(text, 200);
 	CHECK(sliced.lines == std::vector<std::string>({prefixed, combined, suffix}));
-	PrintCollector collector;
+	FixturePrintCollector collector;
 	collector.Feed(old.beginLine);
 	collector.Feed(combined);
 	collector.Feed(prefixed);
@@ -501,15 +507,15 @@ TEST_CASE("exact nonce fencing rejects token-like payload old windows and combin
 	collector.Feed(EndLine());
 	CHECK(collector.PayloadLines() == 2);
 	CHECK(SliceFencedLines(collector.Lines(), 200).lines == std::vector<std::string>({combined, suffix}));
-	LineSampler sampler;
+	FixtureLineSampler sampler;
 	sampler.Reset(old.beginLine);
-	CHECK(sampler.Observe(old.beginLine) == LineSampler::Seen::kNothing);
-	CHECK(sampler.Observe(combined) == LineSampler::Seen::kLine);
+	CHECK(sampler.Observe(old.beginLine) == FixtureLineSampler::Seen::kNothing);
+	CHECK(sampler.Observe(combined) == FixtureLineSampler::Seen::kLine);
 	CHECK(!sampler.SawBegin());
-	CHECK(sampler.Observe(BeginLine()) == LineSampler::Seen::kBegin);
-	CHECK(sampler.Observe(prefixed) == LineSampler::Seen::kLine);
+	CHECK(sampler.Observe(BeginLine()) == FixtureLineSampler::Seen::kBegin);
+	CHECK(sampler.Observe(prefixed) == FixtureLineSampler::Seen::kLine);
 	CHECK(!sampler.SawEnd());
-	CHECK(sampler.Observe(EndLine()) == LineSampler::Seen::kEnd);
+	CHECK(sampler.Observe(EndLine()) == FixtureLineSampler::Seen::kEnd);
 }
 
 TEST_CASE("framing validates nonce and offsets never turn a line suffix into a control")
@@ -527,7 +533,7 @@ TEST_CASE("production admission gate drains an admitted writer before immutable 
 	using dvb::ConsoleLogCapture::WindowAdmission;
 	using namespace std::chrono;
 	WindowAdmission gate;
-	PrintCollector first;
+	FixturePrintCollector first;
 	first.Feed(BeginLine());
 	std::promise<void> entered, resume;
 	auto enteredFuture = entered.get_future();
@@ -589,7 +595,6 @@ TEST_CASE("production admission lease is exception safe and queued late work can
 
 TEST_CASE("fallback slicing bounds payload bytes and reports omitted data without losing the end")
 {
-	using namespace dvb::ConsoleLogCapture;
 	const std::string block(kMaxPrintBytes, 'x');
 	std::string text = BeginLine() + "\n";
 	for (std::size_t i = 0; i < kMaxPayloadBytes / kMaxPrintBytes + 1; ++i) text += block + "\n";
