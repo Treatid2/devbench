@@ -3,15 +3,53 @@
 #include <cstddef>
 #include <cstdarg>
 #include <cstdio>
+#include <chrono>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace dvb::ConsoleLogCapture
 {
-	inline constexpr const char* kMarkerBegin = "DVBCAPBEGINx9F3";
-	inline constexpr const char* kMarkerEnd = "DVBCAPENDx9F3";
+	// Nonce creation belongs to the engine-facing window. This pure framing seam
+	// never accepts a substring or treats a second begin as a restart.
+	struct Fence
+	{
+		explicit Fence(std::string a_nonce);
+		std::string beginCommand, endCommand, beginLine, endLine;
+	};
+
+	// Shared by the actual print and main-thread paths. The owner must outlive
+	// its leases (production closures/detours retain their shared window).
+	class WindowAdmission
+	{
+	public:
+		class Lease
+		{
+		public:
+			Lease(Lease&& a_other) noexcept : m_owner(std::exchange(a_other.m_owner, nullptr)) {}
+			~Lease();
+			Lease(const Lease&) = delete;
+			Lease& operator=(const Lease&) = delete;
+		private:
+			friend class WindowAdmission;
+			explicit Lease(WindowAdmission* a_owner) : m_owner(a_owner) {}
+			WindowAdmission* m_owner;
+		};
+		std::optional<Lease> Enter();
+		bool StopAndDrain(std::chrono::steady_clock::time_point a_deadline);
+		bool Accepting() const;
+		bool Drained() const;
+	private:
+		mutable std::mutex m_mutex;
+		std::condition_variable m_changed;
+		bool m_accepting = true;
+		std::size_t m_active = 0;
+	};
 
 	inline constexpr std::size_t kRingMax = 512;
 
@@ -57,28 +95,31 @@ namespace dvb::ConsoleLogCapture
 	{
 		bool                     sawBegin = false;
 		bool                     sawEnd = false;
+		bool                     lossPossible = false;
 		std::vector<std::string> lines;
 	};
 
-	/// Whether the text holds a begin marker at or after a_fromOffset, and an end marker after it.
+	/// Whether complete lines hold this fence's first begin at/after a_fromOffset,
+	/// and its first end after that begin. Duplicate begin lines never restart it.
 	/// Markers before a_fromOffset belong to an earlier capture.
 	struct FenceState
 	{
 		bool hasBegin = false;
 		bool hasEnd = false;
 	};
-	FenceState FindFence(std::string_view a_text, std::size_t a_fromOffset = 0);
+	FenceState FindFence(const Fence& a_fence, std::string_view a_text, std::size_t a_fromOffset = 0);
 
-	/// The lines between the LAST begin marker (at or after a_fromOffset) and the end marker after
+	/// The lines between the first exact begin (at or after a_fromOffset) and its first exact end,
 	/// it, marker lines excluded, blank lines dropped, at most a_maxLines (the most recent).
-	Slice SliceFencedText(std::string_view a_text, std::size_t a_maxLines, std::size_t a_fromOffset = 0);
-	Slice SliceFencedLines(const std::deque<std::string>& a_lines, std::size_t a_maxLines);
+	Slice SliceFencedText(const Fence& a_fence, std::string_view a_text, std::size_t a_maxLines, std::size_t a_fromOffset = 0);
+	Slice SliceFencedLines(const Fence& a_fence, const std::deque<std::string>& a_lines, std::size_t a_maxLines);
 
 	/// Builds a scrollback from repeated looks at one "most recent line" slot. A line replaced
 	/// between two looks is never seen.
 	class LineSampler
 	{
 	public:
+		explicit LineSampler(Fence a_fence) : m_fence(std::move(a_fence)) {}
 		enum class Seen
 		{
 			kNothing,
@@ -98,6 +139,7 @@ namespace dvb::ConsoleLogCapture
 		[[nodiscard]] std::size_t                    Ticks() const { return m_ticks; }
 
 	private:
+		const Fence m_fence;
 		void Record(std::string_view a_line);
 
 		std::deque<std::string> m_lines;
@@ -133,6 +175,7 @@ namespace dvb::ConsoleLogCapture
 	class PrintCollector
 	{
 	public:
+		explicit PrintCollector(Fence a_fence) : m_fence(std::move(a_fence)) {}
 		static constexpr std::size_t kMaxLines = 20000;
 
 		void Reset();
@@ -149,6 +192,7 @@ namespace dvb::ConsoleLogCapture
 		[[nodiscard]] std::size_t                    FormattingBudget() const;
 
 	private:
+		const Fence m_fence;
 		void Line(std::string_view a_line);
 
 		std::deque<std::string> m_lines;

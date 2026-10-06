@@ -3,6 +3,7 @@
 #include "ConsoleCaptureLogic.h"
 
 #include <string>
+#include <cstdint>
 #include <vector>
 
 // Output is read from a hook on ConsoleLog::VPrint that sees every line printed during the capture.
@@ -12,6 +13,7 @@ namespace dvb::ConsoleLogCapture
 {
 	struct Result
 	{
+		std::uint64_t windowId = 0;
 		bool                     sawBegin = false;
 		bool                     sawEnd = false;
 		std::vector<std::string> lines;
@@ -50,10 +52,17 @@ namespace dvb::ConsoleLogCapture
 	/// when the function's first bytes are not a form it can safely relocate. Main thread, once.
 	void InstallPrintHook();
 
-	/// Runs `a_command` fenced; false if the end marker never arrived. Throws 409 if a capture is
-	/// running and 504 if the begin marker never appeared (the command was not run). Listener thread only.
-	bool RunFencedCapture(const std::string& a_command);
+	/// Runs a_command fenced; completed=false if no end arrived. Throws 409 if
+	/// active/draining, 504 for a missing begin (payload not run) or uncertain
+	/// task/drain failure (no replay). Listener thread only.
+	struct CaptureOutcome { bool completed; std::uint64_t windowId; };
+	CaptureOutcome RunFencedCapture(const std::string& a_command);
 
-	/// Slices the last capture's output from the source it used. Main thread.
-	Result ReadFenced(std::size_t a_maxLines = 200);
+	/// Copies the last closed, drained window's immutable snapshot. Any thread;
+	/// no live engine reads. Throws 409 while a window is active or draining.
+	Result ReadFenced(std::size_t a_maxLines = 200, std::uint64_t a_windowId = 0);
+
+	/// Exact active fence commands only; used by ConsoleHook to omit internal
+	/// commands from recordings, never a prefix/substring suppression rule.
+	bool IsCaptureControlCommand(std::string_view a_command);
 }

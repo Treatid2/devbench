@@ -3,25 +3,41 @@
 #include "ConsoleCaptureLogic.h"
 
 #include <new>
+#include <future>
+#include <chrono>
+#include <thread>
+#include <stdexcept>
 
-using dvb::ConsoleLogCapture::kMarkerBegin;
-using dvb::ConsoleLogCapture::kMarkerEnd;
 using dvb::ConsoleLogCapture::kRingMax;
-using dvb::ConsoleLogCapture::LineSampler;
-using dvb::ConsoleLogCapture::PrintCollector;
-using dvb::ConsoleLogCapture::SliceFencedLines;
-using dvb::ConsoleLogCapture::SliceFencedText;
 
 namespace
 {
+	const dvb::ConsoleLogCapture::Fence kFence{ "0123456789abcdef0123456789abcdef" };
+	// Fixture-only adapters keep the existing coverage on the same production
+	// implementation. Production supplies a new OS-random fence per window.
+	struct LineSampler : dvb::ConsoleLogCapture::LineSampler {
+		LineSampler() : dvb::ConsoleLogCapture::LineSampler(kFence) {}
+	};
+	struct PrintCollector : dvb::ConsoleLogCapture::PrintCollector {
+		PrintCollector() : dvb::ConsoleLogCapture::PrintCollector(kFence) {}
+	};
+	auto SliceFencedLines(const std::deque<std::string>& a_lines, std::size_t a_maxLines) {
+		return dvb::ConsoleLogCapture::SliceFencedLines(kFence, a_lines, a_maxLines);
+	}
+	auto SliceFencedText(std::string_view a_text, std::size_t a_maxLines, std::size_t a_offset = 0) {
+		return dvb::ConsoleLogCapture::SliceFencedText(kFence, a_text, a_maxLines, a_offset);
+	}
+	auto FindFence(std::string_view a_text, std::size_t a_offset = 0) {
+		return dvb::ConsoleLogCapture::FindFence(kFence, a_text, a_offset);
+	}
 	std::string BeginLine()
 	{
-		return std::string("Script command \"") + kMarkerBegin + "\" not found.";
+		return kFence.beginLine;
 	}
 
 	std::string EndLine()
 	{
-		return std::string("Script command \"") + kMarkerEnd + "\" not found.";
+		return kFence.endLine;
 	}
 }
 
@@ -45,12 +61,12 @@ TEST_CASE("text slicing handles CRLF and drops blank lines")
 	CHECK(slice.lines[1] == "beta");
 }
 
-TEST_CASE("text slicing uses the last begin marker")
+TEST_CASE("duplicate begin does not restart an already completed exact window")
 {
 	const std::string text = BeginLine() + "\nold\n" + EndLine() + "\n" + BeginLine() + "\nnew\n" + EndLine() + "\n";
 	const auto        slice = SliceFencedText(text, 200);
 	CHECK(slice.lines.size() == 1);
-	CHECK(slice.lines[0] == "new");
+	CHECK(slice.lines[0] == "old");
 }
 
 TEST_CASE("text slicing reports a missing end marker and a missing begin marker")
@@ -250,7 +266,6 @@ TEST_CASE("new output restarts the quiet count")
 	CHECK(detector.Look(false));
 }
 
-using dvb::ConsoleLogCapture::FindFence;
 
 TEST_CASE("a fence before the starting offset belongs to an earlier capture")
 {
@@ -278,12 +293,12 @@ TEST_CASE("a stale end marker cannot complete a new capture")
 	CHECK(slice.lines[0] == "new output");
 }
 
-TEST_CASE("fence detection with no offset finds the latest fence")
+TEST_CASE("fence detection with no offset selects the first exact complete window")
 {
 	const std::string text = BeginLine() + "\na\n" + EndLine() + "\n" + BeginLine() + "\n";
 	const auto        state = FindFence(text);
 	CHECK(state.hasBegin);
-	CHECK(!state.hasEnd);
+	CHECK(state.hasEnd);
 	CHECK(!FindFence("no markers here").hasBegin);
 }
 
@@ -456,4 +471,132 @@ TEST_CASE("payload byte budget refuses extra data but preserves end control and 
 	CHECK(c.PayloadLines() == 0);
 	CHECK(c.PayloadBytes() == 0);
 	CHECK(c.Dropped() == 0);
+}
+
+TEST_CASE("exact nonce fencing rejects token-like payload old windows and combined controls")
+{
+	const dvb::ConsoleLogCapture::Fence old{ "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
+	const std::string combined = BeginLine() + " " + EndLine();
+	const std::string prefixed = "payload: " + BeginLine();
+	const std::string suffix = EndLine() + " payload";
+	const std::string text = old.beginLine + "\r\n" + old.endLine + "\r\n" +
+		combined + "\r\n" + prefixed + "\r\n" + BeginLine() + "\r\n" +
+		prefixed + "\r\n" + BeginLine() + "\r\n" + combined + "\r\n" + suffix +
+		"\r\n" + EndLine() + "\r\n" + EndLine() + "\r\n";
+	const auto state = FindFence(text);
+	CHECK(state.hasBegin && state.hasEnd);
+	const auto sliced = SliceFencedText(text, 200);
+	CHECK(sliced.lines == std::vector<std::string>({prefixed, combined, suffix}));
+	PrintCollector collector;
+	collector.Feed(old.beginLine);
+	collector.Feed(combined);
+	collector.Feed(prefixed);
+	CHECK(!collector.SawBegin());
+	collector.Feed(BeginLine());
+	collector.Feed(BeginLine());
+	collector.Feed(combined);
+	collector.Feed(suffix);
+	CHECK(!collector.SawEnd());
+	collector.Feed(EndLine());
+	collector.Feed(EndLine());
+	CHECK(collector.PayloadLines() == 2);
+	CHECK(SliceFencedLines(collector.Lines(), 200).lines == std::vector<std::string>({combined, suffix}));
+	LineSampler sampler;
+	sampler.Reset(old.beginLine);
+	CHECK(sampler.Observe(old.beginLine) == LineSampler::Seen::kNothing);
+	CHECK(sampler.Observe(combined) == LineSampler::Seen::kLine);
+	CHECK(!sampler.SawBegin());
+	CHECK(sampler.Observe(BeginLine()) == LineSampler::Seen::kBegin);
+	CHECK(sampler.Observe(prefixed) == LineSampler::Seen::kLine);
+	CHECK(!sampler.SawEnd());
+	CHECK(sampler.Observe(EndLine()) == LineSampler::Seen::kEnd);
+}
+
+TEST_CASE("framing validates nonce and offsets never turn a line suffix into a control")
+{
+	CHECK_THROWS(dvb::ConsoleLogCapture::Fence("short"));
+	CHECK_THROWS(dvb::ConsoleLogCapture::Fence("0123456789abcdef0123456789abcdeG"));
+	CHECK_THROWS(dvb::ConsoleLogCapture::Fence("0123456789abcdef0123456789abcdef0"));
+	const std::string text = "payload:" + BeginLine() + "\n" + EndLine();
+	CHECK(!FindFence(text, 8).hasBegin);
+	CHECK(!SliceFencedText(text, 200, 8).sawBegin);
+}
+
+TEST_CASE("production admission gate drains an admitted writer before immutable read and reopen")
+{
+	using dvb::ConsoleLogCapture::WindowAdmission;
+	using namespace std::chrono;
+	WindowAdmission gate;
+	PrintCollector first;
+	first.Feed(BeginLine());
+	std::promise<void> entered, resume;
+	auto enteredFuture = entered.get_future();
+	auto resumeFuture = resume.get_future();
+	auto writer = std::async(std::launch::async, [&] {
+		auto admitted = gate.Enter();
+		if (!admitted) { entered.set_value(); return; }
+		entered.set_value();
+		if (resumeFuture.wait_for(seconds(1)) != std::future_status::ready) return;
+		// Publication retains the same gate/collector, as PrintDetour does.
+		first.Feed("admitted output");
+		first.Feed(EndLine());
+	});
+	const auto ready = enteredFuture.wait_for(seconds(1));
+	CHECK(ready == std::future_status::ready);
+	CHECK(!gate.StopAndDrain(steady_clock::now()));
+	CHECK(!gate.Accepting());
+	CHECK(!gate.Drained());  // production Freeze refuses read/publication here
+	CHECK(!gate.Enter().has_value());
+	resume.set_value();
+	CHECK(writer.wait_for(seconds(1)) == std::future_status::ready);
+	writer.get();
+	CHECK(gate.StopAndDrain(steady_clock::now() + seconds(1)));
+	CHECK(gate.Drained());
+	const auto frozen = SliceFencedLines(first.Lines(), 200);
+	CHECK(frozen.sawEnd);
+	CHECK(frozen.lines == std::vector<std::string>({"admitted output"}));
+	WindowAdmission successorGate;
+	const dvb::ConsoleLogCapture::Fence next{ "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" };
+	dvb::ConsoleLogCapture::PrintCollector second{next};
+	auto admitted = successorGate.Enter();
+	CHECK(admitted.has_value());
+	CHECK(!gate.Enter().has_value());  // stale admitted task cannot re-enter
+	second.Feed(BeginLine());
+	second.Feed(EndLine());
+	CHECK(!second.SawBegin());
+	second.Feed(next.beginLine);
+	second.Feed("successor output");
+	second.Feed(next.endLine);
+	CHECK(dvb::ConsoleLogCapture::SliceFencedLines(next, second.Lines(), 200).lines ==
+		std::vector<std::string>({"successor output"}));
+	CHECK(frozen.lines == std::vector<std::string>({"admitted output"}));
+}
+
+TEST_CASE("production admission lease is exception safe and queued late work cannot enter")
+{
+	using dvb::ConsoleLogCapture::WindowAdmission;
+	using namespace std::chrono;
+	WindowAdmission gate;
+	try {
+		auto entered = gate.Enter();
+		CHECK(entered.has_value());
+		throw std::runtime_error("injected observer failure");
+	} catch (const std::runtime_error&) {}
+	CHECK(gate.StopAndDrain(steady_clock::now() + seconds(1)));
+	CHECK(!gate.Enter().has_value());
+	CHECK(gate.Drained());
+}
+
+TEST_CASE("fallback slicing bounds payload bytes and reports omitted data without losing the end")
+{
+	using namespace dvb::ConsoleLogCapture;
+	const std::string block(kMaxPrintBytes, 'x');
+	std::string text = BeginLine() + "\n";
+	for (std::size_t i = 0; i < kMaxPayloadBytes / kMaxPrintBytes + 1; ++i) text += block + "\n";
+	text += std::string(kMaxPayloadBytes + 1, 'y') + "\n" + EndLine() + "\n";
+	const auto out = ::SliceFencedText(text, 20000);
+	CHECK(out.sawBegin && out.sawEnd && out.lossPossible);
+	std::size_t bytes = 0;
+	for (const auto& line : out.lines) bytes += line.size();
+	CHECK(bytes <= kMaxPayloadBytes);
 }

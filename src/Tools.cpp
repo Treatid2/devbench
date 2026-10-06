@@ -116,12 +116,20 @@ namespace dvb
 				const int maxLines = a_args.value("maxLines", 200);
 				if (maxLines < 1 || maxLines > static_cast<int>(ConsoleLogCapture::PrintCollector::kMaxLines))
 					throw ToolError(400, std::format("console read: 'maxLines' must be 1..{}", ConsoleLogCapture::PrintCollector::kMaxLines));
-				return MainThread::RunAndWait([maxLines]() -> json {
-					const auto r = ConsoleLogCapture::ReadFenced(static_cast<std::size_t>(maxLines));
+				std::uint64_t windowId = 0;
+				if (const auto id = a_args.find("windowId"); id != a_args.end()) {
+					if (!id->is_number_integer() || (!id->is_number_unsigned() && id->get<std::int64_t>() <= 0) ||
+						(id->is_number_unsigned() && id->get<std::uint64_t>() == 0))
+						throw ToolError(400, "console read: windowId must be a positive integer from capture exec");
+					windowId = id->get<std::uint64_t>();
+				}
+				return [maxLines, windowId]() -> json {
+					const auto r = ConsoleLogCapture::ReadFenced(static_cast<std::size_t>(maxLines), windowId);
 					json       arr = json::array();
 					for (const auto& l : r.lines)
 						arr.push_back(l);
 					return json{
+						{ "windowId", r.windowId },
 						{ "markersFound", r.sawBegin && r.sawEnd },
 						{ "sawBegin", r.sawBegin },
 						{ "sawEnd", r.sawEnd },
@@ -158,7 +166,7 @@ namespace dvb
 									  { "timedOut", r.timedOut },
 								  } },
 					};
-				});
+				}();
 			}
 			if (action != "exec")
 				throw ToolError(400, std::format("unknown action '{}'", action));
@@ -195,8 +203,9 @@ namespace dvb
 				task->AddTask([command]() { RE::Console::ExecuteCommand(command.c_str()); });
 				return json{ { "queued", true }, { "command", command }, { "capturing", false } };
 			}
-			const bool completed = ConsoleLogCapture::RunFencedCapture(command);
-			return json{ { "queued", false }, { "command", command }, { "capturing", true }, { "completed", completed } };
+			const auto outcome = ConsoleLogCapture::RunFencedCapture(command);
+			return json{ { "queued", false }, { "command", command }, { "capturing", true },
+				{ "completed", outcome.completed }, { "windowId", outcome.windowId } };
 		}
 
 		namespace fs = std::filesystem;
@@ -2851,33 +2860,36 @@ namespace dvb
 		ToolDescriptor console;
 		console.name = "console";
 		console.description =
-			"Run a Skyrim console command. action='exec' (default) queues `command` onto the main "
-			"thread (runs next tick). With capture=true it is fenced between marker commands and exec "
-			"returns once the output has landed, so a following action='read' returns the command's "
-			"output as { markersFound, lines:[...], source, lossPossible }. source='print' (the normal "
-			"case) collects game/plugin prints whether or not the Console menu exists. It retains up to "
-			"20000 payload lines and 1048576 payload bytes; each formatted print is limited to 65536 bytes "
-			"before allocation. diag.printLoss distinguishes line/byte limits, formatting/allocation "
-			"failures and oversized prints; any recorded loss sets lossPossible. diag.printDropped is "
-			"the aggregate loss-event count, not an exact missing-line count. The fallbacks, used only when that hook could not "
-			"be installed (diag.printHooked=false): source='buffer' is complete, including several "
-			"lines printed in one frame (e.g. `help`); source='sampler' is used once the Console menu "
-			"has been created, when the game stops filling that buffer: it sees one line per frame, so "
-			"a command that prints SEVERAL lines in a frame keeps only the last (lossPossible=true). "
-			"read returns the most recent 'maxLines' lines (default 200). A second capture while one is "
-			"running gets 409. exec then returns { queued:false, completed }, completed=false meaning "
-			"the end marker never arrived and `lines` may be incomplete; a capture that never sees its "
-			"begin marker gets 504 and the command is not run. "
-			"`save <name>`/`load <name>` are rerouted to the `game` tool's save/load "
-			"path and return { redirected:'game' } — saves use SKSE's queued request "
-			"to avoid synchronous save deadlocks (SkyrimVM::Freeze vs blocked main loop).";
+			"Run a Skyrim console command. action='exec' (default) queues command onto the main thread. With "
+			"capture=true a fresh per-window nonce uses exact observed unknown-command control lines; "
+			"unrecognised framing fails closed before the payload command runs. Exec returns {queued:false, "
+			"completed, windowId}; completed means the end control was observed, not that asynchronous engine "
+			"work is quiescent. Print/task admission retains that exact window. Closing stops new admissions and "
+			"drains admitted work before publishing an immutable result; a drain timeout returns 504 with command "
+			"completion uncertain, blocks a successor and must not trigger replay. action='read' returns "
+			"{windowId, markersFound, lines, source, lossPossible} from the last closed/drained snapshot, without "
+			"live engine reads. While active/draining it returns 409. Optional windowId must match that retained "
+			"snapshot; there is no historical lookup. source='print' captures game/plugin prints whether or not "
+			"the Console menu exists. It retains at most 20000 payload lines and 1048576 payload bytes "
+			"independently of two control records; each formatted print is limited to 65536 bytes before "
+			"allocation. diag.printLoss distinguishes line/byte limits, formatting/allocation failures and "
+			"oversized prints. diag.printDropped is an aggregate loss-event count, not an exact missing-line "
+			"count. Any recorded loss sets lossPossible. Fallback source='buffer' retains multiple lines per "
+			"frame, bounded to the same payload capacity; source='sampler' observes only changing last-message "
+			"lines and can miss repeated or intermediate lines (lossPossible=true). Fallback diagnostics describe "
+			"the last completed look, not current engine state. read returns the most recent maxLines lines "
+			"(default 200, max 20000). A second active or incompletely drained capture gets 409. completed=false "
+			"means no end control was observed and output may be incomplete. A missing begin gets 504 and the "
+			"payload was not run. save/load commands are rerouted to the game tool and return "
+			"{redirected:'game'}; saves use SKSE's queued request to avoid synchronous VM save deadlocks.";
 		console.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
-								{ "action", json{ { "type", "string" }, { "enum", json::array({ "exec", "read" }) }, { "description", "'exec' (default) runs `command`; 'read' returns the fenced output and closes the window" } } },
+								{ "action", json{ { "type", "string" }, { "enum", json::array({ "exec", "read" }) }, { "description", "'exec' (default) runs command; 'read' copies the closed/drained window snapshot" } } },
 								{ "command", json{ { "type", "string" }, { "description", "the console command, exactly as typed after ~ (required for exec)" } } },
 								{ "capture", json{ { "type", "boolean" }, { "description", "exec: fence and capture this command's output for the next read" } } },
 								{ "maxLines", json{ { "type", "integer" }, { "description", "read: most recent lines to return (default 200, max 20000)" } } },
+								{ "windowId", json{ { "type", "integer" }, { "minimum", 1 }, { "description", "read: require this exact windowId returned by capture exec; latest retained snapshot only, not history" } } },
 							} },
 		};
 		a_registry.Register(std::move(console), &ConsoleHandler);
