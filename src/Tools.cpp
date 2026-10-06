@@ -142,6 +142,15 @@ namespace dvb
 									  { "printHooked", r.printHooked },
 									  { "printLines", r.printLines },
 									  { "printDropped", r.printDropped },
+									  { "printPayloadLines", r.printPayloadLines },
+									  { "printPayloadBytes", r.printPayloadBytes },
+									  { "printLoss", json{
+										  { "lineLimit", r.printLoss.lineLimit },
+										  { "byteLimit", r.printLoss.byteLimit },
+										  { "format", r.printLoss.format },
+										  { "allocation", r.printLoss.allocation },
+										  { "oversize", r.printLoss.oversize },
+									  } },
 									  { "ringLines", r.ringLines },
 									  { "samples", r.samples },
 									  { "ticks", r.ticks },
@@ -2846,9 +2855,11 @@ namespace dvb
 			"thread (runs next tick). With capture=true it is fenced between marker commands and exec "
 			"returns once the output has landed, so a following action='read' returns the command's "
 			"output as { markersFound, lines:[...], source, lossPossible }. source='print' (the normal "
-			"case) comes from a hook on the console's print function and holds EVERY line printed "
-			"between the markers, from the game or any plugin, whether or not the Console menu exists "
-			"(lossPossible only past 20000 lines). The fallbacks, used only when that hook could not "
+			"case) collects game/plugin prints whether or not the Console menu exists. It retains up to "
+			"20000 payload lines and 1048576 payload bytes; each formatted print is limited to 65536 bytes "
+			"before allocation. diag.printLoss distinguishes line/byte limits, formatting/allocation "
+			"failures and oversized prints; any recorded loss sets lossPossible. diag.printDropped is "
+			"the aggregate loss-event count, not an exact missing-line count. The fallbacks, used only when that hook could not "
 			"be installed (diag.printHooked=false): source='buffer' is complete, including several "
 			"lines printed in one frame (e.g. `help`); source='sampler' is used once the Console menu "
 			"has been created, when the game stops filling that buffer: it sees one line per frame, so "

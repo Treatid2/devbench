@@ -1,9 +1,26 @@
 #include "ConsoleCaptureLogic.h"
 
+#include <algorithm>
+
 namespace dvb::ConsoleLogCapture
 {
 	namespace
 	{
+		int Traverse(VFormatter a_formatter, char* a_dst, std::size_t a_size,
+			const char* a_format, std::va_list a_args)
+		{
+			std::va_list copy;
+			va_copy(copy, a_args);
+			try {
+				const int result = a_formatter(a_dst, a_size, a_format, copy);
+				va_end(copy);
+				return result;
+			} catch (...) {
+				va_end(copy);
+				throw;
+			}
+		}
+
 		bool Contains(std::string_view a_text, const char* a_token)
 		{
 			return a_text.find(a_token) != std::string_view::npos;
@@ -14,6 +31,66 @@ namespace dvb::ConsoleLogCapture
 			if (a_lines.size() > a_maxLines)
 				a_lines.erase(a_lines.begin(), a_lines.end() - static_cast<std::ptrdiff_t>(a_maxLines));
 		}
+	}
+
+	FormattedPrint FormatPrint(const char* a_format, std::va_list a_args,
+		std::size_t a_budget, VFormatter a_formatter, PrintAllocator a_allocator)
+	{
+		FormattedPrint out;
+		if (!a_format || !a_formatter) {
+			out.loss = PrintLoss::kFormat;
+			return out;
+		}
+		const auto budget = std::min(a_budget, kMaxPrintBytes);
+		char head[1024];
+		int length;
+		try {
+			length = Traverse(a_formatter, head, sizeof(head), a_format, a_args);
+		} catch (...) {
+			out.loss = PrintLoss::kFormat;
+			return out;
+		}
+		if (length < 0) {
+			out.loss = PrintLoss::kFormat;
+			return out;
+		}
+		const auto size = static_cast<std::size_t>(length);
+		if (size > budget) {
+			out.loss = PrintLoss::kOversize;
+			return out;
+		}
+		try {
+			if (size < sizeof(head)) {
+				// Keep allocation injection on the short path as well.
+				if (a_allocator) a_allocator(out.text, size);
+				out.text.assign(head, size);
+			} else {
+				if (a_allocator) a_allocator(out.text, size + 1);
+				else out.text.resize(size + 1);
+				// The seam must obey the exact requested allocation contract.
+				if (out.text.size() != size + 1) {
+					out.text.clear();
+					out.loss = PrintLoss::kAllocation;
+					return out;
+				}
+				int written;
+				try {
+					written = Traverse(a_formatter, out.text.data(), out.text.size(), a_format, a_args);
+				} catch (...) {
+					written = -1;
+				}
+				if (written != length) {
+					out.text.clear();
+					out.loss = PrintLoss::kFormat;
+					return out;
+				}
+				out.text.resize(size);
+			}
+		} catch (...) {
+			out.text.clear();
+			out.loss = PrintLoss::kAllocation;
+		}
+		return out;
 	}
 
 	FenceState FindFence(std::string_view a_text, std::size_t a_fromOffset)
@@ -160,7 +237,9 @@ namespace dvb::ConsoleLogCapture
 	void PrintCollector::Reset()
 	{
 		m_lines.clear();
-		m_dropped = 0;
+		m_loss = {};
+		m_payloadLines = 0;
+		m_payloadBytes = 0;
 		m_sawBegin = false;
 		m_sawEnd = false;
 	}
@@ -172,16 +251,44 @@ namespace dvb::ConsoleLogCapture
 		if (!m_sawBegin) {
 			if (!Contains(a_line, kMarkerBegin))
 				return;
+			m_lines.emplace_back(a_line);
 			m_sawBegin = true;
+			return;
 		} else if (Contains(a_line, kMarkerEnd)) {
+			m_lines.emplace_back(a_line);
 			m_sawEnd = true;
+			return;
 		}
-		// The end marker is always kept so a capture that hit the cap still reads as finished.
-		if (m_lines.size() >= kMaxLines && !m_sawEnd) {
-			++m_dropped;
+		// Fences do not consume the advertised payload capacity. Control records
+		// are retained even when payload is full; two independently bounded slots.
+		if (m_payloadLines >= kMaxLines) {
+			++m_loss.lineLimit;
+			return;
+		}
+		if (a_line.size() > kMaxPayloadBytes - m_payloadBytes) {
+			++m_loss.byteLimit;
 			return;
 		}
 		m_lines.emplace_back(a_line);
+		++m_payloadLines;
+		m_payloadBytes += a_line.size();
+	}
+
+	std::size_t PrintCollector::FormattingBudget() const
+	{
+		// Reserve a small temporary allowance for an end-control record when the
+		// payload is full. Payload publication still checks the exact byte budget.
+		return std::min(kMaxPrintBytes, std::max<std::size_t>(256, kMaxPayloadBytes - m_payloadBytes));
+	}
+
+	void PrintCollector::RecordLoss(PrintLoss a_loss)
+	{
+		switch (a_loss) {
+		case PrintLoss::kFormat: ++m_loss.format; break;
+		case PrintLoss::kAllocation: ++m_loss.allocation; break;
+		case PrintLoss::kOversize: ++m_loss.oversize; break;
+		case PrintLoss::kNone: break;
+		}
 	}
 
 	void PrintCollector::Feed(std::string_view a_text)

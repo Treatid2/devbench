@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdarg>
+#include <cstdio>
 #include <deque>
 #include <string>
 #include <string_view>
@@ -12,6 +14,38 @@ namespace dvb::ConsoleLogCapture
 	inline constexpr const char* kMarkerEnd = "DVBCAPENDx9F3";
 
 	inline constexpr std::size_t kRingMax = 512;
+
+	// Bound one formatted VPrint before allocating; the window payload has its
+	// own independent byte limit. The two control records are separate capacity.
+	inline constexpr std::size_t kMaxPrintBytes = 64 * 1024;
+	inline constexpr std::size_t kMaxPayloadBytes = 1024 * 1024;
+
+	enum class PrintLoss { kNone, kFormat, kAllocation, kOversize };
+	struct FormattedPrint
+	{
+		std::string text;
+		PrintLoss loss = PrintLoss::kNone;
+	};
+	// Production-used, bounded failure-injection seams. Every traversal gets its
+	// own va_copy, even when the injected formatter throws. Defaults use libc and
+	// std::string only; callers cannot ask for more than kMaxPrintBytes.
+	using VFormatter = int (*)(char*, std::size_t, const char*, std::va_list);
+	using PrintAllocator = void (*)(std::string&, std::size_t);
+	FormattedPrint FormatPrint(const char* a_format, std::va_list a_args,
+		std::size_t a_budget = kMaxPrintBytes,
+		VFormatter a_formatter = &std::vsnprintf, PrintAllocator a_allocator = nullptr);
+
+	struct PrintLossCounts
+	{
+		std::size_t lineLimit = 0;
+		std::size_t byteLimit = 0;
+		std::size_t format = 0;
+		std::size_t allocation = 0;
+		std::size_t oversize = 0;
+		[[nodiscard]] std::size_t Total() const {
+			return lineLimit + byteLimit + format + allocation + oversize;
+		}
+	};
 
 	/// Looks the begin marker must survive in the buffer, or be seen in the sampler, before a
 	/// source is chosen.
@@ -103,17 +137,24 @@ namespace dvb::ConsoleLogCapture
 
 		void Reset();
 		void Feed(std::string_view a_text);
+		void RecordLoss(PrintLoss a_loss);
 
 		[[nodiscard]] bool                           SawBegin() const { return m_sawBegin; }
 		[[nodiscard]] bool                           SawEnd() const { return m_sawEnd; }
 		[[nodiscard]] const std::deque<std::string>& Lines() const { return m_lines; }
-		[[nodiscard]] std::size_t                    Dropped() const { return m_dropped; }
+		[[nodiscard]] std::size_t                    Dropped() const { return m_loss.Total(); }
+		[[nodiscard]] const PrintLossCounts&         Loss() const { return m_loss; }
+		[[nodiscard]] std::size_t                    PayloadLines() const { return m_payloadLines; }
+		[[nodiscard]] std::size_t                    PayloadBytes() const { return m_payloadBytes; }
+		[[nodiscard]] std::size_t                    FormattingBudget() const;
 
 	private:
 		void Line(std::string_view a_line);
 
 		std::deque<std::string> m_lines;
-		std::size_t             m_dropped = 0;
+		PrintLossCounts         m_loss;
+		std::size_t             m_payloadLines = 0;
+		std::size_t             m_payloadBytes = 0;
 		bool                    m_sawBegin = false;
 		bool                    m_sawEnd = false;
 	};

@@ -2,6 +2,8 @@
 
 #include "ConsoleCaptureLogic.h"
 
+#include <new>
+
 using dvb::ConsoleLogCapture::kMarkerBegin;
 using dvb::ConsoleLogCapture::kMarkerEnd;
 using dvb::ConsoleLogCapture::kRingMax;
@@ -326,9 +328,132 @@ TEST_CASE("print collector caps its lines, counts the drop, and still sees the e
 		c.Feed("x");
 	c.Feed(EndLine());
 	CHECK(c.SawEnd());
-	CHECK(c.Dropped() == 11);
+	CHECK(c.Dropped() == 10);
 	c.Reset();
 	CHECK(!c.SawBegin());
 	CHECK(c.Lines().empty());
+	CHECK(c.Dropped() == 0);
+}
+
+namespace
+{
+	using namespace dvb::ConsoleLogCapture;
+
+	FormattedPrint FormatWith(std::size_t a_budget, VFormatter a_formatter,
+		PrintAllocator a_allocator, const char* a_format, ...)
+	{
+		std::va_list args;
+		va_start(args, a_format);
+		try {
+			auto result = FormatPrint(a_format, args, a_budget, a_formatter, a_allocator);
+			va_end(args);
+			return result;
+		} catch (...) {
+			va_end(args);
+			throw;
+		}
+	}
+
+	int g_formatCalls = 0;
+	int g_failOnCall = 0;
+	bool g_wrongLength = false;
+	int InjectFormat(char* a_dst, std::size_t a_size, const char* a_format, std::va_list a_args)
+	{
+		++g_formatCalls;
+		if (g_formatCalls == g_failOnCall) return -1;
+		const int n = std::vsnprintf(a_dst, a_size, a_format, a_args);
+		return g_wrongLength && g_formatCalls == 2 ? n + 1 : n;
+	}
+	void RefuseAllocation(std::string&, std::size_t) { throw std::bad_alloc(); }
+}
+
+TEST_CASE("print formatting independently traverses long mixed varargs twice")
+{
+	const std::string longText(2048, 'x');
+	g_formatCalls = 0; g_failOnCall = 0; g_wrongLength = false;
+	const auto result = FormatWith(kMaxPrintBytes, InjectFormat, nullptr,
+		"%d:%s:%d", 17, longText.c_str(), 29);
+	CHECK(result.loss == PrintLoss::kNone);
+	CHECK(result.text == "17:" + longText + ":29");
+	CHECK(g_formatCalls == 2);
+}
+
+TEST_CASE("first and second print format failures and inconsistent lengths are explicit loss")
+{
+	const std::string longText(2048, 'x');
+	for (int failed : {1, 2}) {
+		g_formatCalls = 0; g_failOnCall = failed; g_wrongLength = false;
+		const auto result = FormatWith(kMaxPrintBytes, InjectFormat, nullptr, "%s", longText.c_str());
+		CHECK(result.loss == PrintLoss::kFormat);
+		CHECK(result.text.empty());
+	}
+	g_formatCalls = 0; g_failOnCall = 0; g_wrongLength = true;
+	const auto wrong = FormatWith(kMaxPrintBytes, InjectFormat, nullptr, "%s", longText.c_str());
+	CHECK(wrong.loss == PrintLoss::kFormat);
+	CHECK(wrong.text.empty());
+	g_wrongLength = false;
+}
+
+TEST_CASE("print allocation refusal is bounded observable loss on both format paths")
+{
+	for (std::size_t size : {10u, 2048u}) {
+		const std::string text(size, 'x');
+		const auto result = FormatWith(kMaxPrintBytes, &std::vsnprintf, RefuseAllocation, "%s", text.c_str());
+		CHECK(result.loss == PrintLoss::kAllocation);
+		CHECK(result.text.empty());
+	}
+}
+
+TEST_CASE("print preallocation budget rejects oversize and clamps caller limits")
+{
+	const std::string exact(kMaxPrintBytes, 'x');
+	const auto accepted = FormatWith(kMaxPrintBytes, &std::vsnprintf, nullptr, "%s", exact.c_str());
+	CHECK(accepted.loss == PrintLoss::kNone);
+	CHECK(accepted.text.size() == kMaxPrintBytes);
+	const auto over = FormatWith(kMaxPrintBytes * 2, &std::vsnprintf, nullptr, "%s!", exact.c_str());
+	CHECK(over.loss == PrintLoss::kOversize);
+	CHECK(over.text.empty());
+	const auto remaining = FormatWith(8, &std::vsnprintf, nullptr, "%s", "ninebytes");
+	CHECK(remaining.loss == PrintLoss::kOversize);
+	CHECK(remaining.text.empty());
+}
+
+TEST_CASE("fences do not consume 19999 20000 or 20001 payload line capacity")
+{
+	for (std::size_t count : {19999u, 20000u, 20001u}) {
+		PrintCollector c;
+		c.Feed(BeginLine());
+		for (std::size_t i = 0; i < count; ++i) c.Feed("x");
+		c.Feed(EndLine());
+		CHECK(c.SawEnd());
+		CHECK(c.PayloadLines() == (count > PrintCollector::kMaxLines ? PrintCollector::kMaxLines : count));
+		CHECK(c.Lines().size() == c.PayloadLines() + 2);
+		CHECK(c.Loss().lineLimit == (count == 20001 ? 1u : 0u));
+		CHECK(c.Dropped() == c.Loss().lineLimit);
+	}
+}
+
+TEST_CASE("payload byte budget refuses extra data but preserves end control and loss counters")
+{
+	PrintCollector c;
+	c.Feed(BeginLine());
+	const std::string block(kMaxPrintBytes, 'x');
+	for (std::size_t i = 0; i < kMaxPayloadBytes / kMaxPrintBytes; ++i) c.Feed(block);
+	CHECK(c.PayloadBytes() == kMaxPayloadBytes);
+	CHECK(c.FormattingBudget() == 256);
+	c.Feed("x");
+	CHECK(c.Loss().byteLimit == 1);
+	c.RecordLoss(PrintLoss::kFormat);
+	c.RecordLoss(PrintLoss::kAllocation);
+	c.RecordLoss(PrintLoss::kOversize);
+	c.Feed(EndLine());
+	CHECK(c.SawEnd());
+	CHECK(c.Loss().format == 1);
+	CHECK(c.Loss().allocation == 1);
+	CHECK(c.Loss().oversize == 1);
+	CHECK(c.Dropped() == 4);
+	c.Reset();
+	CHECK(c.PayloadLines() == 0);
+	CHECK(c.PayloadBytes() == 0);
 	CHECK(c.Dropped() == 0);
 }

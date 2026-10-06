@@ -62,23 +62,16 @@ namespace dvb::ConsoleLogCapture
 				return;
 			try {
 				const auto* fmt = reinterpret_cast<const char*>(a_ctx.Rdx);
-				if (!fmt)
-					return;
 				const auto args = reinterpret_cast<std::va_list>(a_ctx.R8);
-				char       head[1024];
-				const int  n = std::vsnprintf(head, sizeof(head), fmt, args);
-				if (n < 0)
-					return;
-				std::string text;
-				if (static_cast<std::size_t>(n) < sizeof(head)) {
-					text.assign(head, static_cast<std::size_t>(n));
-				} else {
-					text.resize(static_cast<std::size_t>(n) + 1);
-					std::vsnprintf(text.data(), text.size(), fmt, args);
-					text.resize(static_cast<std::size_t>(n));
-				}
 				std::lock_guard<std::mutex> lk(g_printMutex);
-				g_printed.Feed(text);
+				// Formatting and its pre-allocation budget see one collector state.
+				// Generation-bound admission/close is a separate pending correction.
+				const auto formatted = FormatPrint(fmt, args, g_printed.FormattingBudget());
+				g_printed.RecordLoss(formatted.loss);
+				if (formatted.loss == PrintLoss::kNone) {
+					try { g_printed.Feed(formatted.text); }
+					catch (...) { g_printed.RecordLoss(PrintLoss::kAllocation); }
+				}
 			} catch (...) {
 			}
 		}
@@ -354,6 +347,9 @@ namespace dvb::ConsoleLogCapture
 			slice = SliceFencedLines(g_printed.Lines(), a_maxLines);
 			out.printLines = g_printed.Lines().size();
 			out.printDropped = g_printed.Dropped();
+			out.printLoss = g_printed.Loss();
+			out.printPayloadLines = g_printed.PayloadLines();
+			out.printPayloadBytes = g_printed.PayloadBytes();
 			out.source = "print";
 			out.lossPossible = out.printDropped > 0;
 		} else if (source == Source::kSampler) {
