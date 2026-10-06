@@ -67,6 +67,22 @@ add_files("src/RecordingsMenu.cpp")
 add_includedirs("src")
 target_end()
 
+-- Standalone transport regression: the exact patched cpp-mcp server, no SKSE,
+-- CommonLib, game, deployment or external endpoint. Compile-only via Broker;
+-- assertion execution belongs to the receiving task. Not selected by default.
+target("devbench-transport-tests")
+set_kind("binary")
+set_default(false)
+set_languages("c++23")
+add_deps("cpp-mcp")
+add_packages("nlohmann_json")
+add_includedirs("tests")
+add_files("tests/transport/*.cpp", "tests/test_main.cpp")
+add_defines("_WINSOCKAPI_")
+add_cxflags("/utf-8", "/EHsc", { force = true })
+add_shflags("/DEBUG", { force = true })
+target_end()
+
 -- The FUCK-hosted in-game menu also lives in its own PCH-free static lib: FUCK_API.h pulls in the
 -- real imgui.h, which cannot coexist with SMF's cimgui ImGuiMCP (devbench-UI) or the main PCH.
 target("devbench-UI-fuck")
