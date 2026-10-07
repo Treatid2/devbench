@@ -37,7 +37,7 @@ namespace dvb
 
 	RestAdapter::RestAdapter(ToolRegistry& a_registry, EventBus& a_events) :
 		m_registry(a_registry), m_events(a_events),
-		m_callbacks(std::make_shared<CallbackLease<RestAdapter>>(*this))
+		m_callbacks(std::make_shared<CallbackLease<RestAdapter, CallbackMode::Concurrent>>(*this))
 	{
 		// Track the latest lifecycle event directly rather than scanning Since(0) on every
 		// /api/health call: the bus's ring buffer caps at 256 events, so under enough traffic
@@ -73,18 +73,28 @@ namespace dvb
 
 	void RestAdapter::Mount(httplib::Server& a_http)
 	{
+		// Routes may have been copied to transport workers before Stop. They keep
+		// only this lease, never the adapter address. Concurrent admission preserves
+		// off-thread health replies while a tool waits for the game main thread.
+		const auto guarded = [lease = m_callbacks](auto a_handler) {
+			return [lease, handler = std::move(a_handler)](const httplib::Request& req, httplib::Response& res) {
+				if (!lease->Invoke([&](RestAdapter& self) { handler(self, req, res); }))
+					WriteJson(res, 503, json{ { "error", "devbench adapter stopped" } });
+			};
+		};
+
 		// `mcp_bridge` sits at the top level, not inside a tool's own description --
 		// see BridgeDiscoveryInfo()'s doc comment for why placement here matters.
-		a_http.Get("/api/tools", [this](const httplib::Request&, httplib::Response& res) {
+		a_http.Get("/api/tools", guarded([](RestAdapter& self, const httplib::Request&, httplib::Response& res) {
 			json arr = json::array();
-			for (const auto& d : m_registry.List())
+			for (const auto& d : self.m_registry.List())
 				arr.push_back(json{ { "name", d.name }, { "description", d.description },
 					{ "inputSchema", d.inputSchema }, { "readOnly", d.readOnly } });
 			WriteJson(res, 200, json{ { "tools", std::move(arr) }, { "mcp_bridge", BridgeDiscoveryInfo() } });
-		});
+		}));
 
 		// Invoke: POST /api/tool/<name>, body is the arguments object.
-		a_http.Post(R"(/api/tool/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
+		a_http.Post(R"(/api/tool/([^/]+))", guarded([](RestAdapter& self, const httplib::Request& req, httplib::Response& res) {
 			const std::string name = req.matches[1];
 			json              args = json::object();
 			if (!req.body.empty()) {
@@ -95,22 +105,22 @@ namespace dvb
 					return;
 				}
 			}
-			const ToolResult r = m_registry.Invoke(name, args, ToolContext{ /*clientId*/ "" });
+			const ToolResult r = self.m_registry.Invoke(name, args, ToolContext{ /*clientId*/ "" });
 			if (r.ok)
 				WriteJson(res, 200, r.value);
 			else
 				WriteJson(res, r.errorCode ? r.errorCode : 500, ToolErrorBody(r));
-		});
+		}));
 
 		// Deliberately GET, not POST (a bodyless POST stalls on httplib's read timeout; see
 		// Server::Start). Answered on the listener thread — no RunAndWait — so it keeps
 		// replying while the main thread is busy (#56) and shows which instance replied (#16).
 		// Reading the fields (busy vs hung, frame < 0, etc.): see the README.
-		a_http.Get("/api/health", [this](const httplib::Request&, httplib::Response& res) {
+		a_http.Get("/api/health", guarded([](RestAdapter& self, const httplib::Request&, httplib::Response& res) {
 			std::optional<std::string> lifecycle;
 			{
-				std::lock_guard lock(m_lifecycleMtx);
-				lifecycle = m_lastLifecycle;
+				std::lock_guard lock(self.m_lifecycleMtx);
+				lifecycle = self.m_lastLifecycle;
 			}
 			json body{
 				{ "ok", true },
@@ -121,10 +131,10 @@ namespace dvb
 			};
 			body.update(InstanceIdentity());  // pid, port, exe, vr
 			WriteJson(res, 200, body);
-		});
+		}));
 
 		// Poll recent events (the SSE stream is a later addition).
-		a_http.Get("/api/events", [this](const httplib::Request& req, httplib::Response& res) {
+		a_http.Get("/api/events", guarded([](RestAdapter& self, const httplib::Request& req, httplib::Response& res) {
 			uint64_t since = 0;
 			if (req.has_param("since")) {
 				try {
@@ -133,9 +143,9 @@ namespace dvb
 				}
 			}
 			json arr = json::array();
-			for (const auto& ev : m_events.Since(since))
+			for (const auto& ev : self.m_events.Since(since))
 				arr.push_back(json{ { "seq", ev.seq }, { "frame", ev.frame }, { "topic", ev.topic }, { "data", ev.payload } });
-			WriteJson(res, 200, json{ { "headSeq", m_events.HeadSeq() }, { "events", arr } });
-		});
+			WriteJson(res, 200, json{ { "headSeq", self.m_events.HeadSeq() }, { "events", arr } });
+		}));
 	}
 }

@@ -10,17 +10,28 @@ integrated, passed or runtime accepted.
 ## Implemented substep
 
 `CallbackLease` is used by actual MCP registry/event callbacks and REST event
-callbacks. Retirement waits for admitted calls, nulls the owner, and makes
-already-copied callbacks inert. Clearing registry/bus storage alone does not
+callbacks and all four REST HTTP routes. Retirement closes admission first,
+then drains admitted calls, and makes already-copied callbacks inert. Clearing registry/bus storage alone does not
 revoke copies. The MCP tool handlers retain the registry rather than an adapter
 address; the registry must remain alive until all handlers/consumers retire.
 Server stop ordering retires adapters before transport destruction. This does
 not prove transport quiescence. Owners cannot retire themselves from their own
 admitted callbacks; all current adapter retirement is on the server owner path.
 
+The shared production lease tracks active calls separately from callback-body
+serialization. MCP retains serialized bodies; REST chooses concurrent lifetime
+admission and protects its lifecycle data with the existing lifecycle mutex.
+Thus a waiting REST tool does not take the lifetime gate's lock away from health
+or event reads. Copied routes return 503 after retirement without dereferencing
+the adapter. This does not establish listener/transport quiescence, a bounded
+drain of a hung tool, or safety of consumers that retain the registry itself.
+
 `PathUtf8` is the production bridge-discovery conversion, with source tests for
-non-ASCII JSON round-trip and empty paths. Six regression cases exercise this
+non-ASCII JSON round-trip and empty paths. Nine regression cases exercise this
 conversion, throwing/admitted/copied callback retirement and the actual registry.
+They also cover both admission modes and health admission while a tool waits.
+These are tests of the production lease, not actual httplib request execution;
+the host-independent target does not compile RestAdapter.cpp.
 They are source only, not compiled or executed. No controls/pins/locks changed.
 
 ## Dependency findings and remaining source work
@@ -36,9 +47,9 @@ they do not repair server startup/stop.
   before a loop over those maps, and uses detached join helpers retaining local
   references. These paths cannot serve as a proven failed-start rollback.
 - `include/mcp_server.h:451`: `running_` is a plain bool shared across workers.
-- Actual REST HTTP routes still capture their adapter. They require proven
-  listener/handler retirement before adapter destruction, or revocable route
-  admission retaining independent state. The bus lease alone does not cover them.
+- REST routes now use revocable concurrent admission retaining independent state.
+  Dependency-owned listener/handler lifetime still requires a proven cleanup path;
+  retiring an adapter is not proof of transport or escaped-registry retirement.
 - `EventBus.h` copies subscriber callbacks before taking its delivery barrier.
   A copied batch may survive an unsubscribe barrier. The adapter lease closes
   the owner-dereference hazard, but subscriber exceptions still need an explicit
@@ -70,6 +81,6 @@ Required next design/implementation:
 
 Only after the whole accepted finding is implemented and exact compilation is
 admitted should a new hash-distinct focused PR107 cycle be prepared. This partial
-checkpoint does not replace the currently active independent console review.
+checkpoint does not replace the independent console review's exact PASS at16dac.
 Experimental source remains `16dac`; reviewed main remains `32823e4`. No runtime
 command, replay, deployment, upstream publication or initial-heartbeat resume.

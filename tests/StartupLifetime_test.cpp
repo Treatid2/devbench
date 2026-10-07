@@ -3,6 +3,7 @@
 #include "PathUtf8.h"
 #include "ToolRegistry.h"
 
+#include <chrono>
 #include <future>
 #include <memory>
 #include <stdexcept>
@@ -26,7 +27,7 @@ TEST_CASE("copied callback cannot reach an owner after retirement")
 	CHECK_NOTHROW(lease->Retire());
 }
 
-TEST_CASE("a throwing admitted callback releases the retirement lock")
+TEST_CASE("a throwing serialized callback releases its admission")
 {
 	Target target;
 	dvb::CallbackLease<Target> lease(target);
@@ -39,7 +40,7 @@ TEST_CASE("a throwing admitted callback releases the retirement lock")
 TEST_CASE("retirement waits for an admitted callback before owner destruction")
 {
 	Target target;
-	dvb::CallbackLease<Target> lease(target);
+	dvb::CallbackLease<Target, dvb::CallbackMode::Concurrent> lease(target);
 	std::promise<void> entered;
 	std::promise<void> release;
 	auto permission = release.get_future().share();
@@ -54,6 +55,53 @@ TEST_CASE("retirement waits for an admitted callback before owner destruction")
 	retirement.get();
 	CHECK(target.calls == 1);
 	CHECK(!lease.Invoke([](Target& t) { ++t.calls; }));
+}
+
+TEST_CASE("concurrent route admission does not block health behind a waiting tool")
+{
+	Target target;
+	dvb::CallbackLease<Target, dvb::CallbackMode::Concurrent> lease(target);
+	std::promise<void> entered;
+	std::promise<void> release;
+	auto permission = release.get_future().share();
+	std::thread tool([&] {
+		lease.Invoke([&](Target&) { entered.set_value(); permission.wait(); });
+	});
+	entered.get_future().wait();
+	auto health = std::async(std::launch::async, [&] {
+		return lease.Invoke([](Target&) {});
+	});
+	const auto healthWhileToolPending = health.wait_for(std::chrono::seconds(2));
+	// Always release/join before assertions: a failing serialization regression
+	// must not leave this test's own worker waiting on the future destructor.
+	release.set_value();
+	tool.join();
+	CHECK(healthWhileToolPending == std::future_status::ready);
+	CHECK(health.get());
+	lease.Retire();
+	CHECK(!lease.Invoke([](Target&) {}));
+}
+
+TEST_CASE("a throwing concurrent callback releases its admission")
+{
+	Target target;
+	dvb::CallbackLease<Target, dvb::CallbackMode::Concurrent> lease(target);
+	CHECK_THROWS_AS(lease.Invoke([](Target&) { throw std::runtime_error("injected route failure"); }), std::runtime_error);
+	CHECK_NOTHROW(lease.Retire());
+	CHECK(!lease.Invoke([](Target&) {}));
+}
+
+TEST_CASE("a copied concurrent route cannot reach a destroyed owner")
+{
+	auto target = std::make_unique<Target>();
+	auto lease = std::make_shared<dvb::CallbackLease<Target, dvb::CallbackMode::Concurrent>>(*target);
+	auto route = [lease] { return lease->Invoke([](Target& t) { ++t.calls; }); };
+	CHECK(route());
+	CHECK(target->calls == 1);
+	lease->Retire();
+	target.reset();
+	CHECK(!route());
+	CHECK_NOTHROW(lease->Retire());
 }
 
 TEST_CASE("actual registry callback retains only a revocable owner lease")
