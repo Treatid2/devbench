@@ -145,6 +145,29 @@ they do not repair server startup/stop.
 
 Required next design/implementation:
 
+10 October two-phase pool source substep:
+
+- `close_admission()` closes the actual mirrored pool queue without joining
+  admitted tasks. `shutdown()` uses the same first phase before joining. This
+  lets the eventual server teardown refuse later enqueue before closing session
+  dispatchers/listener paths that admitted work may need to finish. It does not
+  cancel queued work or certify that any transport has stopped. Mutex acquisition
+  and non-returning application work remain potentially blocking.
+- A fourth pool source fixture keeps an actual task admitted and waiting, queues
+  another task, closes admission twice, rejects later enqueue and then explicitly
+  releases/drains the admitted futures. No test was executed. Total startup/
+  lifetime cases is now23; seven cases added after exact compiled `e312ae0` are
+  uncompiled/unrun.
+- Full source inspection confirms why wiring only a blocking pool shutdown is
+  insufficient: pinned legacy SSE workers may call `close_session` themselves,
+  and that path releases a raw thread owner without joining; pinned Stop clears
+  the session maps before its retirement loop and detaches borrowed join helpers.
+  Existing POST/idle activity overlays remain required. The final overlay must
+  close admission, retain/join every owned session worker (never self-join), wake
+  dispatchers, stop/join HTTP producers and drain pool tasks before dependent
+  state retirement. Exact partial-start/bind cleanup and restart invariants remain
+  unfinished; no pool-only destruction safety or complete PR107 pass is claimed.
+
 1. Establish synchronous bind/listener readiness, safe partial-start cleanup,
    stopped/retry invariants and no detached worker borrowing destroyed state.
    Keep exact fail-closed overlays against the pinned dependency; do not edit

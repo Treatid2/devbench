@@ -45,6 +45,20 @@ namespace mcp
 		thread_pool(const thread_pool&) = delete;
 		thread_pool& operator=(const thread_pool&) = delete;
 
+		// Owner-thread first phase: refuse new work without waiting for application
+		// tasks. The server can then close sessions/listener paths needed by those
+		// tasks before shutdown joins them. Mutex acquisition can still wait; this
+		// is not a bounded-time or fully quiescent transport claim. Admitted work
+		// continues draining, and restart always joins it before reopening.
+		void close_admission()
+		{
+			{
+				std::lock_guard queue(queue_mutex_);
+				stop_ = true;
+			}
+			condition_.notify_all();
+		}
+
 		// Owner-thread operation; never call shutdown/restart from a pool task.
 		// Wait for every admitted task and owned worker before releasing owner state.
 		// A non-returning task still blocks shutdown; detaching is not a safe fallback.
@@ -140,11 +154,7 @@ namespace mcp
 
 		void shutdown_locked()
 		{
-			{
-				std::lock_guard queue(queue_mutex_);
-				stop_ = true;
-			}
-			condition_.notify_all();
+			close_admission();
 			// Enqueue refuses all further admission; the slot list is now stable.
 			for (auto& slot : workers_)
 				if (slot->thread.joinable())

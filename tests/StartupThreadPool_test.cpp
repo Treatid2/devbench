@@ -81,3 +81,41 @@ TEST_CASE("production pinned pool overlay drains futures rejects stopped admissi
 		CHECK(after.get() == 7);
 	CHECK(pool.get_active_threads() == 0);
 }
+
+TEST_CASE("production pinned pool overlay closes admission before waiting for admitted tasks")
+{
+	std::promise<void> entered;
+	std::promise<void> release;
+	auto permission = release.get_future().share();
+	auto started = entered.get_future();
+	mcp::thread_pool pool(1, 1);
+	auto held = pool.enqueue([&entered, permission] {
+		entered.set_value();
+		// Bound the fixture's own wait even if an assertion prevents its intended
+		// release. This is not a production task-cancellation mechanism.
+		permission.wait_for(5s);
+		return 17;
+	});
+	const auto startedStatus = started.wait_for(2s);
+	auto queued = pool.enqueue([] { return 23; });
+	pool.close_admission();
+	pool.close_admission();  // no join or duplicate admission transition
+	CHECK_THROWS_AS(pool.enqueue([] {}), std::runtime_error);
+	if (startedStatus == std::future_status::ready) {
+		CHECK(held.wait_for(0ms) == std::future_status::timeout);
+		CHECK(queued.wait_for(0ms) == std::future_status::timeout);
+		CHECK(pool.get_active_threads() == 1);
+	}
+	release.set_value();
+	pool.shutdown();
+	CHECK(startedStatus == std::future_status::ready);
+	const auto heldStatus = held.wait_for(2s);
+	const auto queuedStatus = queued.wait_for(2s);
+	CHECK(heldStatus == std::future_status::ready);
+	CHECK(queuedStatus == std::future_status::ready);
+	if (heldStatus == std::future_status::ready)
+		CHECK(held.get() == 17);
+	if (queuedStatus == std::future_status::ready)
+		CHECK(queued.get() == 23);
+	CHECK(pool.get_active_threads() == 0);
+}
