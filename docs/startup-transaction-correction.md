@@ -4,8 +4,11 @@ This branch starts at actual experimental integration
 `16dac4fc0653e1cc3c7f1275242949083b4697c2`. It preserves the original
 `abc57702208817423a411d3ce868a0fb8fcf99f8` handoff in ancestry/history.
 The accepted focused PR107 finding requires a complete startup transaction,
-not a widened catch. This checkpoint is not compiled, submitted, delivered,
-integrated, passed or runtime accepted.
+not a widened catch. The prior exact phase checkpoint `e312ae0` compiled both
+production and host targets under Broker qualification on 9 October, without
+assertion execution. Subsequent EventBus source below has not been compiled;
+that earlier compile does not cover this new tree. Neither checkpoint is a
+complete correction, review submission, delivery, integration or runtime pass.
 
 ## Implemented substep
 
@@ -32,7 +35,8 @@ conversion, throwing/admitted/copied callback retirement and the actual registry
 They also cover both admission modes and health admission while a tool waits.
 These are tests of the production lease, not actual httplib request execution;
 the host-independent target does not compile RestAdapter.cpp.
-They are source only, not compiled or executed. No controls/pins/locks changed.
+These nine cases compiled at exact `e312ae0` but were not executed. No
+controls/pins/locks changed.
 
 ## Dependency findings and remaining source work
 
@@ -56,8 +60,9 @@ They are source only, not compiled or executed. No controls/pins/locks changed.
   tool execution/notifications. The readiness atom is server-owned and retains
   the same process-lifetime requirement as the registry used by escaped handlers.
 
-There are now 16 source cases across the two startup files. None was executed by
-the owner. Phase tests are not game/SKSE/actual HTTP or pinned-transport tests.
+These 16 source cases across the two startup files compiled at exact `e312ae0`.
+None was executed by the owner. Phase tests are not game/SKSE/actual HTTP or
+pinned-transport tests.
 Critically, the controller still relies on `Server::Start`'s unqualified listener
 result. Its bind proof, exception cleanup, Stop/Start retry and dependency-worker
 retirement are NOT fixed by this substep. Do not compile and call this full PR107
@@ -77,10 +82,30 @@ they do not repair server startup/stop.
 - REST routes now use revocable concurrent admission retaining independent state.
   Dependency-owned listener/handler lifetime still requires a proven cleanup path;
   retiring an adapter is not proof of transport or escaped-registry retirement.
-- `EventBus.h` copies subscriber callbacks before taking its delivery barrier.
-  A copied batch may survive an unsubscribe barrier. The adapter lease closes
-  the owner-dereference hazard, but subscriber exceptions still need an explicit
-  no-throw delivery boundary; do not claim full EventBus teardown qualification.
+- The EventBus substep below addresses the copied-batch ordering and exception
+  boundary. It does not establish transport quiescence or bounded socket/drain
+  completion, and must not be reported as complete startup teardown qualification.
+
+9 October EventBus source substep, after the exact `e312ae0` compile return:
+
+- The actual worker takes the delivery barrier before copying subscriber callbacks.
+  Unsubscribe removes under the state mutex, releases that mutex, then drains the
+  delivery barrier. Thus either the snapshot omits the removed subscriber or its
+  invocations finish before Unsubscribe returns. The old copy-before-barrier gap
+  is closed without holding the state mutex during subscriber/socket execution.
+- Subscriber exceptions are isolated per invocation and counted without allocating
+  diagnostics; other subscribers and later events continue. Unexpected queue,
+  snapshot-copy or wait exceptions cannot escape the thread entry point: delivery
+  stops with an explicit atomic status rather than terminating the process.
+  Publishers keep the bounded recent ring but do not endlessly queue undeliverable
+  notifications after that terminal worker failure. No restart is attempted.
+- Three source fixtures exercise the real EventBus: throwing subscriber continuity,
+  admitted callback retirement/later non-invocation, and a throwing std::function
+  copy during the production snapshot. Fixture waits are finite; none was run.
+  There are now 19 startup/lifetime source cases, with the new three uncompiled.
+- Unsubscribe/destruction remain owner-thread operations, not calls from a bus
+  subscriber. A subscriber that never returns can still block retirement; this
+  change does not promise a bounded drain or authorise destroying a live worker.
 
 Required next design/implementation:
 

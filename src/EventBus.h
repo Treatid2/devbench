@@ -80,7 +80,8 @@ namespace dvb
 			return id;
 		}
 
-		/// Remove a subscriber. After this returns the callback is guaranteed not to run again,
+		/// Remove a subscriber. Call from an owner thread, never from a bus callback.
+		/// After this returns the callback is guaranteed not to run again,
 		/// so the caller may safely destroy whatever the callback captured — it waits out any
 		/// in-flight delivery batch (the worker holds m_deliverMutex across a batch).
 		void Unsubscribe(SubId a_id)
@@ -107,7 +108,10 @@ namespace dvb
 				m_recent.push_back(ev);
 				while (m_recent.size() > kMaxRecent)
 					m_recent.erase(m_recent.begin());
-				m_deliverQueue.push_back(ev);  // hand off; worker delivers
+				// A failed worker still leaves the recent ring available for inspection,
+				// but must not accumulate an undrainable delivery queue indefinitely.
+				if (!m_deliveryStopped.load(std::memory_order_acquire))
+					m_deliverQueue.push_back(ev);  // hand off; worker delivers
 			}
 			m_cv.notify_one();
 		}
@@ -129,11 +133,33 @@ namespace dvb
 			return m_seq;
 		}
 
+		/// Subscriber exceptions are isolated per invocation; subsequent delivery continues.
+		uint64_t SubscriberFailures() const noexcept
+		{
+			return m_subscriberFailures.load(std::memory_order_relaxed);
+		}
+
+		/// Unexpected queue/snapshot/wait failure terminates this worker, not the process.
+		/// The ring remains readable, but notifications are not claimed to be delivered.
+		bool DeliveryStopped() const noexcept
+		{
+			return m_deliveryStopped.load(std::memory_order_acquire);
+		}
+
 	private:
 		static constexpr size_t kMaxRecent = 256;  // bounded; oldest dropped first
 
 		// Drains the delivery queue and notifies subscribers off the publisher's thread.
-		void DeliverLoop()
+		void DeliverLoop() noexcept
+		{
+			try {
+				DeliverBatches();
+			} catch (...) {
+				m_deliveryStopped.store(true, std::memory_order_release);
+			}
+		}
+
+		void DeliverBatches()
 		{
 			for (;;) {
 				std::deque<Event>       batch;
@@ -144,18 +170,32 @@ namespace dvb
 					if (m_stop && m_deliverQueue.empty())
 						return;
 					batch.swap(m_deliverQueue);
+				}
+				// Acquire the retirement barrier BEFORE taking subscriber copies. If an
+				// Unsubscribe removed an entry first, this snapshot cannot retain it. If
+				// this worker got the barrier first, Unsubscribe waits for these copies
+				// to finish. Copying before this lock allowed stale batches to escape it.
+				std::lock_guard deliver(m_deliverMutex);
+				{
+					std::lock_guard lock(m_mutex);
 					subs.reserve(m_subs.size());
 					for (auto& s : m_subs)
 						subs.push_back(s.second);
 				}
-				// Outside m_mutex (so Publish never blocks) but under m_deliverMutex, so
-				// Unsubscribe can barrier on a batch before its caller destroys the subscriber.
+				// Outside m_mutex (so Publish never waits for subscriber completion) but
+				// under m_deliverMutex, so Unsubscribe can drain this batch before its
+				// caller destroys the subscriber.
 				// A subscriber may block here (e.g., a socket write) — that's the whole point of
 				// delivering off the publisher's thread.
-				std::lock_guard deliver(m_deliverMutex);
 				for (const auto& ev : batch)
-					for (const auto& fn : subs)
-						fn(ev);
+					for (const auto& fn : subs) {
+						try {
+							fn(ev);
+						} catch (...) {
+							// Diagnostics here must not allocate or call another subscriber.
+							m_subscriberFailures.fetch_add(1, std::memory_order_relaxed);
+						}
+					}
 			}
 		}
 
@@ -171,5 +211,7 @@ namespace dvb
 		std::thread             m_worker;
 		bool                    m_stop = false;
 		std::mutex              m_deliverMutex;  // held across a notify batch; Unsubscribe barriers on it
+		std::atomic<uint64_t>    m_subscriberFailures{ 0 };
+		std::atomic<bool>        m_deliveryStopped{ false };
 	};
 }
