@@ -9,8 +9,8 @@
 
 namespace dvb
 {
-	McpAdapter::McpAdapter(ToolRegistry& a_registry, EventBus& a_events, mcp::server& a_server) :
-		m_registry(a_registry), m_events(a_events), m_server(a_server),
+	McpAdapter::McpAdapter(ToolRegistry& a_registry, EventBus& a_events, mcp::server& a_server, const std::atomic<bool>& a_ready) :
+		m_registry(a_registry), m_events(a_events), m_server(a_server), m_ready(a_ready),
 		m_callbacks(std::make_shared<CallbackLease<McpAdapter>>(*this))
 	{}
 
@@ -36,7 +36,9 @@ namespace dvb
 
 				// Handlers need the registry, not the adapter address. Its Server
 				// owner must outlive all transport handlers and escaped consumers.
-				self.m_server.register_tool(t, [registry = &self.m_registry, name = a_desc.name](const json& a_args, const std::string& a_session) -> json {
+				self.m_server.register_tool(t, [registry = &self.m_registry, ready = &self.m_ready, name = a_desc.name](const json& a_args, const std::string& a_session) -> json {
+					if (!ready->load())
+						throw std::runtime_error("devbench startup not ready");
 					const ToolResult r = registry->Invoke(name, a_args, ToolContext{ a_session });
 					if (r.ok)
 						return ToContentBlocks(r.value);  // content ARRAY — see McpContent.h
@@ -46,7 +48,7 @@ namespace dvb
 				});
 
 				// A tool was added or replaced; tell connected clients to re-list.
-				if (self.m_announceChanges)
+				if (self.m_announceChanges && self.m_ready.load())
 					self.m_server.broadcast_notification(mcp::request::create_notification(
 						"notifications/tools/list_changed", json::object()));
 			});
@@ -64,6 +66,8 @@ namespace dvb
 		// Forward bus events to connected MCP clients as notifications.
 		m_sub = m_events.Subscribe([lease = m_callbacks](const EventBus::Event& a_ev) {
 			lease->Invoke([&](McpAdapter& self) {
+				if (!self.m_ready.load())
+					return;
 				self.m_server.broadcast_notification(mcp::request::create_notification(
 					"notifications/message",
 					json{ { "topic", a_ev.topic }, { "seq", a_ev.seq }, { "data", a_ev.payload } }));

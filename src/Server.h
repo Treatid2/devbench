@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -37,11 +38,19 @@ namespace dvb
 		void Stop();
 		bool Running() const;
 
+		// Start builds the transport; PostLoad publishes only after required wiring.
+		// False revokes new tool/REST admission without destroying escaped owners.
+		void SetReady(bool a_ready) noexcept;
+		bool Ready() const noexcept { return m_ready.load(); }
+		// Optional discovery/reporting, outside the required startup transaction.
+		void ReportDiscovery();
+
 	private:
 		std::string                  m_host;
 		int                          m_port;
 		ToolRegistry                 m_registry;
 		EventBus                     m_events;
+		std::atomic<bool>            m_ready{ false };
 		std::unique_ptr<mcp::server> m_mcp;
 		std::unique_ptr<McpAdapter>  m_mcpAdapter;
 		std::unique_ptr<RestAdapter> m_restAdapter;

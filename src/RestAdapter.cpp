@@ -35,8 +35,8 @@ namespace dvb
 		}
 	}
 
-	RestAdapter::RestAdapter(ToolRegistry& a_registry, EventBus& a_events) :
-		m_registry(a_registry), m_events(a_events),
+	RestAdapter::RestAdapter(ToolRegistry& a_registry, EventBus& a_events, const std::atomic<bool>& a_ready) :
+		m_registry(a_registry), m_events(a_events), m_ready(a_ready),
 		m_callbacks(std::make_shared<CallbackLease<RestAdapter, CallbackMode::Concurrent>>(*this))
 	{
 		// Track the latest lifecycle event directly rather than scanning Since(0) on every
@@ -78,7 +78,13 @@ namespace dvb
 		// off-thread health replies while a tool waits for the game main thread.
 		const auto guarded = [lease = m_callbacks](auto a_handler) {
 			return [lease, handler = std::move(a_handler)](const httplib::Request& req, httplib::Response& res) {
-				if (!lease->Invoke([&](RestAdapter& self) { handler(self, req, res); }))
+				if (!lease->Invoke([&](RestAdapter& self) {
+					if (!self.m_ready.load()) {
+						WriteJson(res, 503, json{ { "error", "devbench startup not ready" } });
+						return;
+					}
+					handler(self, req, res);
+				}))
 					WriteJson(res, 503, json{ { "error", "devbench adapter stopped" } });
 			};
 		};

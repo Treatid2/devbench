@@ -36,6 +36,33 @@ They are source only, not compiled or executed. No controls/pins/locks changed.
 
 ## Dependency findings and remaining source work
 
+9 October production phase-boundary substep:
+
+- `PostLoadStartup::Run` is now the controller used by actual main.cpp. It guards
+  configuration, construction, preparation, listener result and publication, and
+  suppresses diagnostic exceptions. Seven new source cases exercise this very
+  sequence with five phase failures, false listener result, disabled configuration,
+  optional reporting failure, retained escaped owner and reentrant/repeated calls.
+- The whole actual kPostLoad branch returns inside a no-throw boundary, including
+  construction of its operations/config object. Other SKSE-dependent input/menu/
+  lifecycle and interface-delivery paths require explicit readiness, not merely
+  a non-null process-lifetime server. All inherited hook installs remain present.
+- The owner is retained before any consumer pointers escape; a failed attempt
+  denies REST/MCP tool admission and menu publication, does not destroy the owner,
+  and does not repeat irreversible publication in the same process. This is a
+  quarantine, not a claim that transport has stopped. Optional discovery writing
+  occurs after committed publication, so it cannot falsely undo that commit.
+- REST checks readiness inside its existing concurrent lease; MCP checks it before
+  tool execution/notifications. The readiness atom is server-owned and retains
+  the same process-lifetime requirement as the registry used by escaped handlers.
+
+There are now 16 source cases across the two startup files. None was executed by
+the owner. Phase tests are not game/SKSE/actual HTTP or pinned-transport tests.
+Critically, the controller still relies on `Server::Start`'s unqualified listener
+result. Its bind proof, exception cleanup, Stop/Start retry and dependency-worker
+retirement are NOT fixed by this substep. Do not compile and call this full PR107
+acceptance, publish it to integration, or submit a prematurely complete review.
+
 The pinned cpp-mcp is `f1117d5286efe6477ddd14322703f034615b6c0e`. Its current
 session-activity overlays affect POST admission and session retirement only;
 they do not repair server startup/stop.
@@ -62,14 +89,14 @@ Required next design/implementation:
    Keep exact fail-closed overlays against the pinned dependency; do not edit
    the submodule or assume `is_running()` certifies binding. Build Broker must
    assess changed controls before compilation; this is not local-build authority.
-2. Wrap the entire PostLoad path (configuration, construction, registration,
+2. Implemented phase boundary, pending complete transport qualification: wrap the entire PostLoad path (configuration, construction, registration,
    consumer wiring, listening, discovery and reporting) in a production-used
    no-throw transaction with narrowly injectable phase operations. Treat optional
    discovery/reporting failure distinctly from required readiness failure.
-3. Gate dependent input/menu/lifecycle/host exposure on explicit readiness, not
+3. Implemented publication gate, dependent on truthful listener readiness: gate dependent input/menu/lifecycle/host exposure on explicit readiness, not
    non-null `g_server`. Do not install irreversible hooks before required stages
    commit; do not claim hook rollback without an actual API.
-4. Retain process-lifetime registry/bus ownership once published to Capture,
+4. Implemented failure retention; pending transport stop/retry proof: retain process-lifetime registry/bus ownership once published to Capture,
    HostApi, Autorun, game sinks, console hook or watchdog. Clear admission or
    intentionally retain failed/quarantined owners; do not delete a Server while
    escaped consumers or async work still refer to it. Avoid retrying irreversible

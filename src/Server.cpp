@@ -147,12 +147,12 @@ namespace dvb
 		m_mcp->set_capabilities(json{ { "tools", json{ { "listChanged", true } } }, { "logging", json::object() } });
 
 		// MCP tools + notifications.
-		m_mcpAdapter = std::make_unique<McpAdapter>(m_registry, m_events, *m_mcp);
+		m_mcpAdapter = std::make_unique<McpAdapter>(m_registry, m_events, *m_mcp, m_ready);
 		m_mcpAdapter->Wire();
 
 		// REST facade on the same httplib server (constructed in mcp::server's ctor,
 		// so http() is valid here; cpp-mcp adds its own routes during start()).
-		m_restAdapter = std::make_unique<RestAdapter>(m_registry, m_events);
+		m_restAdapter = std::make_unique<RestAdapter>(m_registry, m_events, m_ready);
 		if (auto* http = m_mcp->http()) {
 			// httplib's default 5s read timeout applies even to a bodyless POST (no
 			// Content-Length/chunked header) — it waits for a body that will never come
@@ -166,14 +166,10 @@ namespace dvb
 		// Publish the chosen port before start() spawns the listener, so a health/inspect
 		// hit racing startup reads the right port rather than 0.
 		g_boundPort.store(chosen);
-		g_registry.store(&m_registry);        // reachable by dvb::RunTool (the in-game menu) while up
+		// Tool admission and the menu registry remain unpublished until PostLoad
+		// commits its required consumer/hook stages via SetReady(true).
 		const bool ok = m_mcp->start(false);  // non-blocking; spawns the listener thread
-		if (ok) {
-			WriteRuntimeInfo(chosen);
-			WriteBridgeInfo();
-			if (chosen != m_port)
-				logs::info("devbench: configured port {} busy → bound {}", m_port, chosen);
-		} else {
+		if (!ok) {
 			// Tear down the constructed-but-not-listening members: the `if (m_mcp)` guard at
 			// the top treats a non-null m_mcp as "already started", so leaving them set would
 			// make a later Start() return true without a live listener. Reset the port too, or
@@ -190,6 +186,7 @@ namespace dvb
 
 	void Server::Stop()
 	{
+		SetReady(false);
 		CalendarControl::RequestStop();
 		if (m_mcp) {
 			m_mcp->stop();
@@ -207,6 +204,26 @@ namespace dvb
 	bool Server::Running() const
 	{
 		return m_mcp && m_mcp->is_running();
+	}
+
+	void Server::SetReady(bool a_ready) noexcept
+	{
+		if (a_ready) {
+			g_registry.store(&m_registry);
+			m_ready.store(true);
+		} else {
+			m_ready.store(false);
+			g_registry.store(nullptr);
+		}
+	}
+
+	void Server::ReportDiscovery()
+	{
+		const int chosen = BoundPort();
+		WriteRuntimeInfo(chosen);
+		WriteBridgeInfo();
+		if (chosen != m_port)
+			logs::info("devbench: configured port {} busy → bound {}", m_port, chosen);
 	}
 
 	int BoundPort()

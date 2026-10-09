@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include "CallbackLease.h"
@@ -20,7 +21,7 @@ namespace dvb
 	class McpAdapter
 	{
 	public:
-		McpAdapter(ToolRegistry& a_registry, EventBus& a_events, mcp::server& a_server);
+		McpAdapter(ToolRegistry& a_registry, EventBus& a_events, mcp::server& a_server, const std::atomic<bool>& a_ready);
 
 		// Revoke copied registry/bus callbacks before removing registrations. The
 		// transport must outlive this retirement, including any admitted callback.
@@ -32,6 +33,7 @@ namespace dvb
 		ToolRegistry& m_registry;
 		EventBus&     m_events;
 		mcp::server&  m_server;
+		const std::atomic<bool>& m_ready;
 		uint64_t      m_sub = 0;
 		std::shared_ptr<CallbackLease<McpAdapter>> m_callbacks;
 		// Initial wiring registers every existing tool; only AFTER that do (re)registrations mean a

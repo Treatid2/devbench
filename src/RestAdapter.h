@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include "CallbackLease.h"
@@ -30,7 +31,7 @@ namespace dvb
 	class RestAdapter
 	{
 	public:
-		RestAdapter(ToolRegistry& a_registry, EventBus& a_events);
+		RestAdapter(ToolRegistry& a_registry, EventBus& a_events, const std::atomic<bool>& a_ready);
 		// Revoke copied bus/HTTP callbacks and drain admitted bodies. The shared
 		// lease survives in routes; they return 503 after retirement without this.
 		~RestAdapter();
@@ -40,6 +41,7 @@ namespace dvb
 	private:
 		ToolRegistry&              m_registry;
 		EventBus&                  m_events;
+		const std::atomic<bool>&   m_ready;
 		uint64_t                   m_lifecycleSub = 0;
 		std::shared_ptr<CallbackLease<RestAdapter, CallbackMode::Concurrent>> m_callbacks;
 		mutable std::mutex         m_lifecycleMtx;
