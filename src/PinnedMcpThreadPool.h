@@ -1,4 +1,6 @@
 #pragma once
+#ifndef DEVBENCH_PINNED_MCP_THREAD_POOL_H
+#define DEVBENCH_PINNED_MCP_THREAD_POOL_H
 
 // Local startup/lifetime overlay for cpp-mcp f1117d5. The build mirrors this as
 // mcp_thread_pool.h only after an exact pinned-header comparison. Keep the public
@@ -227,3 +229,4 @@ namespace mcp
 		bool stop_{ true };       // protected by queue_mutex_
 	};
 }
+#endif  // DEVBENCH_PINNED_MCP_THREAD_POOL_H

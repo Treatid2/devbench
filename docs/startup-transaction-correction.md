@@ -145,6 +145,38 @@ they do not repair server startup/stop.
 
 Required next design/implementation:
 
+10 October HTTP worker ownership substep:
+
+- Pinned httplib0.19.0 has its own, separate `ThreadPool` (common/httplib.h:764).
+  Constructor failure after earlier threads start destroys joinable threads;
+  its default destructor does not own shutdown, and normal worker job exceptions
+  can escape its thread entry. Repairing only cpp-mcp's pool cannot cover this.
+- `HttpTaskQueueOwnership` is the actual queue delegated to by a generated
+  httplib::ThreadPool wrapper, after an exact unique original-class comparison.
+  It uses the existing joinable core's constructor rollback and destructor drain,
+  preserving a maxQueued bound on waiting jobs (not active handlers) and refusing
+  new admission after shutdown. A failed core enqueue returns false so httplib
+  retains its existing rejected-socket close path. A handler exception is counted
+  and contained by the packaged task; this is not an HTTP error response or proof
+  of socket cleanup. Core/header duplicates use one explicit include guard.
+- Three host source cases exercise this very production queue: partial-constructor
+  rollback, waiting-job capacity/stopped admission, and destructor drain/throwing
+  handler containment. These are not actual HTTP/socket fixtures. Total startup/
+  ownership cases26; latest10after compiled e312 are uncompiled/unrun.
+- The overlay now mirrors common/httplib.h too. The full pinned original worker
+  class is retained as comparison data; unique literal replacement fails closed.
+  Native target include order already selects the mirror ahead of common/. A
+  future OpenSSL lane explicitly fails compilation rather than silently dropping
+  pinned per-worker SSL cleanup. Existing standalone non-SSL recipe is unchanged
+  in that respect; no new TLS qualification is claimed. Pins remain unchanged.
+- Full server entry, listener/bound socket, HTTP socket exception cleanup,
+  maintenance, SSE/session retirement and restart remain unfinished. In
+  particular, the listener must contain an HTTP queue construction throw; a safe
+  partial queue alone does not prevent an unguarded listener entry terminating.
+  The HTTP worker failure count is not currently a public health/verdict receipt.
+  The owner still cannot destroy a hung admitted handler. New controls require
+  final Broker assessment; no configure/build/test execution occurred here.
+
 10 October two-phase pool source substep:
 
 - `close_admission()` closes the actual mirrored pool queue without joining

@@ -21,6 +21,8 @@
 --   4. mcp_thread_pool.h: a locally owned joinable-worker implementation, after
 --      exact pinned-header comparison. This supports explicit owner shutdown
 --      and safe constructor rollback; server stop wiring is a separate substep.
+--   5. httplib.h: exact HTTP worker-class replacement delegates to that owned
+--      pool. HTTP listener/socket rollback is still a separate substep.
 
 local cpp_mcp_root = path.join(os.projectdir(), "lib", "cpp-mcp")
 local patched_inc = path.join(os.projectdir(), "build", "cpp-mcp-patched", "include")
@@ -113,6 +115,34 @@ on_load(function(target)
         end
         io.writefile(path.join(out, name), content)
     end
+    -- httplib is included by mcp_server.h from this mirror before common/.
+    -- Do not edit the pinned dependency or silently accept a changed class.
+    local http = io.readfile(path.join(root, "common", "httplib.h"))
+    local http_original = io.readfile(path.join(os.projectdir(), "xmake", "httplib-thread-pool-original.h"))
+    local http_wrapper = [[class ThreadPool final : public TaskQueue {
+public:
+    explicit ThreadPool(size_t n, size_t mqr = 0) : owned_(n, mqr) {}
+    bool enqueue(std::function<void()> fn) override { return owned_.enqueue(std::move(fn)); }
+    void shutdown() override { owned_.shutdown(); }
+    std::uint64_t failed_requests() const { return owned_.failed_requests(); }
+private:
+    dvb::HttpTaskQueueOwnership owned_;
+};]]
+    http = overlay_once(http, {
+        {
+            from = "#define CPPHTTPLIB_HTTPLIB_H",
+            to = '#define CPPHTTPLIB_HTTPLIB_H\n#include "HttpTaskQueueOwnership.h"',
+        },
+        { from = http_original:gsub("\r\n", "\n"):gsub("\n$", ""), to = http_wrapper },
+    })
+    -- Existing HTTP SSL per-worker cleanup is not silently removed. Current
+    -- standalone DevBench is non-SSL; a future SSL lane needs its own adapter.
+    http = http .. "\n#if defined(CPPHTTPLIB_OPENSSL_SUPPORT)\n#error DevBench HTTP ownership overlay requires separate SSL worker qualification\n#endif\n"
+    io.writefile(path.join(out, "httplib.h"), http)
+    io.writefile(path.join(out, "HttpTaskQueueOwnership.h"),
+        io.readfile(path.join(os.projectdir(), "src", "HttpTaskQueueOwnership.h")))
+    io.writefile(path.join(out, "PinnedMcpThreadPool.h"),
+        io.readfile(path.join(os.projectdir(), "src", "PinnedMcpThreadPool.h")))
     os.mkdir(patched_src)
     io.writefile(path.join(patched_src, "mcp_server.cpp"),
         overlay_once(io.readfile(path.join(root, "src", "mcp_server.cpp")), overlays.source))
