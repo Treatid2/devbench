@@ -18,6 +18,9 @@
 --   3. Exact fail-closed header/server overlays in cpp-mcp-session-activity.lua
 --      protect active Streamable HTTP POSTs from idle retirement. The pinned
 --      source and dependency objects are never edited by configuration.
+--   4. mcp_thread_pool.h: a locally owned joinable-worker implementation, after
+--      exact pinned-header comparison. This supports explicit owner shutdown
+--      and safe constructor rollback; server stop wiring is a separate substep.
 
 local cpp_mcp_root = path.join(os.projectdir(), "lib", "cpp-mcp")
 local patched_inc = path.join(os.projectdir(), "build", "cpp-mcp-patched", "include")
@@ -82,6 +85,14 @@ on_load(function(target)
                 )
             end
             content = content:gsub('#include "json%.hpp"', "#include <nlohmann/json.hpp>")
+        elseif name == "mcp_thread_pool.h" then
+            local original = io.readfile(path.join(os.projectdir(), "xmake", "cpp-mcp-thread-pool-original.h"))
+            -- The retained text file has a terminal LF; pinned upstream does not.
+            -- Normalize CRLF and at most one terminal LF, not code/other whitespace.
+            if content:gsub("\r\n", "\n"):gsub("\n$", "") ~= original:gsub("\r\n", "\n"):gsub("\n$", "") then
+                raise("cpp-mcp startup: pinned thread-pool source changed; owner assessment required")
+            end
+            content = io.readfile(path.join(os.projectdir(), "src", "PinnedMcpThreadPool.h"))
         elseif name == "mcp_server.h" then
             content = overlay_once(content, overlays.header)
             local anchor = "\nprivate:\n    std::string host_;"

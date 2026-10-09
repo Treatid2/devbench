@@ -6,7 +6,7 @@ This branch starts at actual experimental integration
 The accepted focused PR107 finding requires a complete startup transaction,
 not a widened catch. The prior exact phase checkpoint `e312ae0` compiled both
 production and host targets under Broker qualification on 9 October, without
-assertion execution. Subsequent EventBus source below has not been compiled;
+assertion execution. Subsequent EventBus/pool source below has not been compiled;
 that earlier compile does not cover this new tree. Neither checkpoint is a
 complete correction, review submission, delivery, integration or runtime pass.
 
@@ -107,6 +107,42 @@ they do not repair server startup/stop.
   subscriber. A subscriber that never returns can still block retirement; this
   change does not promise a bounded drain or authorise destroying a live worker.
 
+9 October worker-pool ownership source substep:
+
+- The pinned thread-pool constructor can fail after earlier detached workers
+  start. Its counter increments before a potentially throwing thread creation;
+  destructor-only draining also occurs too late in the server's reverse member
+  destruction order (session/cleanup/maintenance state follows the pool member).
+- `PinnedMcpThreadPool.h` supplies the same pool surface through a fail-closed
+  build-tree header mirror. Workers are joinable owned slots, not detached
+  borrowers of pool state. Constructor rollback signals and joins all previously
+  started workers before the exception escapes. Required growth occurs before
+  enqueue accepts a task, so a failed spawn cannot orphan newly dispatched work.
+  Active counts include only successfully returned owned threads; idle retirement
+  and bounded slot reuse use one queue-mutex decision.
+- Explicit owner `shutdown()` closes admission and drains tasks/joins workers;
+  repeated shutdown and explicit restart use one lifecycle lock. Application
+  exceptions retain packaged-task/future semantics. Unexpected worker failure
+  closes admission and abandons pending futures rather than reporting success.
+  This does not imply a bounded shutdown of an application task that never returns;
+  shutdown/restart from a pool task is prohibited.
+- Three source fixtures instantiate the very header used by the generated
+  production mirror: partial constructor worker-creation failure, required-growth
+  failure before task admission, and future/drain/stopped/restart behaviour.
+  They are uncompiled/unrun. Total startup/lifetime source cases is now22.
+- The pinned submodule is unchanged. `xmake/cpp-mcp.lua` compares its entire
+  original pool header against `xmake/cpp-mcp-thread-pool-original.h` before
+  mirroring the local header. Only CRLF and an optional terminal LF are normalised.
+  These changed executed build controls and generated pool bytes require NEW
+  Broker assessment; private exact `e312ae0` qualification does not cover them.
+  The retained original header intentionally preserves pinned upstream trailing
+  whitespace. Static diff checking excludes that exact comparison-data file;
+  authored source/recipe/docs remain checked without changing Git whitespace policy.
+- Server stop has NOT yet been wired to explicit pool shutdown before state
+  retirement, and its listener/maintenance/SSE/session cleanup is still pinned.
+  This pool substep must not be claimed as safe complete Server destruction,
+  truthful bound readiness, Stop/Start or final PR107 review readiness.
+
 Required next design/implementation:
 
 1. Establish synchronous bind/listener readiness, safe partial-start cleanup,
@@ -114,6 +150,8 @@ Required next design/implementation:
    Keep exact fail-closed overlays against the pinned dependency; do not edit
    the submodule or assume `is_running()` certifies binding. Build Broker must
    assess changed controls before compilation; this is not local-build authority.
+   Wire explicit pool shutdown before session/cleanup/maintenance state retirement;
+   verify constructor rollback and worker ownership together with all server tasks.
 2. Implemented phase boundary, pending complete transport qualification: wrap the entire PostLoad path (configuration, construction, registration,
    consumer wiring, listening, discovery and reporting) in a production-used
    no-throw transaction with narrowly injectable phase operations. Treat optional
