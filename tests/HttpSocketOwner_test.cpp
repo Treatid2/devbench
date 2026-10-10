@@ -1,6 +1,7 @@
 #include "test_framework.h"
 #include "HttpSocketOwner.h"
 
+#include <initializer_list>
 #include <stdexcept>
 #include <type_traits>
 
@@ -39,4 +40,43 @@ TEST_CASE("HTTP socket ownership survives exceptional request unwinding")
 	CHECK(shutdownCount == 1);
 	CHECK(closeCount == 1);
 	CHECK(observedSocket == 99);
+}
+
+TEST_CASE("accepted HTTP socket transfers cleanup only after successful admission")
+{
+	shutdownCount = closeCount = 0;
+	{
+		dvb::HttpSocketOwner<int> accepted(7, Shutdown, Close);
+		accepted.Release();  // actual generated queue returns true before this call
+	}
+	CHECK(shutdownCount == 0);
+	CHECK(closeCount == 0);
+	{
+		dvb::HttpSocketOwner<int> admittedHandler(7, Shutdown, Close);
+	}
+	CHECK(shutdownCount == 1);
+	CHECK(closeCount == 1);
+	CHECK(observedSocket == 7);
+}
+
+TEST_CASE("accepted HTTP socket keeps cleanup on refusal or preparation exception")
+{
+	for (bool preparationThrows : { false, true }) {
+		shutdownCount = closeCount = 0;
+		const auto admit = [&] {
+			dvb::HttpSocketOwner<int> accepted(8, Shutdown, Close);
+			if (preparationThrows)
+				throw std::runtime_error("queue argument allocation failed");
+			// A false admission must not call Release.
+			return false;
+		};
+		if (preparationThrows) {
+			CHECK_THROWS(admit());
+		} else {
+			CHECK(!admit());
+		}
+		CHECK(shutdownCount == 1);
+		CHECK(closeCount == 1);
+		CHECK(observedSocket == 8);
+	}
 }

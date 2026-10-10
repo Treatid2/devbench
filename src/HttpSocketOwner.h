@@ -16,14 +16,20 @@ namespace dvb
 			socket_(socket), shutdown_(shutdown), close_(close) {}
 		~HttpSocketOwner() noexcept
 		{
-			(void)shutdown_(socket_);
-			(void)close_(socket_);
+			if (owned_) {
+				(void)shutdown_(socket_);
+				(void)close_(socket_);
+			}
 		}
+		// Transfer only after the actual HTTP queue reports successful admission.
+		// Refusal/pre-admission throws leave this scope responsible for closing.
+		void Release() noexcept { owned_ = false; }
 		HttpSocketOwner(const HttpSocketOwner&) = delete;
 		HttpSocketOwner& operator=(const HttpSocketOwner&) = delete;
 	private:
 		Socket socket_;
 		cleanup shutdown_;
 		cleanup close_;
+		bool owned_{ true };
 	};
 }

@@ -120,7 +120,11 @@ on_load(function(target)
     local http = io.readfile(path.join(root, "common", "httplib.h"))
     local http_original = io.readfile(path.join(os.projectdir(), "xmake", "httplib-thread-pool-original.h"))
     local socket_original = io.readfile(path.join(os.projectdir(), "xmake", "httplib-socket-handler-original.h"))
+    local listener_original = io.readfile(path.join(os.projectdir(), "xmake", "httplib-listener-original.h"))
+    local stop_original = io.readfile(path.join(os.projectdir(), "xmake", "httplib-stop-original.h"))
     socket_original = socket_original:gsub("\r\n", "\n"):gsub("\n$", "")
+    listener_original = listener_original:gsub("\r\n", "\n"):gsub("\n$", "")
+    stop_original = stop_original:gsub("\r\n", "\n"):gsub("\n$", "")
     -- Establish allocation-free ownership before address-string/request work.
     -- Whole-function source comparison is the drift gate; normal close calls
     -- move into the owner's destructor instead of closing a descriptor twice.
@@ -140,13 +144,58 @@ public:
 private:
     dvb::HttpTaskQueueOwnership owned_;
 };]]
+    -- Guard before any allocating flag/queue preparation. The inner guard
+    -- closes admission on exceptional exit BEFORE the queue destructor drains;
+    -- the outer guard also covers queue-constructor failure. Atomic slot claims
+    -- let Stop, normal teardown and either guard coexist without double close.
+    local listener_owned = overlay_once(listener_original, {
+        {
+            from = "inline bool Server::listen_internal() {",
+            to = "inline bool Server::listen_internal() {\n  dvb::HttpListenerSocketOwner<socket_t> listener_owned(svr_sock_, INVALID_SOCKET, detail::shutdown_socket, detail::close_socket);",
+        },
+        {
+            from = "  is_running_ = true;\n  auto se = detail::scope_exit([&]() { is_running_ = false; });",
+            to = "  dvb::HttpListenerRunningFlag listener_running(is_running_);",
+        },
+        {
+            from = "    std::unique_ptr<TaskQueue> task_queue(new_task_queue());",
+            to = "    std::unique_ptr<TaskQueue> task_queue(new_task_queue());\n    dvb::HttpListenerSocketOwner<socket_t> close_before_drain(svr_sock_, INVALID_SOCKET, detail::shutdown_socket, detail::close_socket);",
+        },
+        {
+            from = "        if (svr_sock_ != INVALID_SOCKET) {\n          detail::close_socket(svr_sock_);",
+            to = "        if (listener_owned.Close()) {",
+        },
+        {
+            from = "      detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO,",
+            to = "      dvb::HttpSocketOwner<socket_t> accepted_owned(sock, detail::shutdown_socket, detail::close_socket);\n      detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO,",
+        },
+        {
+            from = [[      if (!task_queue->enqueue(
+              [this, sock]() { process_and_close_socket(sock); })) {
+        detail::shutdown_socket(sock);
+        detail::close_socket(sock);
+      }]],
+            to = [[      if (task_queue->enqueue(
+              [this, sock]() { process_and_close_socket(sock); })) {
+        accepted_owned.Release();
+      }]],
+        },
+        { from = "    task_queue->shutdown();", to = "    (void)listener_owned.Close();\n    task_queue->shutdown();" },
+    })
+    local stop_owned = [[inline void Server::stop() {
+  dvb::HttpListenerSocketOwner<socket_t> bound_socket(svr_sock_, INVALID_SOCKET, detail::shutdown_socket, detail::close_socket);
+  (void)bound_socket.Close();
+  is_decommisioned = false;
+}]]
     http = overlay_once(http, {
         {
             from = "#define CPPHTTPLIB_HTTPLIB_H",
-            to = '#define CPPHTTPLIB_HTTPLIB_H\n#include "HttpTaskQueueOwnership.h"\n#include "HttpSocketOwner.h"',
+            to = '#define CPPHTTPLIB_HTTPLIB_H\n#include "HttpTaskQueueOwnership.h"\n#include "HttpSocketOwner.h"\n#include "HttpListenerSocketOwner.h"',
         },
         { from = http_original:gsub("\r\n", "\n"):gsub("\n$", ""), to = http_wrapper },
         { from = socket_original, to = socket_owned },
+        { from = listener_original, to = listener_owned },
+        { from = stop_original, to = stop_owned },
     })
     -- Existing HTTP SSL per-worker cleanup is not silently removed. Current
     -- standalone DevBench is non-SSL; a future SSL lane needs its own adapter.
@@ -158,6 +207,8 @@ private:
         io.readfile(path.join(os.projectdir(), "src", "PinnedMcpThreadPool.h")))
     io.writefile(path.join(out, "HttpSocketOwner.h"),
         io.readfile(path.join(os.projectdir(), "src", "HttpSocketOwner.h")))
+    io.writefile(path.join(out, "HttpListenerSocketOwner.h"),
+        io.readfile(path.join(os.projectdir(), "src", "HttpListenerSocketOwner.h")))
     io.writefile(path.join(out, "ContainedThreadEntry.h"),
         io.readfile(path.join(os.projectdir(), "src", "ContainedThreadEntry.h")))
     os.mkdir(patched_src)
