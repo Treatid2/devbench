@@ -19,9 +19,13 @@ session. Old configurations gain the new default through normal migration.
 ```
 
 `warn` is the default; `error`, `info`, `debug`, and `off` are also supported.
-Unknown strings fall back to `warn` with a warning; non-string values also fall
-back without resetting unrelated configuration. MCP filtering is independent of
-the ordinary `logLevel` (including ordinary `off`). Disabling MCP detail filters
+Unknown strings and non-string values fall back to `warn` without resetting
+unrelated configuration. Startup configuration diagnostics use the ordinary
+logger at its current threshold. In particular, invalid-string and
+retained-sink-unavailable warnings occur after ordinary `logLevel` is applied,
+so ordinary `error` or `off` suppresses them; the fallback still takes effect.
+MCP event filtering is independent of the ordinary `logLevel` (including ordinary
+`off`). Disabling MCP detail filters
 before message formatting. It does not eliminate argument evaluation at a C++
 call site, change transport semantics, or guarantee zero overhead.
 
