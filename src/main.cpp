@@ -9,6 +9,7 @@
 #include "GameState.h"
 #include "HostApi.h"
 #include "InputHotkeys.h"
+#include "McpLog.h"
 #include "KeyboardInput.h"
 #include "Recording.h"
 #include "RecordingsMenu.h"
@@ -20,7 +21,7 @@
 
 #include <cstring>
 #include <memory>
-#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/rotating_file_sink.h>
 
 namespace
 {
@@ -28,20 +29,61 @@ namespace
 	// so destroying it there would wait for threads that can no longer finish.
 	dvb::Server* g_server = nullptr;
 	dvb::Config  g_config;  // captured at kPostLoad; used at kInputLoaded
+	// Not registry-owned: changing ordinary logLevel must not filter MCP detail.
+	// Process lifetime, like g_server; workers can still log during DLL teardown.
+	spdlog::logger* g_mcpLogger = nullptr;
+	bool g_retainedLogAvailable = false;
 
-	void InitLogging()
+	void InitLogging() try
 	{
 		auto path = SKSE::log::log_directory();
 		if (!path)
 			return;
 		*path /= std::format("{}.log", SKSE::PluginDeclaration::GetSingleton()->GetName());
 
-		auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(path->string(), true);
+		// Shared bounded retention: current5MiB plus three archives; preserve prior
+		// runs instead of truncating the only retained transport evidence at launch.
+		auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(path->string(), 5 * 1024 * 1024, 3, true);
 		auto log = std::make_shared<spdlog::logger>("global", std::move(sink));
 		log->set_level(spdlog::level::info);
 		log->flush_on(spdlog::level::info);
 		spdlog::set_default_logger(std::move(log));
-		spdlog::set_pattern("[%H:%M:%S.%e] [%^%L%$] %v");
+		spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%L] %v");
+		g_retainedLogAvailable = true;
+	}
+	catch (...) { dvb::McpLog::NoteFailure(); }  // unavailable disk logging must not abort load
+
+	void WriteMcpLog(dvb::McpLogLevel level, std::string_view text)
+	{
+		static constexpr spdlog::level::level_enum levels[] = {
+			spdlog::level::debug, spdlog::level::info, spdlog::level::warn, spdlog::level::err
+		};
+		g_mcpLogger->log(levels[static_cast<unsigned>(level)], "[mcp] {}", text);
+	}
+
+	void ConfigureMcpLogging(const std::string& requested) noexcept
+	{
+		dvb::McpLogLevel level;
+		const bool valid = dvb::ParseMcpLogLevel(requested, level);
+		dvb::McpLog::SetLevel(level);
+		try {
+			if (!valid) logs::warn("devbench: invalid mcpLogLevel; using warn");
+			if (!g_retainedLogAvailable) {
+				logs::warn("devbench: MCP retained logging unavailable: no log directory");
+				return;
+			}
+			if (!g_mcpLogger) {
+				const auto ordinary = spdlog::default_logger();
+				auto logger = std::make_unique<spdlog::logger>("devbench-mcp", ordinary->sinks().begin(), ordinary->sinks().end());
+				logger->set_level(spdlog::level::debug);  // independent early filter in McpLog
+				logger->flush_on(spdlog::level::warn);
+				logger->set_error_handler([](const std::string&) { dvb::McpLog::NoteFailure(); });
+				g_mcpLogger = logger.release();
+				dvb::McpLog::SetSink(WriteMcpLog);
+			}
+		} catch (...) {
+			dvb::McpLog::NoteFailure();  // never prevent server startup to log a log failure
+		}
 	}
 
 	// Apply the config's log level (default info). Lowering to debug/trace surfaces
@@ -82,6 +124,7 @@ namespace
 		if (a_msg->type == SKSE::MessagingInterface::kPostLoad) {
 			const dvb::Config cfg = dvb::LoadConfig();
 			ApplyLogLevel(cfg.logLevel);
+			ConfigureMcpLogging(cfg.mcpLogLevel);
 			if (!cfg.enabled) {
 				logs::info("devbench: server disabled via config; not starting");
 			} else {

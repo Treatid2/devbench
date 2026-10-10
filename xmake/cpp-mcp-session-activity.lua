@@ -69,6 +69,24 @@ private:
     },
     source = {
         {
+            from = [[            if (session_dispatchers_.size() >= max_sessions_) {
+                res.status = 503;]],
+            to = [[            if (session_dispatchers_.size() >= max_sessions_) {
+                LOG_WARNING("Session admission refused: transport=streamable_http count=", session_dispatchers_.size(), " limit=", max_sessions_);
+                res.status = 503;]],
+        },
+        {
+            from = 'LOG_WARNING("Max sessions reached (", max_sessions_, "), rejecting SSE connection");',
+            to = 'LOG_WARNING("Session admission refused: transport=legacy_sse count=", session_dispatchers_.size(), " limit=", max_sessions_);',
+        },
+        -- Parser exception text can quote request fragments; log the boundary,
+        -- not peer argument/body snippets. Other exception text remains bounded.
+        { from = 'LOG_ERROR("Failed to parse JSON request: ", e.what());', to = 'LOG_ERROR("Failed to parse JSON request");' },
+        { from = 'LOG_ERROR("Failed to create request object: ", e.what());', to = 'LOG_ERROR("Failed to create request object");' },
+        { from = 'LOG_ERROR("Failed to parse JSON: ", e.what());', to = 'LOG_ERROR("Failed to parse JSON");' },
+        { from = 'LOG_ERROR("MCP exception: ", e.what(), ", code: ", static_cast<int>(e.code()));', to = 'LOG_ERROR("MCP exception code: ", static_cast<int>(e.code()));' },
+        { from = 'LOG_ERROR("Exception while processing request: ", e.what());', to = 'LOG_ERROR("Exception while processing request");' },
+        {
             from = "    // Validate session for non-initialize requests\n    if (!is_initialize) {",
             to = "    session_request_guard request_activity;\n    // Validate session for non-initialize requests\n    if (!is_initialize) {",
         },

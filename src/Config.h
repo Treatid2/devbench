@@ -13,6 +13,7 @@ namespace dvb
 		bool        enabled = true;     ///< start the MCP/REST server at all
 		int         port = 8920;        ///< localhost port for /mcp and /api (default SE/AE 8920, VR 8921 — LoadConfig)
 		std::string logLevel = "info";  ///< trace|debug|info|warn|error (spdlog level)
+		std::string mcpLogLevel = "warn";  ///< debug|info|warn|error|off, independent MCP threshold
 
 		// In-game hotkeys (DXScanCode; 0 = disabled). Let recording/replay run with no
 		// MCP/REST client connected — the standalone-benchmark path. Ignored while the

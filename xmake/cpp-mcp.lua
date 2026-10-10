@@ -75,7 +75,13 @@ on_load(function(target)
     for _, hdr in ipairs(os.files(path.join(root, "include", "*.h"))) do
         local name = path.filename(hdr)
         local content = io.readfile(hdr)
-        if name == "mcp_message.h" then
+        if name == "mcp_logger.h" then
+            local original = io.readfile(path.join(os.projectdir(), "xmake", "cpp-mcp-logger-original.h"))
+            if content:gsub("\r\n", "\n"):gsub("\n$", "") ~= original:gsub("\r\n", "\n"):gsub("\n$", "") then
+                raise("cpp-mcp logging: pinned logger changed; owner assessment required")
+            end
+            content = io.readfile(path.join(os.projectdir(), "src", "PinnedMcpLogger.h"))
+        elseif name == "mcp_message.h" then
             if not content:find('#include "json.hpp"', 1, true) then
                 raise(
                     'cpp-mcp: expected `#include "json.hpp"` in mcp_message.h; upstream changed — review xmake/cpp-mcp.lua'
@@ -103,6 +109,7 @@ on_load(function(target)
         io.writefile(path.join(out, name), content)
     end
     os.mkdir(patched_src)
+    io.writefile(path.join(out, "McpLog.h"), io.readfile(path.join(os.projectdir(), "src", "McpLog.h")))
     io.writefile(path.join(patched_src, "mcp_server.cpp"),
         overlay_once(io.readfile(path.join(root, "src", "mcp_server.cpp")), overlays.source))
 end)

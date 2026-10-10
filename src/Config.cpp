@@ -26,6 +26,7 @@ namespace dvb
 				{ "enabled", a_cfg.enabled },
 				{ "port", a_cfg.port },
 				{ "logLevel", a_cfg.logLevel },
+				{ "mcpLogLevel", a_cfg.mcpLogLevel },
 				{ "recordHotkey", a_cfg.recordHotkey },
 				{ "replayHotkey", a_cfg.replayHotkey },
 				{ "recordHotkeyShift", a_cfg.recordHotkeyShift },
@@ -104,6 +105,10 @@ namespace dvb
 			cfg.enabled = j.value("enabled", cfg.enabled);
 			cfg.port = j.value("port", cfg.port);
 			cfg.logLevel = j.value("logLevel", cfg.logLevel);
+			if (const auto value = j.find("mcpLogLevel"); value != j.end()) {
+				if (value->is_string()) cfg.mcpLogLevel = value->get<std::string>();
+				else logs::warn("devbench: mcpLogLevel must be a string; using warn");
+			}
 			cfg.recordHotkey = j.value("recordHotkey", cfg.recordHotkey);
 			cfg.replayHotkey = j.value("replayHotkey", cfg.replayHotkey);
 			cfg.recordHotkeyShift = j.value("recordHotkeyShift", cfg.recordHotkeyShift);
@@ -129,7 +134,7 @@ namespace dvb
 			// defaults — otherwise a user never discovers options added in an update. The
 			// values just loaded above are preserved; only absent keys gain defaults.
 			static constexpr const char* kKeys[] = {
-				"enabled", "port", "logLevel", "recordHotkey", "replayHotkey",
+				"enabled", "port", "logLevel", "mcpLogLevel", "recordHotkey", "replayHotkey",
 				"recordHotkeyShift", "replayHotkeyShift", "replayPath", "replayRestoreScene",
 				"recordIntervalMs", "autoRunPath", "autoRunRestoreScene", "loadSettleMs",
 				"couplingAnchorMs", "couplingCellMs", "cleanTransition", "cleanTransitionCell",
