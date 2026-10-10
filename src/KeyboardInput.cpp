@@ -3,6 +3,7 @@
 #include "EventBus.h"
 #include "GameClock.h"
 #include "GameState.h"
+#include "InputToolSchema.h"
 #include "KeyboardButtonEvent.h"
 #include "KeyboardInputState.h"
 #include "MainThread.h"
@@ -855,24 +856,7 @@ namespace dvb
 			"may explicitly survive the load/new-game events it is reproducing. There are deliberately no per-device or "
 			"per-button VR mutation actions: submit the coherent tracked set so poses and controls cannot "
 			"come from different clocks.";
-		input.inputSchema = json{
-			{ "type", "object" },
-			{ "properties", json{
-								{ "action", json{ { "type", "string" }, { "enum", json::array({ "capabilities", "status", "down", "up", "tap", "sequence", "stop", "releaseAll" }) } } },
-								{ "device", json{ { "type", "string" }, { "enum", json::array({ "keyboard", "vrTrackedSet" }) }, { "description", "mutation/status device; omit for capabilities" } } },
-								{ "key", json{ { "oneOf", json::array({ json{ { "type", "string" } }, json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 258 } } }) }, { "description", "down/up/tap: documented key name or raw DirectInput scancode; keyboard button events have no VR wand association; mouseLeft / mouseRight / mouseMiddle (256-258) are mouse buttons" } } },
-								{ "owner", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "stable task/session owner; defaults to MCP session id or rest:anonymous" } } },
-								{ "durationMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", 5000 }, { "description", "tap duration (default 50); sequence tap/wait event duration" } } },
-								{ "maxHoldMs", json{ { "type", "integer" }, { "minimum", 100 }, { "maximum", kMaximumMaxHoldMs }, { "description", "down safety lease (default 5000); automatic up at expiry" } } },
-								{ "force", json{ { "type", "boolean" }, { "description", "internal cleanup only; external true is rejected" } } },
-								{ "all", json{ { "type", "boolean" }, { "description", "internal cleanup only; external true is rejected" } } },
-								{ "events", json{ { "type", "array" }, { "minItems", 1 }, { "maxItems", kMaximumSequenceEvents }, { "description", "sequence: balanced [{action:tap|down|up|wait,key?,durationMs?,afterMs?}]" }, { "items", json{ { "type", "object" } } } } },
-								{ "frames", json{ { "type", "array" }, { "minItems", 1 }, { "maxItems", kMaximumVRTrackedFrames }, { "description", "vrTrackedSet sequence: monotonic atomic frames; each requires tMs, originCode, hmd, left, right; controller objects carry packetNumber/pressed/touched/five axes" }, { "items", json{ { "type", "object" } } } } },
-								{ "tailMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", 1000 }, { "description", "vrTrackedSet sequence: final-state visibility before automatic release (default 50ms)" } } },
-								{ "controlToken", json{ { "type", "string" }, { "description", "vrTrackedSet stop/releaseAll: opaque token returned by sequence start" } } },
-								{ "surviveLifecycle", json{ { "type", "boolean" }, { "description", "internal recording replay only; external true is rejected" } } },
-							} },
-		};
+		input.inputSchema = InputToolSchema(kMaximumMaxHoldMs, kMaximumSequenceEvents, kMaximumVRTrackedFrames);
 		a_registry.Register(std::move(input), &HandleInput);
 	}
 

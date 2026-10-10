@@ -128,6 +128,7 @@
             "enum": [
               "capabilities",
               "status",
+              "observe",
               "down",
               "up",
               "tap",
@@ -146,7 +147,7 @@
             "type": "string"
           },
           "device": {
-            "description": "mutation/status device; omit for capabilities",
+            "description": "observation/mutation/status device; observe requires vrTrackedSet; omit for capabilities",
             "enum": ["keyboard", "vrTrackedSet"],
             "type": "string"
           },
