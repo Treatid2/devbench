@@ -119,6 +119,18 @@ on_load(function(target)
     -- Do not edit the pinned dependency or silently accept a changed class.
     local http = io.readfile(path.join(root, "common", "httplib.h"))
     local http_original = io.readfile(path.join(os.projectdir(), "xmake", "httplib-thread-pool-original.h"))
+    local socket_original = io.readfile(path.join(os.projectdir(), "xmake", "httplib-socket-handler-original.h"))
+    socket_original = socket_original:gsub("\r\n", "\n"):gsub("\n$", "")
+    -- Establish allocation-free ownership before address-string/request work.
+    -- Whole-function source comparison is the drift gate; normal close calls
+    -- move into the owner's destructor instead of closing a descriptor twice.
+    local socket_owned = overlay_once(socket_original, {
+        {
+            from = "inline bool Server::process_and_close_socket(socket_t sock) {",
+            to = "inline bool Server::process_and_close_socket(socket_t sock) {\n  dvb::HttpSocketOwner<socket_t> owned(sock, detail::shutdown_socket, detail::close_socket);",
+        },
+        { from = "  detail::shutdown_socket(sock);\n  detail::close_socket(sock);\n", to = "" },
+    })
     local http_wrapper = [[class ThreadPool final : public TaskQueue {
 public:
     explicit ThreadPool(size_t n, size_t mqr = 0) : owned_(n, mqr) {}
@@ -131,9 +143,10 @@ private:
     http = overlay_once(http, {
         {
             from = "#define CPPHTTPLIB_HTTPLIB_H",
-            to = '#define CPPHTTPLIB_HTTPLIB_H\n#include "HttpTaskQueueOwnership.h"',
+            to = '#define CPPHTTPLIB_HTTPLIB_H\n#include "HttpTaskQueueOwnership.h"\n#include "HttpSocketOwner.h"',
         },
         { from = http_original:gsub("\r\n", "\n"):gsub("\n$", ""), to = http_wrapper },
+        { from = socket_original, to = socket_owned },
     })
     -- Existing HTTP SSL per-worker cleanup is not silently removed. Current
     -- standalone DevBench is non-SSL; a future SSL lane needs its own adapter.
@@ -143,6 +156,8 @@ private:
         io.readfile(path.join(os.projectdir(), "src", "HttpTaskQueueOwnership.h")))
     io.writefile(path.join(out, "PinnedMcpThreadPool.h"),
         io.readfile(path.join(os.projectdir(), "src", "PinnedMcpThreadPool.h")))
+    io.writefile(path.join(out, "HttpSocketOwner.h"),
+        io.readfile(path.join(os.projectdir(), "src", "HttpSocketOwner.h")))
     os.mkdir(patched_src)
     io.writefile(path.join(patched_src, "mcp_server.cpp"),
         overlay_once(io.readfile(path.join(root, "src", "mcp_server.cpp")), overlays.source))

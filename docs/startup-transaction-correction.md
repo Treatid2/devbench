@@ -229,3 +229,19 @@ admitted should a new hash-distinct focused PR107 cycle be prepared. This partia
 checkpoint does not replace the independent console review's exact PASS at16dac.
 Experimental source remains `16dac`; reviewed main remains `32823e4`. No runtime
 command, replay, deployment, upstream publication or initial-heartbeat resume.
+# Accepted HTTP socket exception cleanup (10 October continuation)
+
+The exact pinned non-SSL process_and_close_socket now establishes an
+allocation-free HttpSocketOwner before address strings/request work. Shutdown
+and close move into the owner destructor and occur on normal and exceptional
+exit, including when native shutdown returns an error. The full original
+function is an exact unique overlay anchor; pinned dependency remains unchanged.
+Two source fixtures exercise the production ownership class with cleanup
+callbacks, not real sockets. They are uncompiled/unrun. Combined startup cases
+now28, latest12since exact compiled e312 uncompiled/unrun.
+
+This does not repair accepted sockets before queue admission, prebound listener
+rollback, listener-entry exceptions, partial start, session/SSE producer joining,
+full stop/drain/retry or hung application work. Socket cleanup error codes are
+not proof of successful network shutdown. Changed mirrors need final Broker
+assessment; no inherited compilation or review verdict is relabelled.
