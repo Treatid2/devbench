@@ -8,7 +8,7 @@ return {
     header = {
         {
             from = "#define MCP_SERVER_H",
-            to = '#define MCP_SERVER_H\n#include "ContainedThreadEntry.h"\n#include "SessionCapacityAdmission.h"',
+            to = '#define MCP_SERVER_H\n#include "ContainedThreadEntry.h"\n#include "SessionCapacityAdmission.h"\n#include "SessionInitializationState.h"',
         },
         {
             from = "    bool running_ = false;",
@@ -80,6 +80,24 @@ private:
         },
     },
     source = {
+        {
+            from = [[        std::lock_guard<std::mutex> lock(mutex_);
+        // Check if session still exists (either SSE or HTTP mode)
+        auto it = session_dispatchers_.find(session_id);
+        bool has_dispatcher = (it != session_dispatchers_.end());
+
+        // For HTTP mode, we also track initialization in session_initialized_ map
+        // So we allow setting initialized state even without a dispatcher for HTTP sessions
+        if (!has_dispatcher) {
+            LOG_DEBUG("Setting initialization state for HTTP session: ", session_id);
+        }
+
+        session_initialized_[session_id] = initialized;]],
+            to = [[        // Initialization cannot recreate state after dispatcher retirement.
+        // The helper uses the same owner lock as registration and retirement.
+        (void)dvb::SetRegisteredSessionInitialized(
+            session_dispatchers_, session_initialized_, mutex_, session_id, initialized);]],
+        },
         {
             from = [[    // Enforce session limit
     if (max_sessions_ > 0) {
