@@ -8,7 +8,7 @@ return {
     header = {
         {
             from = "#define MCP_SERVER_H",
-            to = '#define MCP_SERVER_H\n#include "ContainedThreadEntry.h"\n#include "SessionCapacityAdmission.h"\n#include "SessionInitializationState.h"',
+            to = '#define MCP_SERVER_H\n#include "ContainedThreadEntry.h"\n#include "SessionCapacityAdmission.h"\n#include "SessionInitializationState.h"\n#include "SessionRegistrationRollback.h"',
         },
         {
             from = "    bool running_ = false;",
@@ -80,6 +80,43 @@ private:
         },
     },
     source = {
+        {
+            from = [[        auto mcp_req = parse_jsonrpc_message(items[0]);
+        json result = handle_initialize(mcp_req, session_id);
+
+        res.set_header("Mcp-Session-Id", session_id);
+        res.set_header("Content-Type", "application/json");
+        res.set_content(result.dump(), "application/json");
+        return;]],
+            to = [[        // Failed initialization must not consume an undisclosed session slot.
+        // No published session is closed here; rollback requires exact allocation identity.
+        auto rollback = [&]() {
+            (void)dvb::RollbackSessionRegistration(
+                session_dispatchers_, session_initialized_, mutex_, session_id, session_dispatcher);
+        };
+        try {
+            if (!request_activity.acquire(session_dispatcher)) {
+                rollback();
+                res.status = 503;
+                res.set_content("{\"error\":\"Session closed during initialization\"}", "application/json");
+                return;
+            }
+            auto mcp_req = parse_jsonrpc_message(items[0]);
+            json result = handle_initialize(mcp_req, session_id);
+            if (result.contains("error")) {
+                rollback();
+                res.set_content(result.dump(), "application/json");
+                return;
+            }
+            // Complete serialization/response construction before exposing the new ID.
+            res.set_content(result.dump(), "application/json");
+            res.set_header("Mcp-Session-Id", session_id);
+        } catch (...) {
+            rollback();
+            throw;
+        }
+        return;]],
+        },
         {
             from = [[        std::lock_guard<std::mutex> lock(mutex_);
         // Check if session still exists (either SSE or HTTP mode)
