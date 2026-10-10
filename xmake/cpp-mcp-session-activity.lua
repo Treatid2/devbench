@@ -8,7 +8,7 @@ return {
     header = {
         {
             from = "#define MCP_SERVER_H",
-            to = '#define MCP_SERVER_H\n#include "ContainedThreadEntry.h"',
+            to = '#define MCP_SERVER_H\n#include "ContainedThreadEntry.h"\n#include "SessionCapacityAdmission.h"',
         },
         {
             from = "    bool running_ = false;",
@@ -80,6 +80,57 @@ private:
         },
     },
     source = {
+        {
+            from = [[    // Enforce session limit
+    if (max_sessions_ > 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (session_dispatchers_.size() >= max_sessions_) {
+            LOG_WARNING("Max sessions reached (", max_sessions_, "), rejecting SSE connection");
+            res.status = 503;
+            res.set_content("{\"error\":\"Too many sessions\"}", "application/json");
+            return;
+        }
+    }
+]],
+            to = "",
+        },
+        {
+            from = [[    // Add session dispatcher to mapping table
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        session_dispatchers_[session_id] = session_dispatcher;
+    }]],
+            to = [[    // Both transports share atomic count-and-insert admission.
+    if (!dvb::AdmitSession(session_dispatchers_, mutex_, max_sessions_, session_id, session_dispatcher)) {
+        res.status = 503;
+        res.set_content("{\"error\":\"Too many sessions\"}", "application/json");
+        return;
+    }]],
+        },
+        {
+            from = [[        // Enforce session limit
+        if (max_sessions_ > 0) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (session_dispatchers_.size() >= max_sessions_) {
+                res.status = 503;
+                res.set_content("{\"error\":\"Too many sessions\"}", "application/json");
+                return;
+            }
+        }
+]],
+            to = "",
+        },
+        {
+            from = [[        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            session_dispatchers_[session_id] = session_dispatcher;
+        }]],
+            to = [[        if (!dvb::AdmitSession(session_dispatchers_, mutex_, max_sessions_, session_id, session_dispatcher)) {
+            res.status = 503;
+            res.set_content("{\"error\":\"Too many sessions\"}", "application/json");
+            return;
+        }]],
+        },
         {
             from = [[        maintenance_thread_ = std::make_unique<std::thread>([this]() {
             while (true) {

@@ -211,6 +211,8 @@ private:
         io.readfile(path.join(os.projectdir(), "src", "HttpListenerSocketOwner.h")))
     io.writefile(path.join(out, "ContainedThreadEntry.h"),
         io.readfile(path.join(os.projectdir(), "src", "ContainedThreadEntry.h")))
+    io.writefile(path.join(out, "SessionCapacityAdmission.h"),
+        io.readfile(path.join(os.projectdir(), "src", "SessionCapacityAdmission.h")))
     os.mkdir(patched_src)
     io.writefile(path.join(patched_src, "mcp_server.cpp"),
         overlay_once(io.readfile(path.join(root, "src", "mcp_server.cpp")), overlays.source))
