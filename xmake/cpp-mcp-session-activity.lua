@@ -7,6 +7,18 @@ function main()
 return {
     header = {
         {
+            from = "#define MCP_SERVER_H",
+            to = '#define MCP_SERVER_H\n#include "ContainedThreadEntry.h"',
+        },
+        {
+            from = "    bool running_ = false;",
+            to = "    dvb::ContainedThreadEntry thread_entry_state_;\n    std::atomic<bool> running_{false};",
+        },
+        {
+            from = "    bool is_running() const;",
+            to = "    bool is_running() const;\n    std::uint64_t worker_entry_failures() const noexcept { return thread_entry_state_.Failures(); }",
+        },
+        {
             from = "    // Get the last activity time",
             to = [[    // Streamable HTTP request activity, protected by the dispatcher mutex.
     bool begin_request() {
@@ -68,6 +80,76 @@ private:
         },
     },
     source = {
+        {
+            from = [[        maintenance_thread_ = std::make_unique<std::thread>([this]() {
+            while (true) {
+                // Check inactive sessions every 10 seconds
+                std::unique_lock<std::mutex> lock(maintenance_mutex_);
+                auto should_exit = maintenance_cond_.wait_for(lock, std::chrono::seconds(10), [this] {
+                    return !maintenance_thread_run_;
+                });
+                if (should_exit) {
+                    LOG_INFO("Maintenance thread exiting");
+                    return;
+                }
+                lock.unlock();
+                try {
+                    check_inactive_sessions();
+                } catch (const std::exception& e) {
+                    LOG_ERROR("Exception in maintenance thread: ", e.what());
+                } catch (...) {
+                    LOG_ERROR("Unknown exception in maintenance thread");
+                }
+            }
+        });]],
+            to = [[        maintenance_thread_ = std::make_unique<std::thread>([this]() noexcept {
+            (void)thread_entry_state_.Run([this]() {
+            while (true) {
+                // Check inactive sessions every 10 seconds
+                std::unique_lock<std::mutex> lock(maintenance_mutex_);
+                auto should_exit = maintenance_cond_.wait_for(lock, std::chrono::seconds(10), [this] {
+                    return !maintenance_thread_run_;
+                });
+                if (should_exit) {
+                    LOG_INFO("Maintenance thread exiting");
+                    return;
+                }
+                lock.unlock();
+                try {
+                    check_inactive_sessions();
+                } catch (const std::exception& e) {
+                    LOG_ERROR("Exception in maintenance thread: ", e.what());
+                } catch (...) {
+                    LOG_ERROR("Unknown exception in maintenance thread");
+                }
+            }
+            });
+        });]],
+        },
+        {
+            from = [[        server_thread_ = std::make_unique<std::thread>([this]() {
+            LOG_INFO("Starting server in separate thread");
+            if (!http_server_->listen(host_.c_str(), port_)) {
+                LOG_ERROR("Failed to start server on ", host_, ":", port_);
+                running_ = false;
+                return;
+            }
+        });]],
+            to = [[        server_thread_ = std::make_unique<std::thread>([this]() noexcept {
+            (void)thread_entry_state_.Run([this]() {
+            LOG_INFO("Starting server in separate thread");
+            if (!http_server_->listen(host_.c_str(), port_)) {
+                LOG_ERROR("Failed to start server on ", host_, ":", port_);
+                running_ = false;
+                return;
+            }
+            });
+        });]],
+        },
+        {
+            from = "bool server::is_running() const {\n    return running_;\n}",
+            to = "bool server::is_running() const {\n    return running_.load(std::memory_order_acquire) && !thread_entry_state_.Failed();\n}",
+        },
         {
             from = "    // Validate session for non-initialize requests\n    if (!is_initialize) {",
             to = "    session_request_guard request_activity;\n    // Validate session for non-initialize requests\n    if (!is_initialize) {",

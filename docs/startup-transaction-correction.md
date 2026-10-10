@@ -245,3 +245,20 @@ rollback, listener-entry exceptions, partial start, session/SSE producer joining
 full stop/drain/retry or hung application work. Socket cleanup error codes are
 not proof of successful network shutdown. Changed mirrors need final Broker
 assessment; no inherited compilation or review verdict is relabelled.
+# Actual transport worker-entry containment (10 October next continuation)
+
+Exact nonblocking listener/maintenance blocks are wrapped by the production
+ContainedThreadEntry. Exceptions in listener logging/listen/HTTP queue creation,
+maintenance wait/loop or its error logging cannot escape either worker entry.
+Failure records only an atomic counter, with no fallible logging/callback on the
+containment path. The generated server running flag is atomic; is_running refuses
+a recorded failed entry and worker_entry_failures exposes that exact count.
+Later normal completion does not clear failure history or attest owner retirement.
+Two host source cases exercise the production boundary for normal/standard/unknown
+exception outcomes;30combined startup cases/new14since compiled e312 uncompiled/unrun.
+
+This remains incomplete: owner-thread construction failures, synchronous bind and
+readiness, safe partial stop, session/SSE ownership/drain and stopped retry still
+require correction. Sticky entry failure will need owner-confirmed recreation or
+an explicitly quiescent recovery path; no safe retry or teardown is claimed here.
+No changed-control compilation, recipe execution, assertions or runtime performed.
