@@ -39,7 +39,7 @@ null queue; blocking start stopped by another owner; fail-closed embedded stdio;
 partial invalid-regex route registration refusing graph reuse; and injected first
 or second worker creation failure. Factories must return the owned joinable thread
 running the supplied body exactly once asynchronously, never inline or detached.
-These cases compiled at exact aa5b857; no assertion execution is claimed here. The dependency
+These cases compiled at exact6fea561; no assertion execution is claimed here. The dependency
 configuration seam is not a DevBench tool or permission to create runtime workers.
 
 No test may attach to a game, delete a foreign session or retry arbitrary production
@@ -68,7 +68,8 @@ checked through real /mcp POST, GET/DELETE, legacy /sse and /message entries.
 Predicate exceptions fail closed through the public HTTP route.
 
 Finite concurrent workers register160 tools and perform80 public catalogue and
-80 callable requests under a20s useful-work budget, with1s connection/2s read
+80 callable iterations (echo plus a published late tool when available) under
+a20s useful-work budget, with1s connection/2s read
 bounds and failure counters read after all joins. No harness CHECK runs in a
 worker. A real callable registers another tool, checking that catalogue locking
 is released before application code. These fixtures add a60s margin over the
@@ -78,14 +79,26 @@ cancellation, never an unsafe detached worker. Preserve any original failure;
 do not automatically replay. New compiled-source receipts are required before
 requester execution or claiming these fixtures ran.
 
-All three compiler attempts at aa5b85737c39253c7d56e2da440f417635aebb8f /
+Current production/transport source6fea5615aeb5ca4acb8547ef3096ca172751f0e9 /
+treee8e8a2d96fd8aa8d529c992edaa23f4bdc878af6 compiled once per affected target.
+Both original compiler attempts exited zero; qualification/outer jobs SUCCEEDED.
+The transport log explicitly compiles McpReplacementPublication_test.cpp and the
+actual McpAdapter/ToolRegistry. This aggregate includes17 declared cases; assertions
+have NOT RUN in compile qualification. Issued transport EXE SHA256
+e755ff435d17bd1e8bffd7b34a25a74bb879377d203d54e0cc57909ce3666ed8,
+BuildKey sha256:cdb6777645c615530c3690af2f0e42d19fc09464574686766ed0ec24f8d2b07e.
+Documentation-only child retains its separate head and requires unchanged
+non-document compiled closure proof; no docs-only rebuild or source relabel.
+The unchanged pure-host target retains its actual aa5 identity, not a6fea rebuild.
+
+Historical three compiler attempts at aa5b85737c39253c7d56e2da440f417635aebb8f /
 treec6bcf5e3bd0372ff31af6f75baa1c0522b4ed0b1 exited zero once. Its transport
 log explicitly compiles both public-admission fixture TUs and the actual adapter/
 registry. Host/transport outer jobs succeeded; production outer NONZERO_EXIT from
 post-publication scratch-release lock timeout remains preserved with separate
 successful cleanup reconciliation, no compiler replay. All assertions remain
 unrun in these compile receipts. This is not the predecessor ed16 host-publication
-recovery narrative, nor proof that the later source changes below compiled.
+recovery narrative. Later replacement compilation is established separately above.
 
 McpReplacementPublication_test.cpp adds ONE later source case on its own37394
 loopback server: a barrier after older registry commit forces the newer same-name
@@ -94,6 +107,6 @@ actual adapter callback through narrow friend access, not a substitute adapter.
 Final registry descriptor, real tools/list schema and tools/call handler/value
 must agree. No CHECK on worker threads;3s entered/5s release waits and1s connect/
 2s read bounds, no detached timeout helper. Current660s aggregate hard deadline
-is unchanged. This changed-source fixture needs its own exact compile receipt;
+is unchanged. This fixture compiled in the exact6fea transport receipt above;
 do not substitute the older aa5 EXE or repeat a completed qualification. The
 aggregate source declaration count becomes17, not an assertion-result count.

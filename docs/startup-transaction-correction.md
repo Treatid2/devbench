@@ -147,16 +147,37 @@ candidate's inherited qualification.
 
 The 166bea0 focused review returned CHANGES_REQUIRED for concurrent native tool
 map reads and pre-commit native MCP admission. Both findings were accepted and
-the original review transaction completed. The current correction changes native
-source and executed overlay/transport-target recipes; the older ed16 compilation
-below does not qualify these new bytes. New source fixtures exercise the actual
+closed in aa5. Its successor review confirmed those closures but required
+same-name replacement publication convergence and accurate qualification docs;
+that review was evaluated/completed and both corrections are implemented here.
+Source fixtures exercise the actual
 McpAdapter/ToolRegistry with public concurrent catalogue/call requests, reentrant
 registration, and the production-used PostLoadStartup controller with successful
 or injected failed publication and the same retained readiness token. The fixture
 does not execute SKSE hooks or claim a game-level publication test. Compilation,
 requester assertions and a hash-distinct successor review remain separate stages.
 
-Latest issued historical candidate
+Current issued production/transport source
+`6fea5615aeb5ca4acb8547ef3096ca172751f0e9`, tree
+`e8e8a2d96fd8aa8d529c992edaa23f4bdc878af6`, compiled once for each affected
+target under exact Broker assessment. Both compiler attempts exited zero and
+both qualification/outer jobs SUCCEEDED. The actual transport log includes the
+new replacement fixture and production adapter. No assertions were run.
+Production BuildKey is
+`sha256:20d222e7b8af9d04d1e09db59caaa7b459c5b061fbfb756d5355dafd082273fb`;
+transport BuildKey is
+`sha256:cdb6777645c615530c3690af2f0e42d19fc09464574686766ed0ec24f8d2b07e`.
+Source/lock/dependency/generated-mirror correspondence, four issued artifact
+hashes, PDB proofs and cleanup were independently admitted on retained L evidence.
+The current documentation-only child has a separate identity; its unchanged
+non-document compiled closure must be proved, never relabelled or rebuilt.
+
+Pure host deliberately remains the actual aa5 milestone below, not a6fea build:
+no pure-host executable body or fixture changed (registry header adds only
+contract comments and friend declaration). No redundant host rebuild, new-head
+host compile claim or assertion replay is made.
+
+Historical three-target candidate
 `aa5b85737c39253c7d56e2da440f417635aebb8f`, tree
 `c6bcf5e3bd0372ff31af6f75baa1c0522b4ed0b1`, compiled once per target under exact
 Broker assessment: production, pure host and standalone transport. All three
@@ -166,15 +187,12 @@ outer job remained NONZERO_EXIT when post-publication scratch release timed out.
 Separate owned cleanup reconciliation succeeded without compiler replay or
 rewriting that original outcome. Assertions were NOT RUN by that qualification.
 
-The current same-name replacement correction and its new deterministic fixture
-are later source changes: aa5 artifacts do not qualify them. Their exact issued
-commit/tree must be bound after fresh Broker qualification. A subsequent
-documentation-only composition must keep its distinct head and prove unchanged
-non-document compiled closure instead of relabelling or rebuilding artifacts.
-Earlier ed16 host-publication recovery remains historical only, not the failure
-lane or current source qualification described above.
+The aa5 artifacts do not qualify the later same-name replacement change;
+the exact6fea qualification above supplies that production/transport boundary.
+Earlier ed16 host-publication recovery remains historical only. The aa5 production
+outer cleanup failure remains preserved, not rewritten by the successful6fea jobs.
 
-The aa5 source checks verified36 unique MCP projections and exact
+The6fea source checks verified36 unique MCP projections and exact
 source/control correspondence. The focused host sources exercise production
 phase, callback, bus, pool, socket, session and provider ownership primitives.
 The standalone transport target additionally exercises actual bind refusal,
