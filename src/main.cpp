@@ -12,6 +12,7 @@
 #include "McpLog.h"
 #include "RetainedLogInitialization.h"
 #include "KeyboardInput.h"
+#include "PostLoadStartup.h"
 #include "Recording.h"
 #include "RecordingsMenu.h"
 #include "Server.h"
@@ -22,6 +23,7 @@
 
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <spdlog/sinks/rotating_file_sink.h>
 
 namespace
@@ -34,6 +36,7 @@ namespace
 	// Process lifetime, like g_server; workers can still log during DLL teardown.
 	spdlog::logger* g_mcpLogger = nullptr;
 	dvb::RetainedLogResult g_retainedLog;
+	dvb::PostLoadStartup g_startup;
 
 	void InitLogging() noexcept
 	{
@@ -122,12 +125,110 @@ namespace
 	// interface request would never reach us without this. Only acts on the request.
 	void OnInterfaceMessage(SKSE::MessagingInterface::Message* a_msg)
 	{
-		dvb::HostApi::OnInterfaceRequest(a_msg);
+		if (g_startup.Ready() && g_server && g_server->Ready())
+			dvb::HostApi::OnInterfaceRequest(a_msg);
+	}
+
+	struct PostLoadOperations
+	{
+		dvb::Config config;
+
+		bool Configure()
+		{
+			config = dvb::LoadConfig();
+			ApplyLogLevel(config.logLevel);
+			ConfigureMcpLogging(config.mcpLogLevel);
+			return config.enabled;
+		}
+
+		void Construct()
+		{
+			g_config = config;
+			// Retain this process-lifetime owner BEFORE any registry/bus address
+			// escapes. A later failure never deletes it or repeats irreversible work.
+			g_server = new dvb::Server("127.0.0.1", config.port);
+		}
+
+		void Prepare()
+		{
+			g_server->Events().SetFrameProvider(&dvb::game::CurrentFrame);
+			dvb::RegisterCoreTools(g_server->Tools(), g_server->Events());
+			dvb::Recording::SetLoadSettleMs(config.loadSettleMs);
+			dvb::Recording::SetDefaultIntervalMs(config.recordIntervalMs);
+			dvb::Recording::SetCoupling(config.couplingAnchorMs, config.couplingCellMs, config.cleanTransition, config.cleanTransitionCell);
+			dvb::Recording::SetCaptureDefaults(config.captureSettleMs);
+			dvb::Capture::SetEvents(&g_server->Events());
+			dvb::Capture::SetDefaults(config);
+			dvb::ArmAutoRun(g_server->Tools(), config.autoRunPath, config.autoRunRestoreScene);
+			dvb::HostApi::Init(g_server->Tools(), g_server->Events());
+		}
+
+		bool Listen() { return g_server->Start(); }
+
+		void Publish()
+		{
+			// Required listener stage must succeed BEFORE irreversible hook/sink
+			// installs. No hook rollback API is presumed if this phase later fails.
+			dvb::InstallGameEvents(g_server->Events());
+			dvb::StallWatchdog::Start(g_server->Events(), config.stallWatchdogMs);
+			dvb::ConsoleHook::Install(g_server->Events());
+			dvb::ConsoleLogCapture::InstallPrintHook();
+			dvb::CameraOrbit::Install();
+			auto* messaging = SKSE::GetMessagingInterface();
+			if (!messaging || !messaging->RegisterListener(nullptr, OnInterfaceMessage))
+				throw std::runtime_error("devbench interface listener registration failed");
+			g_server->SetReady(true);
+		}
+
+		void Quarantine() noexcept
+		{
+			if (g_server)
+				g_server->SetReady(false);
+			// Do NOT run pinned stop/destruction here until its cleanup is proven.
+			// This is denied admission and retained ownership, not stopped transport.
+		}
+
+		void Report(dvb::PostLoadStartup::Outcome a_outcome, dvb::PostLoadStartup::Phase a_phase, std::exception_ptr a_error)
+		{
+			if (a_outcome == dvb::PostLoadStartup::Outcome::Disabled) {
+				logs::info("devbench: server disabled via config; not starting");
+			} else if (a_outcome == dvb::PostLoadStartup::Outcome::Ready) {
+				g_server->ReportDiscovery();
+			} else {
+				try {
+					if (a_error)
+						std::rethrow_exception(a_error);
+				} catch (const std::exception& e) {
+					logs::error("devbench: startup phase {} failed: {}; owner retained, dependent stages disabled",
+						static_cast<int>(a_phase), e.what());
+					return;
+				} catch (...) {}
+				logs::error("devbench: startup phase {} failed; owner retained, dependent stages disabled", static_cast<int>(a_phase));
+			}
+		}
+	};
+
+	void StartPostLoad() noexcept
+	{
+		// Even construction of the operation/config object belongs to the SKSE
+		// boundary; no diagnostic failure may escape to another plugin's listener.
+		try {
+			PostLoadOperations operations;
+			g_startup.Run(operations);
+		} catch (...) {
+			try { logs::error("devbench: could not construct startup operations"); } catch (...) {}
+		}
 	}
 
 	void OnMessage(SKSE::MessagingInterface::Message* a_msg)
 	{
 		if (!a_msg)
+			return;
+		if (a_msg->type == SKSE::MessagingInterface::kPostLoad) {
+			StartPostLoad();
+			return;
+		}
+		if (!g_startup.Ready() || !g_server || !g_server->Ready())
 			return;
 		if (a_msg->type == SKSE::MessagingInterface::kPreLoadGame || a_msg->type == SKSE::MessagingInterface::kNewGame)
 			dvb::CameraOrbit::Stop();  // an orbit never carries into another game
@@ -135,58 +236,6 @@ namespace
 			dvb::FreeCamera::BeginLoad();
 		else if (a_msg->type == SKSE::MessagingInterface::kNewGame || a_msg->type == SKSE::MessagingInterface::kPostLoadGame)
 			dvb::FreeCamera::EndLoad();
-		// Init at kPostLoad, not kDataLoaded: SKSE runs ALL plugins' kPostLoad before any
-		// kDataLoaded, so the cross-plugin interface is ready when consumer mods request it
-		// at their kDataLoaded (otherwise plugin order can make us answer too late — a
-		// consumer would see "devbench not present"). The HTTP server only listens here;
-		// tool handlers query game state lazily when invoked (by then the game is loaded).
-		if (a_msg->type == SKSE::MessagingInterface::kPostLoad) {
-			const dvb::Config cfg = dvb::LoadConfig();
-			ApplyLogLevel(cfg.logLevel);
-			ConfigureMcpLogging(cfg.mcpLogLevel);
-			if (!cfg.enabled) {
-				logs::info("devbench: server disabled via config; not starting");
-			} else {
-				// Register built-in tools and wire the cross-plugin host API (which
-				// registers its self-test tool) BEFORE Start() so they appear on both
-				// transports from the first request; then attach game-event sources.
-				g_config = cfg;  // kept for kInputLoaded (input sink registers later)
-				g_server = new dvb::Server("127.0.0.1", cfg.port);
-				g_server->Events().SetFrameProvider(&dvb::game::CurrentFrame);
-				dvb::RegisterCoreTools(g_server->Tools(), g_server->Events());
-				dvb::Recording::SetLoadSettleMs(cfg.loadSettleMs);
-				dvb::Recording::SetDefaultIntervalMs(cfg.recordIntervalMs);
-				dvb::Recording::SetCoupling(cfg.couplingAnchorMs, cfg.couplingCellMs, cfg.cleanTransition, cfg.cleanTransitionCell);
-				dvb::Recording::SetCaptureDefaults(cfg.captureSettleMs);
-				dvb::Capture::SetEvents(&g_server->Events());
-				dvb::Capture::SetDefaults(cfg);
-				dvb::ArmAutoRun(g_server->Tools(), cfg.autoRunPath, cfg.autoRunRestoreScene);
-				dvb::HostApi::Init(g_server->Tools(), g_server->Events());
-				// Never let a throw here escape into SKSE's kPostLoad dispatch: that aborts the
-				// remaining listeners, silently leaving every later-loaded plugin without its
-				// kPostLoad (observed as other mods' API-dependent features vanishing, with the
-				// fault showing up only in an unrelated mod's log). A dev tool failing to start
-				// must not take the rest of the load order down with it.
-				try {
-					g_server->Start();
-				} catch (const std::exception& e) {
-					logs::error("devbench: server failed to start: {}", e.what());
-				} catch (...) {
-					logs::error("devbench: server failed to start (unknown exception)");
-				}
-				dvb::InstallGameEvents(g_server->Events());
-				dvb::StallWatchdog::Start(g_server->Events(), cfg.stallWatchdogMs);
-				dvb::ConsoleHook::Install(g_server->Events());  // observe console commands as events / for recording
-				dvb::ConsoleLogCapture::InstallPrintHook();     // every printed line reaches a console capture
-				dvb::CameraOrbit::Install();                    // camera action='orbit' holds the gameplay camera round the player
-
-				// Receive cross-plugin interface requests from ANY plugin (nullptr sender),
-				// so consumer mods' dispatches reach us (mirrors MergeMapper). Registered
-				// at kPostLoad, before consumers request at their kDataLoaded.
-				if (auto* m = SKSE::GetMessagingInterface())
-					m->RegisterListener(nullptr, OnInterfaceMessage);
-			}
-		}
 		// Register input hotkeys at kInputLoaded — BSInputDeviceManager is null at kPostLoad,
 		// so registering then silently no-ops. kInputLoaded fires once the input subsystem is up.
 		if (a_msg->type == SKSE::MessagingInterface::kInputLoaded && g_server) {
@@ -197,7 +246,7 @@ namespace
 
 		// Register the optional in-game menus at kDataLoaded (the frameworks are up by then). Each
 		// is inert if its framework isn't installed; both drive devbench via dvb::RunTool, so they
-		// need the server (g_server). SMF and FUCK are independent — host either, both, or neither.
+		// need committed server readiness. SMF and FUCK are independent — host either, both, or neither.
 		if (a_msg->type == SKSE::MessagingInterface::kDataLoaded && g_server) {
 			dvb::UI::Register();
 			dvb::UI::RegisterFuck();

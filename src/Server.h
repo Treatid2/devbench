@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "EventBus.h"
@@ -32,17 +34,32 @@ namespace dvb
 		ToolRegistry& Tools() { return m_registry; }
 		EventBus&     Events() { return m_events; }
 
-		/// Wire adapters and start listening (non-blocking). Idempotent.
+		/// Owner-only lifecycle; returns after actual bind/queue readiness, not
+		/// worker construction. Never call Start/Stop from a transport callback.
 		bool Start();
 		void Stop();
 		bool Running() const;
 
+		// Start builds the transport; PostLoad publishes only after required wiring.
+		// False revokes new MCP/session/catalogue/tool/REST requests without
+		// destroying escaped owners. Previously admitted work may finish; retained
+		// session IDs cannot admit new requests and retire through idle/owner Stop.
+		void SetReady(bool a_ready) noexcept;
+		bool Ready() const noexcept { return m_ready.load(); }
+		// Optional discovery/reporting, outside the required startup transaction.
+		void ReportDiscovery();
+
 	private:
+		void StopLocked();  // requires m_lifecycleMutex; drains before adapter reset
+		std::mutex                   m_lifecycleMutex;
 		std::string                  m_host;
 		int                          m_port;
 		ToolRegistry                 m_registry;
 		EventBus                     m_events;
-		std::unique_ptr<mcp::server> m_mcp;
+		std::atomic<bool>            m_ready{ false };
+		// Atomic shared snapshots let Running() inspect without taking the
+		// lifecycle mutex that Stop holds while joining transport callbacks.
+		std::shared_ptr<mcp::server> m_mcp;
 		std::unique_ptr<McpAdapter>  m_mcpAdapter;
 		std::unique_ptr<RestAdapter> m_restAdapter;
 	};

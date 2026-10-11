@@ -13,8 +13,9 @@ namespace dvb
 	// register tools / emit events into this host's registry and event bus.
 	namespace HostApi
 	{
-		// Wire the host interface to the registry + bus. Call once at kDataLoaded,
-		// before consumers request the interface (they do so at kPostLoad).
+		// Wire the host interface to a process-lifetime registry + bus at kPostLoad.
+		// Interface delivery is gated by committed PostLoad readiness; consumers
+		// request it at kDataLoaded, after every plugin's kPostLoad has finished.
 		void Init(ToolRegistry& a_registry, EventBus& a_events);
 
 		// Handle a DevBenchMessage::kMessage_GetInterface request. Call from the SKSE

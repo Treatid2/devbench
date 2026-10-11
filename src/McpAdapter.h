@@ -1,6 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
+#include "CallbackLease.h"
 
 namespace mcp
 {
@@ -18,12 +21,10 @@ namespace dvb
 	class McpAdapter
 	{
 	public:
-		McpAdapter(ToolRegistry& a_registry, EventBus& a_events, mcp::server& a_server);
+		McpAdapter(ToolRegistry& a_registry, EventBus& a_events, mcp::server& a_server, const std::atomic<bool>& a_ready);
 
-		// Unsubscribe from the bus before we're destroyed — the bus worker thread (which outlives
-		// this adapter: Server destroys the adapter before the EventBus) must not call our
-		// subscriber after `this`/the server reference are gone. Unsubscribe barriers on any
-		// in-flight delivery, so this is a clean cutoff.
+		// Revoke copied registry/bus callbacks before removing registrations. The
+		// transport must outlive this retirement, including any admitted callback.
 		~McpAdapter();
 
 		void Wire();
@@ -32,7 +33,9 @@ namespace dvb
 		ToolRegistry& m_registry;
 		EventBus&     m_events;
 		mcp::server&  m_server;
+		const std::atomic<bool>& m_ready;
 		uint64_t      m_sub = 0;
+		std::shared_ptr<CallbackLease<McpAdapter>> m_callbacks;
 		// Initial wiring registers every existing tool; only AFTER that do (re)registrations mean a
 		// real change worth a notifications/tools/list_changed broadcast. Set true at the end of Wire().
 		bool m_announceChanges = false;
