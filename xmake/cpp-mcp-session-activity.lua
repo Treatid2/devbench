@@ -7,12 +7,37 @@ function main()
 return {
     header = {
         {
+            from = "        unsigned int threadpool_size{ std::thread::hardware_concurrency() };",
+            to = [[        unsigned int threadpool_size{ std::thread::hardware_concurrency() };
+        // Host qualification seam. Must create the supplied function exactly
+        // once asynchronously and return its owned joinable thread; no inline
+        // execution, foreign worker or detached substitute is permitted.
+        std::function<std::thread(std::function<void()>)> startup_thread_factory{
+            [](std::function<void()> body) { return std::thread(std::move(body)); }
+        };]],
+        },
+        {
+            from = "    thread_pool thread_pool_;",
+            to = "    std::function<std::thread(std::function<void()>)> startup_thread_factory_;\n    thread_pool thread_pool_;",
+        },
+        {
             from = "#define MCP_SERVER_H",
-            to = '#define MCP_SERVER_H\n#include "ContainedThreadEntry.h"\n#include "SessionCapacityAdmission.h"\n#include "SessionInitializationState.h"\n#include "SessionRegistrationRollback.h"\n#include "SseProviderPump.h"\n#include "ImmutableCallbackSnapshot.h"',
+            to = '#define MCP_SERVER_H\n#include <future>\n#include "ContainedThreadEntry.h"\n#include "SessionCapacityAdmission.h"\n#include "SessionInitializationState.h"\n#include "SessionRegistrationRollback.h"\n#include "SseProviderPump.h"\n#include "ImmutableCallbackSnapshot.h"',
         },
         {
             from = "    bool running_ = false;",
-            to = "    dvb::ContainedThreadEntry thread_entry_state_;\n    bool session_admission_open_{false};  // protected by mutex_\n    std::atomic<bool> running_{false};",
+            to = [[    // Lifecycle is owner-only; callbacks must not reenter Start/Stop.
+    std::mutex lifecycle_mutex_;
+    void stop_locked();
+    bool routes_ready_{false};
+    bool routes_failed_{false};
+    dvb::HttpListenerStartup::Token active_startup_token_{0};
+    dvb::ContainedThreadEntry thread_entry_state_;
+    std::atomic<std::uint64_t> entry_failure_baseline_{0};
+    std::atomic<std::uint64_t> pool_failure_baseline_{0};
+    std::atomic<bool> bind_failed_{false};
+    bool session_admission_open_{false};  // protected by mutex_
+    std::atomic<bool> running_{false};]],
         },
         {
             from = [[    // SSE thread
@@ -25,7 +50,7 @@ return {
         },
         {
             from = "    bool is_running() const;",
-            to = "    bool is_running() const;\n    std::uint64_t worker_entry_failures() const noexcept { return thread_entry_state_.Failures(); }",
+            to = "    bool is_running() const;\n    std::uint64_t worker_entry_failures() const noexcept { return thread_entry_state_.Failures(); }\n    bool last_start_bind_failed() const noexcept { return bind_failed_.load(std::memory_order_acquire); }",
         },
         {
             from = "    // Get the last activity time",
@@ -106,17 +131,12 @@ private:
     },
     source = {
         {
-            from = [[    session_cleanup_handler_[key] = handler;]],
-            to = [[    dvb::UpdateCallbackSnapshot(session_cleanup_handler_, key, std::move(handler));]],
+            from = "    , thread_pool_(conf.threadpool_size)",
+            to = "    , startup_thread_factory_(conf.startup_thread_factory)\n    , thread_pool_(conf.threadpool_size)",
         },
         {
-            from = [[    LOG_INFO("Starting MCP server on ", host_, ":", port_);]],
-            to = [[    thread_pool_.restart();
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        session_admission_open_ = true;
-    }
-    LOG_INFO("Starting MCP server on ", host_, ":", port_);]],
+            from = [[    session_cleanup_handler_[key] = handler;]],
+            to = [[    dvb::UpdateCallbackSnapshot(session_cleanup_handler_, key, std::move(handler));]],
         },
         {
             from = [[        auto mcp_req = parse_jsonrpc_message(items[0]);
@@ -199,76 +219,13 @@ private:
         }]],
         },
         {
-            from = [[        maintenance_thread_ = std::make_unique<std::thread>([this]() {
-            while (true) {
-                // Check inactive sessions every 10 seconds
-                std::unique_lock<std::mutex> lock(maintenance_mutex_);
-                auto should_exit = maintenance_cond_.wait_for(lock, std::chrono::seconds(10), [this] {
-                    return !maintenance_thread_run_;
-                });
-                if (should_exit) {
-                    LOG_INFO("Maintenance thread exiting");
-                    return;
-                }
-                lock.unlock();
-
-                try {
-                    check_inactive_sessions();
-                } catch (const std::exception& e) {
-                    LOG_ERROR("Exception in maintenance thread: ", e.what());
-                } catch (...) {
-                    LOG_ERROR("Unknown exception in maintenance thread");
-                }
-            }
-        });]],
-            to = [[        maintenance_thread_ = std::make_unique<std::thread>([this]() noexcept {
-            (void)thread_entry_state_.Run([this]() {
-                while (true) {
-                    // Check inactive sessions every 10 seconds
-                    std::unique_lock<std::mutex> lock(maintenance_mutex_);
-                    auto should_exit = maintenance_cond_.wait_for(lock, std::chrono::seconds(10), [this] {
-                        return !maintenance_thread_run_;
-                    });
-                    if (should_exit) {
-                        LOG_INFO("Maintenance thread exiting");
-                        return;
-                    }
-                    lock.unlock();
-
-                    try {
-                        check_inactive_sessions();
-                    } catch (const std::exception& e) {
-                        LOG_ERROR("Exception in maintenance thread: ", e.what());
-                    } catch (...) {
-                        LOG_ERROR("Unknown exception in maintenance thread");
-                    }
-                }
-            });
-        });]],
-        },
-        {
-            from = [[        server_thread_ = std::make_unique<std::thread>([this]() {
-            LOG_INFO("Starting server in separate thread");
-            if (!http_server_->listen(host_.c_str(), port_)) {
-                LOG_ERROR("Failed to start server on ", host_, ":", port_);
-                running_ = false;
-                return;
-            }
-        });]],
-            to = [[        server_thread_ = std::make_unique<std::thread>([this]() noexcept {
-            (void)thread_entry_state_.Run([this]() {
-                LOG_INFO("Starting server in separate thread");
-                if (!http_server_->listen(host_.c_str(), port_)) {
-                    LOG_ERROR("Failed to start server on ", host_, ":", port_);
-                    running_ = false;
-                    return;
-                }
-            });
-        });]],
-        },
-        {
             from = "bool server::is_running() const {\n    return running_;\n}",
-            to = "bool server::is_running() const {\n    return running_.load(std::memory_order_acquire) && !thread_entry_state_.Failed();\n}",
+            to = [[bool server::is_running() const {
+    return running_.load(std::memory_order_acquire) &&
+        thread_entry_state_.Failures() == entry_failure_baseline_.load(std::memory_order_acquire) &&
+        thread_pool_.worker_failures() == pool_failure_baseline_.load(std::memory_order_acquire) &&
+        http_server_->listener_startup_ready();
+}]],
         },
         {
             from = "    // Validate session for non-initialize requests\n    if (!is_initialize) {",

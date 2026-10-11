@@ -205,6 +205,15 @@ private:
   bool listener_startup_ready() const { return listener_startup_.Ready(); }]],
         },
         {
+            from = "  void wait_until_ready() const;",
+            to = [[  void wait_until_ready() const;
+  // Owner-only, after joining the previous listener and before another bind.
+  void reset_listener_after_join() {
+    listener_startup_.Cancel();
+    is_decommisioned = false;
+  }]],
+        },
+        {
             from = "  std::atomic<bool> is_running_{false};",
             to = "  dvb::HttpListenerStartup listener_startup_;\n  std::atomic<bool> is_running_{false};",
         },
@@ -248,6 +257,8 @@ private:
         { from = sse_original:gsub("\r\n", "\n"):gsub("\n$", ""), to = sse_owned },
     })
     for _, replacement in ipairs({
+        { original = "cpp-mcp-start-original.cpp", owned = "PinnedMcpStart.inc" },
+        { original = "cpp-mcp-stdio-original.cpp", owned = "PinnedMcpStdio.inc" },
         { original = "cpp-mcp-stop-original.cpp", owned = "PinnedMcpStop.inc" },
         { original = "cpp-mcp-close-session-original.cpp", owned = "PinnedMcpCloseSession.inc" },
     }) do

@@ -26,3 +26,25 @@ Four cases exercise the production transport/dispatcher:
 
 These transport assertions do not prove game-state restoration. Application
 lease cleanup, requester runtime acceptance and review verdict remain separate.
+
+## Startup transaction source fixtures
+
+Eight new cases in McpStartupTransaction_test.cpp use only their own loopback
+port37392: actual bind refusal/free-port retry and repeated stop/start; thrown
+HTTP queue construction with one explicit retry and preserved historical count;
+null queue; blocking start stopped by another owner; fail-closed embedded stdio;
+partial invalid-regex route registration refusing graph reuse; and injected first
+or second worker creation failure. Factories must return the owned joinable thread
+running the supplied body exactly once asynchronously, never inline or detached.
+These are authored source cases, NOT compiled/executed evidence. The dependency
+configuration seam is not a DevBench tool or permission to create runtime workers.
+
+No test may attach to a game, delete a foreign session or retry arbitrary production
+failure. Named injected failures permit the one explicit fixture retry described
+above. Existing330s session fixture deadline needs a separately assessed larger
+budget before running the aggregate with startup cases: their preparation wait is
+30s each and cannot be silently treated as zero or squeezed into the old budget.
+The manager does not run this executable; Broker compilation and requester-owned
+host qualification remain distinct stages. Persistent Mapping environments need
+no restart for these standalone host fixtures. A future installed startup candidate
+does require changed-component/startup qualification coordinated by runtime owners.

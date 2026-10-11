@@ -1,6 +1,12 @@
-// Owner-thread only. The full startup transaction must serialize Start/Stop;
-// no application callback may call this drain from an owned worker.
+// Owner-thread only; never reenter from a transport task or cleanup callback.
 void server::stop() {
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+    stop_locked();
+}
+
+// Requires lifecycle_mutex_; Start rollback uses the same drain without taking
+// that mutex recursively. Callback and dependency owners must still be alive.
+void server::stop_locked() {
     // Even a failed listener may leave owned workers: never return on !running_.
     running_.store(false, std::memory_order_release);
     {
@@ -25,6 +31,9 @@ void server::stop() {
     if (server_thread_ && server_thread_->joinable()) server_thread_->join();
     maintenance_thread_.reset();
     server_thread_.reset();
+    // A failed listener can set decommissioned after the first stop signal.
+    // Reset only after joining it, never while an old listener can still write.
+    http_server_->reset_listener_after_join();
     thread_pool_.shutdown();
 
     // No workers remain. Extract one node at a time without allocating a new

@@ -38,26 +38,6 @@ namespace
 	std::chrono::steady_clock::time_point g_recCacheAt{};
 	bool                                  g_recCacheValid = false;
 
-	// True if 127.0.0.1:port can be bound (i.e. it's free). WSAStartup is ref-counted,
-	// so pairing it with WSACleanup here is safe whether or not winsock is already up.
-	bool PortAvailable(const std::string& a_host, int a_port)
-	{
-		WSADATA      wsa;
-		const bool   started = ::WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
-		bool         available = true;
-		const SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-		if (s != INVALID_SOCKET) {
-			sockaddr_in addr{};
-			addr.sin_family = AF_INET;
-			addr.sin_port = ::htons(static_cast<u_short>(a_port));
-			::inet_pton(AF_INET, a_host.c_str(), &addr.sin_addr);
-			available = ::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
-			::closesocket(s);
-		}
-		if (started)
-			::WSACleanup();
-		return available;
-	}
 
 	// %LOCALAPPDATA% survives a VFS mod manager's Data virtualization (MO2's overwrite folder
 	// swallows writes to Data/SKSE/Plugins/devbench); per-game subfolder since SE and VR run
@@ -116,94 +96,85 @@ namespace dvb
 
 	bool Server::Start()
 	{
-		if (m_mcp)
+		std::lock_guard lifecycle(m_lifecycleMutex);
+		if (const auto current = std::atomic_load(&m_mcp); current && current->is_running())
 			return true;
-
-		// Find a free port starting at the configured one (a second instance or an
-		// occupied port just moves to the next). The bound port is written to
-		// runtime.json so fixed-URL clients can discover a non-default choice.
+		StopLocked();  // a failed retained owner must not masquerade as success
 		constexpr int kMaxTries = 16;
-		int           chosen = m_port;
-		for (int i = 0; i < kMaxTries; ++i) {
-			if (PortAvailable(m_host, m_port + i)) {
-				chosen = m_port + i;
-				break;
+		for (int offset = 0; offset < kMaxTries; ++offset) {
+			// Avoid overflow/out-of-range ports before creating any transport owner.
+			if (m_port < 1 || m_port > 65535 - offset)
+				return false;
+			const int chosen = m_port + offset;
+			try {
+				mcp::server::configuration cfg;
+				cfg.host = m_host;
+				cfg.port = chosen;
+				cfg.name = "devbench";
+				cfg.version = DEVBENCH_VERSION_STRING;
+				auto candidate = std::make_shared<mcp::server>(cfg);
+				std::atomic_store(&m_mcp, candidate);
+				candidate->set_server_info(cfg.name, cfg.version);
+				candidate->set_capabilities(json{ { "tools", json{ { "listChanged", true } } }, { "logging", json::object() } });
+
+				m_mcpAdapter = std::make_unique<McpAdapter>(m_registry, m_events, *candidate, m_ready);
+				m_mcpAdapter->Wire();
+				m_restAdapter = std::make_unique<RestAdapter>(m_registry, m_events, m_ready);
+				auto* http = candidate->http();
+				if (!http)
+					throw std::runtime_error("DevBench HTTP owner unavailable");
+				http->set_read_timeout(2, 0);
+				m_restAdapter->Mount(*http);
+				if (!candidate->start(false)) {
+					const bool bindFailed = candidate->last_start_bind_failed();
+					StopLocked();
+					// Only an actual bind refusal advances the existing finite port
+					// selection. Worker/route/readiness failures are not replayed.
+					if (bindFailed) continue;
+					return false;
+				}
+				// Publish only the actual held, prepared endpoint. Tool/menu
+				// admission still requires PostLoad SetReady(true).
+				g_boundPort.store(chosen);
+				try { logs::info("devbench: server on {}:{} — listening (mcp + rest)", m_host, chosen); }
+				catch (...) {} // optional reporting cannot turn success into a retry
+				return true;
+			} catch (...) {
+				StopLocked();
+				try { logs::error("devbench: server startup failed"); } catch (...) {}
+				return false;
 			}
 		}
-
-		// This cpp-mcp revision takes a configuration struct (host/port are no
-		// longer positional ctor args).
-		mcp::server::configuration cfg;
-		cfg.host = m_host;
-		cfg.port = chosen;
-		cfg.name = "devbench";
-		cfg.version = DEVBENCH_VERSION_STRING;
-
-		m_mcp = std::make_unique<mcp::server>(cfg);
-		m_mcp->set_server_info(cfg.name, cfg.version);
-		// tools.listChanged: tools are added at runtime (cross-plugin consumers register kinds/menus),
-		// so advertise the capability and emit notifications/tools/list_changed when the set changes —
-		// a client that connected before a mod (or the game) finished loading then refreshes its list.
-		m_mcp->set_capabilities(json{ { "tools", json{ { "listChanged", true } } }, { "logging", json::object() } });
-
-		// MCP tools + notifications.
-		m_mcpAdapter = std::make_unique<McpAdapter>(m_registry, m_events, *m_mcp, m_ready);
-		m_mcpAdapter->Wire();
-
-		// REST facade on the same httplib server (constructed in mcp::server's ctor,
-		// so http() is valid here; cpp-mcp adds its own routes during start()).
-		m_restAdapter = std::make_unique<RestAdapter>(m_registry, m_events, m_ready);
-		if (auto* http = m_mcp->http()) {
-			// httplib's default 5s read timeout applies even to a bodyless POST (no
-			// Content-Length/chunked header) — it waits for a body that will never come
-			// before giving up with an empty 400. Shorten this so that mistake fails fast
-			// instead of stalling; GET /api/health is the real fix for liveness checks.
-			http->set_read_timeout(2, 0);
-			m_restAdapter->Mount(*http);
-		} else
-			logs::warn("devbench: cpp-mcp http() returned null; REST facade unavailable");
-
-		// Publish the chosen port before start() spawns the listener, so a health/inspect
-		// hit racing startup reads the right port rather than 0.
-		g_boundPort.store(chosen);
-		// Tool admission and the menu registry remain unpublished until PostLoad
-		// commits its required consumer/hook stages via SetReady(true).
-		const bool ok = m_mcp->start(false);  // non-blocking; spawns the listener thread
-		if (!ok) {
-			// Tear down the constructed-but-not-listening members: the `if (m_mcp)` guard at
-			// the top treats a non-null m_mcp as "already started", so leaving them set would
-			// make a later Start() return true without a live listener. Reset the port too, or
-			// it would advertise a live bridge for a server that never came up.
-			g_boundPort.store(0);
-			g_registry.store(nullptr);
-			m_restAdapter.reset();
-			m_mcpAdapter.reset();
-			m_mcp.reset();
-		}
-		logs::info("devbench: server on {}:{} — {}", m_host, chosen, ok ? "listening (mcp + rest)" : "FAILED to start");
-		return ok;
+		return false;
 	}
 
 	void Server::Stop()
 	{
+		std::lock_guard lifecycle(m_lifecycleMutex);
+		StopLocked();
+	}
+
+	void Server::StopLocked()
+	{
 		SetReady(false);
 		CalendarControl::RequestStop();
-		if (m_mcp) {
-			m_mcp->stop();
-		}
-		// Adapter callbacks reference the transport. Retire them while it is still
-		// alive, not after destroying it. Listener/worker rollback is a separate
-		// requirement: this ordering alone does not certify pinned stop() quiescence.
+		const auto transport = std::atomic_load(&m_mcp);
+		if (transport)
+			transport->stop();
+		// Every HTTP/core handler is drained before destroying its callback
+		// owners. Concurrent Running() retains only a read-only transport snapshot,
+		// never this lifecycle lock or a new request/admission lease.
 		m_restAdapter.reset();
 		m_mcpAdapter.reset();
-		m_mcp.reset();
+		std::atomic_store(&m_mcp, std::shared_ptr<mcp::server>{});
 		g_boundPort.store(0);
 		g_registry.store(nullptr);
 	}
 
 	bool Server::Running() const
 	{
-		return m_mcp && m_mcp->is_running();
+		const auto transport = std::atomic_load(&m_mcp);
+		return transport && transport->is_running();
 	}
 
 	void Server::SetReady(bool a_ready) noexcept
