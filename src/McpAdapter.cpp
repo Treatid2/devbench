@@ -29,10 +29,16 @@ namespace dvb
 		// registration listener) tools added later by cross-plugin consumers at kPostLoad.
 		auto registerOne = [lease = m_callbacks](const ToolDescriptor& a_desc) {
 			lease->Invoke([&](McpAdapter& self) {
+				// Notifications occur after the registry commit and can arrive out of
+				// order. Re-read inside serialized publication: a delayed older callback
+				// must not leave discovery behind the handler selected by Invoke(name).
+				const auto current = self.m_registry.Describe(a_desc.name);
+				if (!current)
+					return;
 				mcp::tool t;
-				t.name = a_desc.name;
-				t.description = a_desc.description;
-				t.parameters_schema = a_desc.inputSchema;
+				t.name = current->name;
+				t.description = current->description;
+				t.parameters_schema = current->inputSchema;
 
 				// Handlers need the registry, not the adapter address. Its Server
 				// owner must outlive all transport handlers and escaped consumers.

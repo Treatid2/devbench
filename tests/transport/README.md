@@ -9,7 +9,8 @@ recipe. Compile success alone is not an assertion pass.
 The receiving task may run the returned aggregate executable once in isolation
 with a bounded 660-second process deadline. The session cases start their own
 loopback server on port37391; the startup cases use port37392, and the new
-committed-admission/real-adapter cases use port37393.
+committed-admission/real-adapter cases use port37393; the new same-name replacement
+fixture uses port37394.
 An occupied port is a failure, never permission to use that listener. Preserve
 exit code, stdout/stderr, exact executable hash and its source/build receipt.
 Do not run this fixture concurrently with another copy.
@@ -38,7 +39,7 @@ null queue; blocking start stopped by another owner; fail-closed embedded stdio;
 partial invalid-regex route registration refusing graph reuse; and injected first
 or second worker creation failure. Factories must return the owned joinable thread
 running the supplied body exactly once asynchronously, never inline or detached.
-These cases compiled at exact ed16b82; no assertion execution is claimed here. The dependency
+These cases compiled at exact aa5b857; no assertion execution is claimed here. The dependency
 configuration seam is not a DevBench tool or permission to create runtime workers.
 
 No test may attach to a game, delete a foreign session or retry arbitrary production
@@ -56,7 +57,7 @@ host qualification remain distinct stages. Persistent Mapping environments need
 no restart for these standalone host fixtures. A future installed startup candidate
 does require changed-component/startup qualification coordinated by runtime owners.
 
-## Review correction fixtures (not covered by the ed16 artifacts)
+## Review correction fixtures and qualification identity
 
 McpCommittedAdmission_test.cpp compiles the actual McpAdapter and ToolRegistry
 production translation units with the existing host-only logs stub. It uses the
@@ -76,3 +77,23 @@ deadlock still requires the requester's hard process deadline and owned-process
 cancellation, never an unsafe detached worker. Preserve any original failure;
 do not automatically replay. New compiled-source receipts are required before
 requester execution or claiming these fixtures ran.
+
+All three compiler attempts at aa5b85737c39253c7d56e2da440f417635aebb8f /
+treec6bcf5e3bd0372ff31af6f75baa1c0522b4ed0b1 exited zero once. Its transport
+log explicitly compiles both public-admission fixture TUs and the actual adapter/
+registry. Host/transport outer jobs succeeded; production outer NONZERO_EXIT from
+post-publication scratch-release lock timeout remains preserved with separate
+successful cleanup reconciliation, no compiler replay. All assertions remain
+unrun in these compile receipts. This is not the predecessor ed16 host-publication
+recovery narrative, nor proof that the later source changes below compiled.
+
+McpReplacementPublication_test.cpp adds ONE later source case on its own37394
+loopback server: a barrier after older registry commit forces the newer same-name
+replacement callback to publish first and the older callback last. It wraps the
+actual adapter callback through narrow friend access, not a substitute adapter.
+Final registry descriptor, real tools/list schema and tools/call handler/value
+must agree. No CHECK on worker threads;3s entered/5s release waits and1s connect/
+2s read bounds, no detached timeout helper. Current660s aggregate hard deadline
+is unchanged. This changed-source fixture needs its own exact compile receipt;
+do not substitute the older aa5 EXE or repeat a completed qualification. The
+aggregate source declaration count becomes17, not an assertion-result count.

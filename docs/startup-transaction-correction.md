@@ -35,7 +35,7 @@ its retained token, never acquire locks, reenter the server or perform callbacks
 
 Revocation refuses new requests on retained IDs as well as new initialization;
 already admitted work may finish. Existing sessions retire through normal idle
-expiry or owned Stop. Client DELETE is refused while quarantined, not replaced
+expiry, provider completion or owned Stop. Client DELETE is refused while quarantined, not replaced
 with guessed deletion or a global reset. Inert CORS OPTIONS remains available and
 proves neither MCP admission nor commitment. Irreversible PostLoad cannot recommit
 automatically. These are admission rules, not cancellation or bounded-drain promises.
@@ -59,6 +59,13 @@ existing get_tools snapshot already holds that mutex. Formatting and application
 callbacks run after unlocking. In particular, a tool may register another tool
 without recursively acquiring a held catalogue mutex. Adapter retirement leases
 protect lifetime; they do not substitute for collection synchronization.
+
+Registry commits and post-commit listener notifications can complete in different
+orders. The serialized MCP adapter therefore treats the supplied descriptor as a
+name notification and re-reads the registry's current descriptor inside publication.
+A delayed older replacement cannot permanently overwrite the final schema while
+Invoke-by-name uses a newer handler. This is convergence after registrations and
+callbacks finish, not instantaneous atomic discovery/dispatch across both objects.
 
 The real EventBus takes its delivery barrier before copying a subscriber batch.
 Unsubscribe removes the subscriber under the state mutex, releases that mutex,
@@ -149,18 +156,25 @@ or injected failed publication and the same retained readiness token. The fixtur
 does not execute SKSE hooks or claim a game-level publication test. Compilation,
 requester assertions and a hash-distinct successor review remain separate stages.
 
-Exact native/test/recipe candidate
-`ed16b82d7bedc7d2f9e709599e5bf3e355935385`, tree
-`0fbd06bbf4fcb64008069ce1aca4bd2a319ac939`, compiled once per target under exact
-Broker assessment: production, pure host and standalone transport. Production
-and transport qualification succeeded. Pure-host compilation succeeded, but
-its outer publication job failed; the Broker recovered the original EXE/PDB
-without compiling again. That recovery is supplemental artifact custody, not
-a rewritten outer result or replacement canonical qualification PASS.
-Subsequent documentation-only composition must keep its distinct head and
-prove unchanged compiled-source closure instead of relabelling these artifacts.
+Latest issued historical candidate
+`aa5b85737c39253c7d56e2da440f417635aebb8f`, tree
+`c6bcf5e3bd0372ff31af6f75baa1c0522b4ed0b1`, compiled once per target under exact
+Broker assessment: production, pure host and standalone transport. All three
+compiler attempts exited zero; host and transport qualification/outer jobs
+succeeded. Production artifacts and qualification succeeded, but its original
+outer job remained NONZERO_EXIT when post-publication scratch release timed out.
+Separate owned cleanup reconciliation succeeded without compiler replay or
+rewriting that original outcome. Assertions were NOT RUN by that qualification.
 
-Source checks verified 28 MCP and 17 HTTP unique pinned projections and exact
+The current same-name replacement correction and its new deterministic fixture
+are later source changes: aa5 artifacts do not qualify them. Their exact issued
+commit/tree must be bound after fresh Broker qualification. A subsequent
+documentation-only composition must keep its distinct head and prove unchanged
+non-document compiled closure instead of relabelling or rebuilding artifacts.
+Earlier ed16 host-publication recovery remains historical only, not the failure
+lane or current source qualification described above.
+
+The aa5 source checks verified36 unique MCP projections and exact
 source/control correspondence. The focused host sources exercise production
 phase, callback, bus, pool, socket, session and provider ownership primitives.
 The standalone transport target additionally exercises actual bind refusal,
@@ -168,6 +182,13 @@ repeated Stop/Start, throwing/null HTTP queue creation, blocking Start/Stop,
 stdio refusal, partial-route poison and either startup-thread creation failure.
 Successful owned fixture startup is a throwing prerequisite before any public
 OPTIONS request, so failed startup never authorizes contacting another listener.
+
+The new replacement fixture wraps the actual installed registration listener
+through a narrow friend accessor (no runtime diagnostic hook), delays the older
+callback after its commit, lets a later same-name schema/handler commit and publish,
+then releases the older callback. Public tools/list and tools/call must agree on
+the final generation after both calls complete. Promise waits, own socket timeouts
+and requester hard process deadline are finite; no detached fixture worker.
 
 Compilation is not assertion execution. The owner has not run these candidates;
 the requester owns bounded host/transport execution and runtime acceptance.
