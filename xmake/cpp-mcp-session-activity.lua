@@ -9,6 +9,9 @@ return {
         {
             from = "        unsigned int threadpool_size{ std::thread::hardware_concurrency() };",
             to = [[        unsigned int threadpool_size{ std::thread::hardware_concurrency() };
+        // Immutable embedding gate: read only its retained readiness token.
+        // No reentry/locks; standalone default admits after listener readiness.
+        std::function<bool()> request_admission{ []() noexcept { return true; } };
         // Host qualification seam. Must create the supplied function exactly
         // once asynchronously and return its owned joinable thread; no inline
         // execution, foreign worker or detached substitute is permitted.
@@ -18,7 +21,7 @@ return {
         },
         {
             from = "    thread_pool thread_pool_;",
-            to = "    std::function<std::thread(std::function<void()>)> startup_thread_factory_;\n    thread_pool thread_pool_;",
+            to = "    const std::function<bool()> request_admission_;\n    std::function<std::thread(std::function<void()>)> startup_thread_factory_;\n    thread_pool thread_pool_;",
         },
         {
             from = "#define MCP_SERVER_H",
@@ -50,7 +53,20 @@ return {
         },
         {
             from = "    bool is_running() const;",
-            to = "    bool is_running() const;\n    std::uint64_t worker_entry_failures() const noexcept { return thread_entry_state_.Failures(); }\n    bool last_start_bind_failed() const noexcept { return bind_failed_.load(std::memory_order_acquire); }",
+            to = [[    bool is_running() const;
+    // Per-request admission, not cancellation of already admitted work.
+    bool requests_admitted() const noexcept {
+        try { return request_admission_(); } catch (...) { return false; }
+    }
+    bool admit_http_request(httplib::Response& response) const {
+        if (requests_admitted()) return true;
+        response.status = 503;
+        response.set_header("Access-Control-Allow-Origin", "*");
+        response.set_content("{\"error\":\"Server not ready\"}", "application/json");
+        return false;
+    }
+    std::uint64_t worker_entry_failures() const noexcept { return thread_entry_state_.Failures(); }
+    bool last_start_bind_failed() const noexcept { return bind_failed_.load(std::memory_order_acquire); }]],
         },
         {
             from = "    // Get the last activity time",
@@ -131,8 +147,42 @@ private:
     },
     source = {
         {
+            from = "json server::process_request(const request& req, const std::string& session_id) {",
+            to = [[json server::process_request(const request& req, const std::string& session_id) {
+    // Includes initialize, initialized-notification and built-in catalogue.
+    if (!requests_admitted()) {
+        if (req.is_notification()) return json::object();
+        return response::create_error(req.id, error_code::invalid_request,
+                                      "Server not ready").to_json();
+    }]],
+        },
+        {
+            from = "void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res) {",
+            to = "void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res) {\n    if (!admit_http_request(res)) return;",
+        },
+        {
+            from = "void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res) {",
+            to = "void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res) {\n    if (!admit_http_request(res)) return;",
+        },
+        {
+            from = "void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res) {",
+            to = "void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res) {\n    if (!admit_http_request(res)) return;",
+        },
+        {
+            from = "void server::handle_mcp_delete(const httplib::Request& req, httplib::Response& res) {",
+            to = "void server::handle_mcp_delete(const httplib::Request& req, httplib::Response& res) {\n    if (!admit_http_request(res)) return;",
+        },
+        {
+            from = "            try {\n                if (dispatcher->is_closed() || !running_)",
+            to = "            try {\n                if (dispatcher->is_closed() || !running_ || !requests_admitted())",
+        },
+        {
+            from = "                if (!result) {\n                    if (dispatcher->is_closed() || !running_)",
+            to = "                if (!result) {\n                    if (dispatcher->is_closed() || !running_ || !requests_admitted())",
+        },
+        {
             from = "    , thread_pool_(conf.threadpool_size)",
-            to = "    , startup_thread_factory_(conf.startup_thread_factory)\n    , thread_pool_(conf.threadpool_size)",
+            to = "    , request_admission_(conf.request_admission)\n    , startup_thread_factory_(conf.startup_thread_factory)\n    , thread_pool_(conf.threadpool_size)",
         },
         {
             from = [[    session_cleanup_handler_[key] = handler;]],
@@ -212,7 +262,7 @@ private:
             session_dispatchers_[session_id] = session_dispatcher;
         }]],
             to = [[        bool admission_closed = false;
-        if (!dvb::AdmitSession(session_dispatchers_, mutex_, max_sessions_, session_id, session_dispatcher, &session_admission_open_, &admission_closed)) {
+        if (!dvb::AdmitSession(session_dispatchers_, mutex_, max_sessions_, session_id, session_dispatcher, &session_admission_open_, &admission_closed, &request_admission_)) {
             res.status = 503;
             res.set_content(admission_closed ? "{\"error\":\"Server stopping\"}" : "{\"error\":\"Too many sessions\"}", "application/json");
             return;

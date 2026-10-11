@@ -261,6 +261,7 @@ private:
         { original = "cpp-mcp-stdio-original.cpp", owned = "PinnedMcpStdio.inc" },
         { original = "cpp-mcp-stop-original.cpp", owned = "PinnedMcpStop.inc" },
         { original = "cpp-mcp-close-session-original.cpp", owned = "PinnedMcpCloseSession.inc" },
+        { original = "cpp-mcp-register-tool-original.cpp", owned = "PinnedMcpRegisterTool.inc" },
     }) do
         local original = io.readfile(path.join(os.projectdir(), "xmake", replacement.original))
         local owned = io.readfile(path.join(os.projectdir(), "src", replacement.owned))

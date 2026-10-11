@@ -2,6 +2,7 @@
 // The .inc suffix excludes this fragment from the src/**.cpp target glob.
 // cpp-mcp.lua guards the entire original before inserting it in namespace mcp.
 void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
+    if (!admit_http_request(res)) return;
     (void)req;
     const std::string session_id = generate_session_id();
     auto session_dispatcher = std::make_shared<event_dispatcher>();
@@ -16,7 +17,7 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
         catch (...) {} // Cleanup/logging exceptions cannot escape Response destruction.
     };
     bool admission_closed = false;
-    if (!dvb::AdmitSession(session_dispatchers_, mutex_, max_sessions_, session_id, session_dispatcher, &session_admission_open_, &admission_closed)) {
+    if (!dvb::AdmitSession(session_dispatchers_, mutex_, max_sessions_, session_id, session_dispatcher, &session_admission_open_, &admission_closed, &request_admission_)) {
         res.status = 503;
         res.set_content(admission_closed ? "{\"error\":\"Server stopping\"}" : "{\"error\":\"Too many sessions\"}", "application/json");
         return;
@@ -29,7 +30,7 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
             [this, session_dispatcher, pump, retire](size_t, httplib::DataSink& sink) {
                 const bool result = pump->Pump(
                     [this, &session_dispatcher]() {
-                        return running_.load(std::memory_order_acquire) && !session_dispatcher->is_closed();
+                        return running_.load(std::memory_order_acquire) && requests_admitted() && !session_dispatcher->is_closed();
                     },
                     [&sink](const std::string& message) { return sink.write(message.data(), message.size()); },
                     [&session_dispatcher, &sink]() {

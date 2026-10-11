@@ -86,3 +86,35 @@ TEST_CASE("concurrent session admission shares one remaining slot")
 	CHECK(admitted.load() == 1);
 	CHECK(sessions.size() == 1);
 }
+
+TEST_CASE("session insertion rechecks the retained startup token under the owner lock")
+{
+	std::map<std::string, int> sessions;
+	std::mutex mutex;
+	bool open = true;
+	bool ownerClosed = false;
+	std::atomic<bool> committed{ false };
+	const std::function<bool()> admission = [&]() noexcept { return committed.load(); };
+	CHECK(!dvb::AdmitSession(sessions, mutex, 1, "premature", 1, &open, &ownerClosed, &admission));
+	CHECK(ownerClosed);
+	CHECK(sessions.empty());
+	committed.store(true);
+	CHECK(dvb::AdmitSession(sessions, mutex, 1, "owned", 2, &open, &ownerClosed, &admission));
+	CHECK(!ownerClosed);
+	committed.store(false);
+	CHECK(!dvb::AdmitSession(sessions, mutex, 0, "quarantined", 3, &open, &ownerClosed, &admission));
+	CHECK(ownerClosed);
+	CHECK(sessions.size() == 1);
+	CHECK(sessions.at("owned") == 2);
+}
+
+TEST_CASE("throwing startup admission fails closed without consuming a session slot")
+{
+	std::map<std::string, int> sessions;
+	std::mutex mutex;
+	bool ownerClosed = false;
+	const std::function<bool()> admission = []() -> bool { throw std::runtime_error("injected admission failure"); };
+	CHECK(!dvb::AdmitSession(sessions, mutex, 1, "premature", 1, nullptr, &ownerClosed, &admission));
+	CHECK(ownerClosed);
+	CHECK(sessions.empty());
+}

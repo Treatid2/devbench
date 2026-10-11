@@ -7,9 +7,10 @@ custody. Build Broker must assess this new compile target and source-overlay
 recipe. Compile success alone is not an assertion pass.
 
 The receiving task may run the returned aggregate executable once in isolation
-with a bounded 600-second process deadline. The session cases start their own
-loopback server on port37391; the startup cases use port37392.
-an occupied port is a failure, never permission to use that listener. Preserve
+with a bounded 660-second process deadline. The session cases start their own
+loopback server on port37391; the startup cases use port37392, and the new
+committed-admission/real-adapter cases use port37393.
+An occupied port is a failure, never permission to use that listener. Preserve
 exit code, stdout/stderr, exact executable hash and its source/build receipt.
 Do not run this fixture concurrently with another copy.
 
@@ -45,7 +46,7 @@ failure. Named injected failures permit the one explicit fixture retry described
 above. The former 330-second session-only budget does not cover this aggregate.
 Its successful session lane already includes 180s of POST-only activity plus a
 35s admitted request and idle maintenance; startup preparation can wait 30s per
-case. The 600-second aggregate bound permits that finite additional work, but is
+case. The 660-second aggregate bound permits that finite additional work, but is
 still a hard deadline, not a guarantee that a failed drain terminates naturally.
 Preserve timeout/hang evidence and cancel only the owned standalone fixture
 through the requester's supported process wrapper; never target a game, foreign
@@ -54,3 +55,24 @@ The manager does not run this executable; Broker compilation and requester-owned
 host qualification remain distinct stages. Persistent Mapping environments need
 no restart for these standalone host fixtures. A future installed startup candidate
 does require changed-component/startup qualification coordinated by runtime owners.
+
+## Review correction fixtures (not covered by the ed16 artifacts)
+
+McpCommittedAdmission_test.cpp compiles the actual McpAdapter and ToolRegistry
+production translation units with the existing host-only logs stub. It uses the
+same PostLoadStartup controller and retained atomic token as production, but no
+SKSE hook implementation. Listening-before-publication, injected publication
+failure, commitment, retained-ID quarantine and single-slot non-consumption are
+checked through real /mcp POST, GET/DELETE, legacy /sse and /message entries.
+Predicate exceptions fail closed through the public HTTP route.
+
+Finite concurrent workers register160 tools and perform80 public catalogue and
+80 callable requests under a20s useful-work budget, with1s connection/2s read
+bounds and failure counters read after all joins. No harness CHECK runs in a
+worker. A real callable registers another tool, checking that catalogue locking
+is released before application code. These fixtures add a60s margin over the
+previous600s aggregate budget; they do not extend that budget dynamically. A
+deadlock still requires the requester's hard process deadline and owned-process
+cancellation, never an unsafe detached worker. Preserve any original failure;
+do not automatically replay. New compiled-source receipts are required before
+requester execution or claiming these fixtures ran.

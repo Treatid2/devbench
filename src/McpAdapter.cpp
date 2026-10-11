@@ -58,8 +58,8 @@ namespace dvb
 			registerOne(desc);
 
 		// Expose tools registered after wiring (cross-plugin consumers). Note: this can
-		// call register_tool from the main/message thread post-start; safe in practice
-		// because consumers register at kPostLoad, before any MCP client connects.
+		// call register_tool after clients connect. The pinned transport synchronizes
+		// catalogue reads and copies a callable before invoking it without its mutex.
 		m_registry.SetRegistrationListener(registerOne);
 		m_callbacks->Invoke([](McpAdapter& self) { self.m_announceChanges = true; });
 

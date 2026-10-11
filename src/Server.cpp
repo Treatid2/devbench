@@ -112,6 +112,9 @@ namespace dvb
 				cfg.port = chosen;
 				cfg.name = "devbench";
 				cfg.version = DEVBENCH_VERSION_STRING;
+				// Immutable transport policy references the same retained PostLoad token.
+				// Bind/queue readiness alone must not expose MCP sessions or the catalogue.
+				cfg.request_admission = [ready = &m_ready]() noexcept { return ready->load(); };
 				auto candidate = std::make_shared<mcp::server>(cfg);
 				std::atomic_store(&m_mcp, candidate);
 				candidate->set_server_info(cfg.name, cfg.version);

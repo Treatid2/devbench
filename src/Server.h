@@ -41,7 +41,9 @@ namespace dvb
 		bool Running() const;
 
 		// Start builds the transport; PostLoad publishes only after required wiring.
-		// False revokes new tool/REST admission without destroying escaped owners.
+		// False revokes new MCP/session/catalogue/tool/REST requests without
+		// destroying escaped owners. Previously admitted work may finish; retained
+		// session IDs cannot admit new requests and retire through idle/owner Stop.
 		void SetReady(bool a_ready) noexcept;
 		bool Ready() const noexcept { return m_ready.load(); }
 		// Optional discovery/reporting, outside the required startup transaction.

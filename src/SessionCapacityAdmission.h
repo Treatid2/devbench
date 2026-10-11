@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <mutex>
 #include <stdexcept>
 
@@ -13,12 +14,19 @@ namespace dvb
 	template<class Map>
 	bool AdmitSession(Map& sessions, std::mutex& mutex, std::size_t maximum,
 		const typename Map::key_type& id, const typename Map::mapped_type& dispatcher,
-		const bool* admissionOpen = nullptr, bool* ownerClosed = nullptr)
+		const bool* admissionOpen = nullptr, bool* ownerClosed = nullptr,
+		const std::function<bool()>* requestAdmission = nullptr)
 	{
 		std::lock_guard lock(mutex);
 		if (ownerClosed) *ownerClosed = false;
 		// If supplied, this flag is read/written only under this same owner mutex.
-		if (admissionOpen && !*admissionOpen) {
+		// The immutable embedding predicate must only read its retained readiness
+		// token; no reentry or locks/callback work under the session owner mutex.
+		// Exceptions fail closed before insertion and consume no session slot.
+		bool committed = true;
+		try { if (requestAdmission) committed = (*requestAdmission)(); }
+		catch (...) { committed = false; }
+		if ((admissionOpen && !*admissionOpen) || !committed) {
 			if (ownerClosed) *ownerClosed = true;
 			return false;
 		}
