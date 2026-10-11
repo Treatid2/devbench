@@ -151,7 +151,7 @@ private:
     local listener_owned = overlay_once(listener_original, {
         {
             from = "inline bool Server::listen_internal() {",
-            to = "inline bool Server::listen_internal() {\n  dvb::HttpListenerSocketOwner<socket_t> listener_owned(svr_sock_, INVALID_SOCKET, detail::shutdown_socket, detail::close_socket);",
+            to = "inline bool Server::listen_internal() {\n  dvb::HttpListenerSocketOwner<socket_t> listener_owned(svr_sock_, INVALID_SOCKET, detail::shutdown_socket, detail::close_socket);\n  const auto startup_token = listener_startup_.CurrentToken();\n  dvb::HttpListenerStartupExit startup_exit(listener_startup_, startup_token);",
         },
         {
             from = "  is_running_ = true;\n  auto se = detail::scope_exit([&]() { is_running_ = false; });",
@@ -159,7 +159,7 @@ private:
         },
         {
             from = "    std::unique_ptr<TaskQueue> task_queue(new_task_queue());",
-            to = "    std::unique_ptr<TaskQueue> task_queue(new_task_queue());\n    dvb::HttpListenerSocketOwner<socket_t> close_before_drain(svr_sock_, INVALID_SOCKET, detail::shutdown_socket, detail::close_socket);",
+            to = "    std::unique_ptr<TaskQueue> task_queue(new_task_queue());\n    dvb::HttpListenerSocketOwner<socket_t> close_before_drain(svr_sock_, INVALID_SOCKET, detail::shutdown_socket, detail::close_socket);\n    dvb::HttpListenerStartupExit fail_before_drain(listener_startup_, startup_token);\n    if (!task_queue) { return false; }\n    if (svr_sock_ != INVALID_SOCKET) { (void)listener_startup_.PublishReady(startup_token); }",
         },
         {
             from = "        if (svr_sock_ != INVALID_SOCKET) {\n          detail::close_socket(svr_sock_);",
@@ -183,6 +183,7 @@ private:
         { from = "    task_queue->shutdown();", to = "    (void)listener_owned.Close();\n    task_queue->shutdown();" },
     })
     local stop_owned = [[inline void Server::stop() {
+  listener_startup_.Cancel();
   dvb::HttpListenerSocketOwner<socket_t> bound_socket(svr_sock_, INVALID_SOCKET, detail::shutdown_socket, detail::close_socket);
   (void)bound_socket.Close();
   is_decommisioned = false;
@@ -190,7 +191,22 @@ private:
     http = overlay_once(http, {
         {
             from = "#define CPPHTTPLIB_HTTPLIB_H",
-            to = '#define CPPHTTPLIB_HTTPLIB_H\n#include "HttpTaskQueueOwnership.h"\n#include "HttpSocketOwner.h"\n#include "HttpListenerSocketOwner.h"',
+            to = '#define CPPHTTPLIB_HTTPLIB_H\n#include "HttpTaskQueueOwnership.h"\n#include "HttpSocketOwner.h"\n#include "HttpListenerSocketOwner.h"\n#include "HttpListenerStartup.h"',
+        },
+        {
+            from = "  bool listen_after_bind();",
+            to = [[  bool listen_after_bind();
+  // The transport owner serializes lifecycle and joins old workers before begin.
+  dvb::HttpListenerStartup::Token begin_listener_startup() { return listener_startup_.Begin(); }
+  bool wait_listener_startup_until(dvb::HttpListenerStartup::Token token,
+                                  dvb::HttpListenerStartup::Deadline deadline) {
+    return listener_startup_.WaitUntil(token, deadline);
+  }
+  bool listener_startup_ready() const { return listener_startup_.Ready(); }]],
+        },
+        {
+            from = "  std::atomic<bool> is_running_{false};",
+            to = "  dvb::HttpListenerStartup listener_startup_;\n  std::atomic<bool> is_running_{false};",
         },
         { from = http_original:gsub("\r\n", "\n"):gsub("\n$", ""), to = http_wrapper },
         { from = socket_original, to = socket_owned },
@@ -209,6 +225,8 @@ private:
         io.readfile(path.join(os.projectdir(), "src", "HttpSocketOwner.h")))
     io.writefile(path.join(out, "HttpListenerSocketOwner.h"),
         io.readfile(path.join(os.projectdir(), "src", "HttpListenerSocketOwner.h")))
+    io.writefile(path.join(out, "HttpListenerStartup.h"),
+        io.readfile(path.join(os.projectdir(), "src", "HttpListenerStartup.h")))
     io.writefile(path.join(out, "ContainedThreadEntry.h"),
         io.readfile(path.join(os.projectdir(), "src", "ContainedThreadEntry.h")))
     io.writefile(path.join(out, "SessionCapacityAdmission.h"),
