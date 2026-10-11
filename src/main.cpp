@@ -10,6 +10,7 @@
 #include "HostApi.h"
 #include "InputHotkeys.h"
 #include "McpLog.h"
+#include "RetainedLogInitialization.h"
 #include "KeyboardInput.h"
 #include "Recording.h"
 #include "RecordingsMenu.h"
@@ -32,26 +33,31 @@ namespace
 	// Not registry-owned: changing ordinary logLevel must not filter MCP detail.
 	// Process lifetime, like g_server; workers can still log during DLL teardown.
 	spdlog::logger* g_mcpLogger = nullptr;
-	bool g_retainedLogAvailable = false;
+	dvb::RetainedLogResult g_retainedLog;
 
-	void InitLogging() try
+	void InitLogging() noexcept
 	{
-		auto path = SKSE::log::log_directory();
-		if (!path)
-			return;
-		*path /= std::format("{}.log", SKSE::PluginDeclaration::GetSingleton()->GetName());
-
-		// Shared bounded retention: current5MiB plus three archives; preserve prior
-		// runs instead of truncating the only retained transport evidence at launch.
-		auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(path->string(), 5 * 1024 * 1024, 3, true);
-		auto log = std::make_shared<spdlog::logger>("global", std::move(sink));
-		log->set_level(spdlog::level::info);
-		log->flush_on(spdlog::level::info);
-		spdlog::set_default_logger(std::move(log));
-		spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%L] %v");
-		g_retainedLogAvailable = true;
+		g_retainedLog = dvb::InitializeRetainedLog(
+			[] {
+				auto path = SKSE::log::log_directory();
+				if (path) *path /= std::format("{}.log", SKSE::PluginDeclaration::GetSingleton()->GetName());
+				return path;
+			},
+			[](const auto& path) {
+				// One file owner: SKSE's automatic file logger is disabled below.
+				// Current5MiB plus three archives, preserving prior runs at launch.
+				return std::make_shared<spdlog::sinks::rotating_file_sink_mt>(path.string(), 5 * 1024 * 1024, 3, true);
+			},
+			[](auto sink) {
+				auto log = std::make_shared<spdlog::logger>("global", std::move(sink));
+				log->set_level(spdlog::level::info);
+				log->flush_on(spdlog::level::info);
+				log->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%L] %v");
+				return log;
+			},
+			[](auto log) { spdlog::set_default_logger(std::move(log)); });
+		if (!g_retainedLog.Ready()) dvb::McpLog::NoteFailure();
 	}
-	catch (...) { dvb::McpLog::NoteFailure(); }  // unavailable disk logging must not abort load
 
 	void WriteMcpLog(dvb::McpLogLevel level, std::string_view text)
 	{
@@ -61,6 +67,19 @@ namespace
 		g_mcpLogger->log(levels[static_cast<unsigned>(level)], "[mcp] {}", text);
 	}
 
+	void ReportRetainedLogFailure() noexcept
+	{
+		try {
+			const auto message = std::format("devbench: MCP retained logging unavailable: stage={} error={} code={}",
+				dvb::RetainedLogStageName(g_retainedLog.stage),
+				dvb::RetainedLogErrorName(g_retainedLog.error), g_retainedLog.code);
+			// There is no retained file to report its own initialization failure to.
+			// Debugger output is best effort, not persistent capture or stderr redirection.
+			::OutputDebugStringA(message.c_str());
+			logs::warn("{}", message);  // ordinary threshold still applies
+		} catch (...) { dvb::McpLog::NoteFailure(); }
+	}
+
 	void ConfigureMcpLogging(const std::string& requested) noexcept
 	{
 		dvb::McpLogLevel level;
@@ -68,8 +87,8 @@ namespace
 		dvb::McpLog::SetLevel(level);
 		try {
 			if (!valid) logs::warn("devbench: invalid mcpLogLevel; using warn");
-			if (!g_retainedLogAvailable) {
-				logs::warn("devbench: MCP retained logging unavailable: no log directory");
+			if (!g_retainedLog.Ready()) {
+				ReportRetainedLogFailure();
 				return;
 			}
 			if (!g_mcpLogger) {
@@ -225,7 +244,9 @@ namespace
 
 SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
-	SKSE::Init(a_skse);
+	// Pinned CommonLib defaults to opening/truncating this same file. Disable
+	// that owner before our bounded rotating sink is created (not after rotation).
+	SKSE::Init(a_skse, SKSE::InitInfo{ .log = false });
 	InitLogging();
 	SKSE::AllocTrampoline(1 << 10);
 	logs::info("devbench {} loaded", DEVBENCH_VERSION_STRING);

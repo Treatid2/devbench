@@ -37,6 +37,10 @@ library messages. `debug` includes the existing library's additional detail; it
 does not enable packet capture or raw request/response payload tracing.
 
 Output uses the normal SKSE `devbench.log` location, shared with ordinary logs.
+DevBench disables CommonLib's automatic file logger before installing its own
+sink: two owners must not open/truncate/rotate the same file at startup. The
+candidate logger's level, flush policy and pattern are configured before it is
+published as the ordinary logger; MCP then shares that one sink.
 Retention is now bounded: current file up to5MiB, plus three rotated archives
 (`devbench.1.log` through `devbench.3.log`), rotating at startup instead of
 truncating the previous run. This is about20MiB, not a guarantee that every run is
@@ -57,6 +61,14 @@ Transport logging is best effort. Formatting and sink failures cannot escape
 through the MCP logger; failures increment an in-process atomic counter, not a
 new public diagnostic API. Failure to initialize retained disk logging does not
 abort plugin load. Missing logs do not establish no traffic or a healthy reaper.
+Initialization failures distinguish `path`, `sink`, `logger` and `publish` stages
+with a fixed error class, without raw exception text or private paths. A numeric
+code is supplied only by `std::system_error` (its category is not exported, so
+the number alone is not a portable OS error identity); other failures use zero.
+When no retained sink exists, its failure cannot be written into that file.
+The warning uses the surviving default logger subject to ordinary filtering,
+and best-effort Windows debugger output independent of that threshold. Neither
+is a guarantee of persistent capture. No unbounded fallback file is created.
 The synchronous shared sink can impose disk-I/O latency; this is not an async
 collector, hard-time-bounded logging, session inventory, or proof of expiry,
 worker quiescence, connection correctness or resolution of any current incident.
