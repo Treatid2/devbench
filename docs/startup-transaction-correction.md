@@ -1,264 +1,149 @@
-# Startup transaction correction — partial source checkpoint
+# Startup transaction correction
 
-This branch starts at actual experimental integration
-`16dac4fc0653e1cc3c7f1275242949083b4697c2`. It preserves the original
-`abc57702208817423a411d3ce868a0fb8fcf99f8` handoff in ancestry/history.
-The accepted focused PR107 finding requires a complete startup transaction,
-not a widened catch. The prior exact phase checkpoint `e312ae0` compiled both
-production and host targets under Broker qualification on 9 October, without
-assertion execution. Subsequent EventBus/pool source below has not been compiled;
-that earlier compile does not cover this new tree. Neither checkpoint is a
-complete correction, review submission, delivery, integration or runtime pass.
+This is the focused PR107 startup/lifetime correction on the experimental
+`16dac4fc0653e1cc3c7f1275242949083b4697c2` lineage. The original
+`abc57702208817423a411d3ce868a0fb8fcf99f8` handoff remains in ancestry. Intermediate
+design checkpoints remain in Git history; this document describes the current
+implemented contract, not those checkpoints' former validation states.
 
-## Implemented substep
+## Publication and readiness
 
-`CallbackLease` is used by actual MCP registry/event callbacks and REST event
-callbacks and all four REST HTTP routes. Retirement closes admission first,
-then drains admitted calls, and makes already-copied callbacks inert. Clearing registry/bus storage alone does not
-revoke copies. The MCP tool handlers retain the registry rather than an adapter
-address; the registry must remain alive until all handlers/consumers retire.
-Server stop ordering retires adapters before transport destruction. This does
-not prove transport quiescence. Owners cannot retire themselves from their own
-admitted callbacks; all current adapter retirement is on the server owner path.
+The production `PostLoadStartup::Run` transaction guards configuration,
+construction, preparation, listener startup and required publication. The entire
+actual PostLoad entry has a no-throw boundary, including creation of its phase
+operations. Optional discovery/reporting failure cannot undo an already committed
+required publication. Diagnostic exceptions do not escape the startup boundary.
 
-The shared production lease tracks active calls separately from callback-body
-serialization. MCP retains serialized bodies; REST chooses concurrent lifetime
-admission and protects its lifecycle data with the existing lifecycle mutex.
-Thus a waiting REST tool does not take the lifetime gate's lock away from health
-or event reads. Copied routes return 503 after retirement without dereferencing
-the adapter. This does not establish listener/transport quiescence, a bounded
-drain of a hung tool, or safety of consumers that retain the registry itself.
+Input, menu, lifecycle, REST/MCP and host-interface exposure require explicit
+readiness, not merely a non-null server pointer. The server retains its registry,
+event bus and readiness atom before their addresses can escape to consumers.
+Failure closes tool admission and retains/quarantines that process-lifetime owner;
+it does not delete objects still referenced by installed hooks, consumers or
+asynchronous work. Irreversible publication is not retried in the same process.
+Retained ownership is not a claim that a failed transport has stopped.
 
-`PathUtf8` is the production bridge-discovery conversion, with source tests for
-non-ASCII JSON round-trip and empty paths. Nine regression cases exercise this
-conversion, throwing/admitted/copied callback retirement and the actual registry.
-They also cover both admission modes and health admission while a tool waits.
-These are tests of the production lease, not actual httplib request execution;
-the host-independent target does not compile RestAdapter.cpp.
-These nine cases compiled at exact `e312ae0` but were not executed. No
-controls/pins/locks changed.
+`PathUtf8` supplies the production bridge-discovery path conversion. Its source
+fixtures include a non-ASCII JSON round-trip and empty-path handling.
 
-## Dependency findings and remaining source work
+## Callback and worker lifetime
 
-9 October production phase-boundary substep:
+Actual MCP registry/event callbacks and REST events/routes use `CallbackLease`.
+Retirement first closes admission, then drains admitted calls. Already-copied
+callbacks become inert without dereferencing the retired adapter. MCP serializes
+callback bodies; REST uses concurrent lifetime admission so a waiting tool does
+not exclude independent health/event reads. Registry consumers still require
+the retained process-lifetime registry owner.
 
-- `PostLoadStartup::Run` is now the controller used by actual main.cpp. It guards
-  configuration, construction, preparation, listener result and publication, and
-  suppresses diagnostic exceptions. Seven new source cases exercise this very
-  sequence with five phase failures, false listener result, disabled configuration,
-  optional reporting failure, retained escaped owner and reentrant/repeated calls.
-- The whole actual kPostLoad branch returns inside a no-throw boundary, including
-  construction of its operations/config object. Other SKSE-dependent input/menu/
-  lifecycle and interface-delivery paths require explicit readiness, not merely
-  a non-null process-lifetime server. All inherited hook installs remain present.
-- The owner is retained before any consumer pointers escape; a failed attempt
-  denies REST/MCP tool admission and menu publication, does not destroy the owner,
-  and does not repeat irreversible publication in the same process. This is a
-  quarantine, not a claim that transport has stopped. Optional discovery writing
-  occurs after committed publication, so it cannot falsely undo that commit.
-- REST checks readiness inside its existing concurrent lease; MCP checks it before
-  tool execution/notifications. The readiness atom is server-owned and retains
-  the same process-lifetime requirement as the registry used by escaped handlers.
+The real EventBus takes its delivery barrier before copying a subscriber batch.
+Unsubscribe removes the subscriber under the state mutex, releases that mutex,
+then drains the barrier. A removed callback is either absent from the snapshot
+or finished before retirement returns. Subscriber exceptions are isolated and
+counted; an unexpected worker-entry failure closes delivery with sticky status
+rather than escaping the thread entry or endlessly queueing undeliverable work.
 
-These 16 source cases across the two startup files compiled at exact `e312ae0`.
-None was executed by the owner. Phase tests are not game/SKSE/actual HTTP or
-pinned-transport tests.
-Critically, the controller still relies on `Server::Start`'s unqualified listener
-result. Its bind proof, exception cleanup, Stop/Start retry and dependency-worker
-retirement are NOT fixed by this substep. Do not compile and call this full PR107
-acceptance, publish it to integration, or submit a prematurely complete review.
+The mirrored cpp-mcp pool owns joinable workers. Partial construction rolls back
+and joins earlier workers; required growth precedes accepting new work. Explicit
+`close_admission()` refuses new tasks without joining, and `shutdown()` then
+drains admitted work and joins workers. The separate mirrored httplib queue uses
+the same ownership primitive while preserving its waiting-job capacity bound.
+Contained worker exceptions retain counters/future failure semantics; containment
+alone is not an HTTP error response or proof that application work succeeded.
 
-The pinned cpp-mcp is `f1117d5286efe6477ddd14322703f034615b6c0e`. Its current
-session-activity overlays affect POST admission and session retirement only;
-they do not repair server startup/stop.
+Bound-listener and accepted-request sockets acquire cleanup ownership before
+fallible work. The production socket owners attempt shutdown/close on normal
+and exceptional exit. Cleanup error codes are not proof of successful network
+shutdown. Legacy SSE uses response-owned provider lifetime instead of detached
+session worker threads. Session admission's capacity check and insertion are
+atomic under the existing owner mutex; unpublished initialization rollback uses
+the exact dispatcher identity, not a guessed or foreign session.
 
-- `src/mcp_server.cpp:120–214`: nonblocking start returns after spawning, not
-  after bind success. Maintenance thread creation precedes listener creation.
-  A partial throw can leave a joinable maintenance thread with `running_` false.
-- `:216–346`: stop early-returns on false `running_`, clears dispatcher maps
-  before a loop over those maps, and uses detached join helpers retaining local
-  references. These paths cannot serve as a proven failed-start rollback.
-- `include/mcp_server.h:451`: `running_` is a plain bool shared across workers.
-- REST routes now use revocable concurrent admission retaining independent state.
-  Dependency-owned listener/handler lifetime still requires a proven cleanup path;
-  retiring an adapter is not proof of transport or escaped-registry retirement.
-- The EventBus substep below addresses the copied-batch ordering and exception
-  boundary. It does not establish transport quiescence or bounded socket/drain
-  completion, and must not be reported as complete startup teardown qualification.
+## Start, Stop and explicit restart
 
-9 October EventBus source substep, after the exact `e312ae0` compile return:
+Pinned Start serializes owner lifecycle, drains the retired generation, binds
+the actual socket synchronously and waits for the HTTP queue-ready handshake.
+Only then does it open session admission. A free-port probe or a pointer to a
+worker is not bound readiness. Partial route insertion poisons that instance;
+it cannot append another partial route graph on retry. Completed routes are
+reused by an explicit stopped restart.
 
-- The actual worker takes the delivery barrier before copying subscriber callbacks.
-  Unsubscribe removes under the state mutex, releases that mutex, then drains the
-  delivery barrier. Thus either the snapshot omits the removed subscriber or its
-  invocations finish before Unsubscribe returns. The old copy-before-barrier gap
-  is closed without holding the state mutex during subscriber/socket execution.
-- Subscriber exceptions are isolated per invocation and counted without allocating
-  diagnostics; other subscribers and later events continue. Unexpected queue,
-  snapshot-copy or wait exceptions cannot escape the thread entry point: delivery
-  stops with an explicit atomic status rather than terminating the process.
-  Publishers keep the bounded recent ring but do not endlessly queue undeliverable
-  notifications after that terminal worker failure. No restart is attempted.
-- Three source fixtures exercise the real EventBus: throwing subscriber continuity,
-  admitted callback retirement/later non-invocation, and a throwing std::function
-  copy during the production snapshot. Fixture waits are finite; none was run.
-  There are now 19 startup/lifetime source cases, with the new three uncompiled.
-- Unsubscribe/destruction remain owner-thread operations, not calls from a bus
-  subscriber. A subscriber that never returns can still block retirement; this
-  change does not promise a bounded drain or authorise destroying a live worker.
+Fallible route, core, maintenance and listener creation shares ordered rollback:
+close session/core admission; wake dispatchers and maintenance; close the socket;
+join original workers; reset listener generation after join; drain core work;
+then retire remaining session state. Dependent adapters remain alive during
+transport drain and are retired afterwards. Neither Stop nor rollback detaches
+a worker to destroy state it may still borrow.
 
-9 October worker-pool ownership source substep:
+Blocking Start releases the lifecycle mutex while waiting for its exact
+generation's completion, allowing another owner to Stop it. Stale completion
+cannot stop a newer generation. Worker-entry and core-failure baselines preserve
+cumulative history but distinguish a newly failed attempt. The startup thread
+factory seam must run the exact body asynchronously and return its owned joinable
+thread; it is not an arbitrary executor or runtime-facing interface.
 
-- The pinned thread-pool constructor can fail after earlier detached workers
-  start. Its counter increments before a potentially throwing thread creation;
-  destructor-only draining also occurs too late in the server's reverse member
-  destruction order (session/cleanup/maintenance state follows the pool member).
-- `PinnedMcpThreadPool.h` supplies the same pool surface through a fail-closed
-  build-tree header mirror. Workers are joinable owned slots, not detached
-  borrowers of pool state. Constructor rollback signals and joins all previously
-  started workers before the exception escapes. Required growth occurs before
-  enqueue accepts a task, so a failed spawn cannot orphan newly dispatched work.
-  Active counts include only successfully returned owned threads; idle retirement
-  and bounded slot reuse use one queue-mutex decision.
-- Explicit owner `shutdown()` closes admission and drains tasks/joins workers;
-  repeated shutdown and explicit restart use one lifecycle lock. Application
-  exceptions retain packaged-task/future semantics. Unexpected worker failure
-  closes admission and abandons pending futures rather than reporting success.
-  This does not imply a bounded shutdown of an application task that never returns;
-  shutdown/restart from a pool task is prohibited.
-- Three source fixtures instantiate the very header used by the generated
-  production mirror: partial constructor worker-creation failure, required-growth
-  failure before task admission, and future/drain/stopped/restart behaviour.
-  They are uncompiled/unrun. Total startup/lifetime source cases is now22.
-- The pinned submodule is unchanged. `xmake/cpp-mcp.lua` compares its entire
-  original pool header against `xmake/cpp-mcp-thread-pool-original.h` before
-  mirroring the local header. Only CRLF and an optional terminal LF are normalised.
-  These changed executed build controls and generated pool bytes require NEW
-  Broker assessment; private exact `e312ae0` qualification does not cover them.
-  The retained original header intentionally preserves pinned upstream trailing
-  whitespace. Static diff checking excludes that exact comparison-data file;
-  authored source/recipe/docs remain checked without changing Git whitespace policy.
-- Server stop has NOT yet been wired to explicit pool shutdown before state
-  retirement, and its listener/maintenance/SSE/session cleanup is still pinned.
-  This pool substep must not be claimed as safe complete Server destruction,
-  truthful bound readiness, Stop/Start or final PR107 review readiness.
+The higher `dvb::Server` serializes Start/Stop with one lifecycle mutex and uses
+atomic shared transport snapshots for read-only Running. A failed retained owner
+does not report success merely because its pointer exists. Only actual bind
+refusal advances the finite port-selection sequence; route, worker and readiness
+failures are not automatically replayed. The bound port is published after
+prepared listener success; tool/menu publication has its separate PostLoad gate.
 
-Required next design/implementation:
+Embedded stdio deliberately refuses host-owned stdin. This embedding uses
+threaded HTTP and the separate bridge. Consuming an uninterruptible host input
+stream cannot supply the same safe Stop contract.
 
-10 October HTTP worker ownership substep:
+## Pinned overlay and drift boundary
 
-- Pinned httplib0.19.0 has its own, separate `ThreadPool` (common/httplib.h:764).
-  Constructor failure after earlier threads start destroys joinable threads;
-  its default destructor does not own shutdown, and normal worker job exceptions
-  can escape its thread entry. Repairing only cpp-mcp's pool cannot cover this.
-- `HttpTaskQueueOwnership` is the actual queue delegated to by a generated
-  httplib::ThreadPool wrapper, after an exact unique original-class comparison.
-  It uses the existing joinable core's constructor rollback and destructor drain,
-  preserving a maxQueued bound on waiting jobs (not active handlers) and refusing
-  new admission after shutdown. A failed core enqueue returns false so httplib
-  retains its existing rejected-socket close path. A handler exception is counted
-  and contained by the packaged task; this is not an HTTP error response or proof
-  of socket cleanup. Core/header duplicates use one explicit include guard.
-- Three host source cases exercise this very production queue: partial-constructor
-  rollback, waiting-job capacity/stopped admission, and destructor drain/throwing
-  handler containment. These are not actual HTTP/socket fixtures. Total startup/
-  ownership cases26; latest10after compiled e312 are uncompiled/unrun.
-- The overlay now mirrors common/httplib.h too. The full pinned original worker
-  class is retained as comparison data; unique literal replacement fails closed.
-  Native target include order already selects the mirror ahead of common/. A
-  future OpenSSL lane explicitly fails compilation rather than silently dropping
-  pinned per-worker SSL cleanup. Existing standalone non-SSL recipe is unchanged
-  in that respect; no new TLS qualification is claimed. Pins remain unchanged.
-- Full server entry, listener/bound socket, HTTP socket exception cleanup,
-  maintenance, SSE/session retirement and restart remain unfinished. In
-  particular, the listener must contain an HTTP queue construction throw; a safe
-  partial queue alone does not prevent an unguarded listener entry terminating.
-  The HTTP worker failure count is not currently a public health/verdict receipt.
-  The owner still cannot destroy a hung admitted handler. New controls require
-  final Broker assessment; no configure/build/test execution occurred here.
+cpp-mcp remains pinned at `f1117d5286efe6477ddd14322703f034615b6c0e` with
+httplib 0.19.0. The submodule, dependency locks and recursive pins are unchanged.
+Local build-tree mirrors select the corrected implementation without modifying
+the retained dependency checkout. Whole original functions/classes are retained
+as comparison anchors; replacements must match uniquely and fail closed on
+dependency drift. Only CRLF and the documented terminal-LF comparison boundary
+are normalized. Imported comparison data intentionally preserves pinned upstream
+whitespace; authored source, recipes and docs remain whitespace-checked.
 
-10 October two-phase pool source substep:
+The native include ordering selects mirrored headers first. An unqualified
+OpenSSL worker lane fails compilation rather than silently losing the pinned
+per-worker SSL cleanup. No new TLS qualification is claimed. Changed executed
+recipes/generated bytes require Broker assessment, not a local build or an old
+candidate's inherited qualification.
 
-- `close_admission()` closes the actual mirrored pool queue without joining
-  admitted tasks. `shutdown()` uses the same first phase before joining. This
-  lets the eventual server teardown refuse later enqueue before closing session
-  dispatchers/listener paths that admitted work may need to finish. It does not
-  cancel queued work or certify that any transport has stopped. Mutex acquisition
-  and non-returning application work remain potentially blocking.
-- A fourth pool source fixture keeps an actual task admitted and waiting, queues
-  another task, closes admission twice, rejects later enqueue and then explicitly
-  releases/drains the admitted futures. No test was executed. Total startup/
-  lifetime cases is now23; seven cases added after exact compiled `e312ae0` are
-  uncompiled/unrun.
-- Full source inspection confirms why wiring only a blocking pool shutdown is
-  insufficient: pinned legacy SSE workers may call `close_session` themselves,
-  and that path releases a raw thread owner without joining; pinned Stop clears
-  the session maps before its retirement loop and detaches borrowed join helpers.
-  Existing POST/idle activity overlays remain required. The final overlay must
-  close admission, retain/join every owned session worker (never self-join), wake
-  dispatchers, stop/join HTTP producers and drain pool tasks before dependent
-  state retirement. Exact partial-start/bind cleanup and restart invariants remain
-  unfinished; no pool-only destruction safety or complete PR107 pass is claimed.
+## Validation and limits
 
-1. Establish synchronous bind/listener readiness, safe partial-start cleanup,
-   stopped/retry invariants and no detached worker borrowing destroyed state.
-   Keep exact fail-closed overlays against the pinned dependency; do not edit
-   the submodule or assume `is_running()` certifies binding. Build Broker must
-   assess changed controls before compilation; this is not local-build authority.
-   Wire explicit pool shutdown before session/cleanup/maintenance state retirement;
-   verify constructor rollback and worker ownership together with all server tasks.
-2. Implemented phase boundary, pending complete transport qualification: wrap the entire PostLoad path (configuration, construction, registration,
-   consumer wiring, listening, discovery and reporting) in a production-used
-   no-throw transaction with narrowly injectable phase operations. Treat optional
-   discovery/reporting failure distinctly from required readiness failure.
-3. Implemented publication gate, dependent on truthful listener readiness: gate dependent input/menu/lifecycle/host exposure on explicit readiness, not
-   non-null `g_server`. Do not install irreversible hooks before required stages
-   commit; do not claim hook rollback without an actual API.
-4. Implemented failure retention; pending transport stop/retry proof: retain process-lifetime registry/bus ownership once published to Capture,
-   HostApi, Autorun, game sinks, console hook or watchdog. Clear admission or
-   intentionally retain failed/quarantined owners; do not delete a Server while
-   escaped consumers or async work still refer to it. Avoid retrying irreversible
-   stages or claiming stopped state while a transport listener remains alive.
-5. Add production-used failure seams and regression source for construction,
-   wiring, bind/start, post-start discovery/reporting, repeated Stop/Start,
-   readiness gating, copied callbacks and failure after consumer publication.
-   Broker compiles exact committed candidates; receiver owns assertion execution.
+Exact native/test/recipe candidate
+`ed16b82d7bedc7d2f9e709599e5bf3e355935385`, tree
+`0fbd06bbf4fcb64008069ce1aca4bd2a319ac939`, compiled once per target under exact
+Broker assessment: production, pure host and standalone transport. Production
+and transport qualification succeeded. Pure-host compilation succeeded, but
+its outer publication job failed; the Broker recovered the original EXE/PDB
+without compiling again. That recovery is supplemental artifact custody, not
+a rewritten outer result or replacement canonical qualification PASS.
+Subsequent documentation-only composition must keep its distinct head and
+prove unchanged compiled-source closure instead of relabelling these artifacts.
 
-Only after the whole accepted finding is implemented and exact compilation is
-admitted should a new hash-distinct focused PR107 cycle be prepared. This partial
-checkpoint does not replace the independent console review's exact PASS at16dac.
-Experimental source remains `16dac`; reviewed main remains `32823e4`. No runtime
-command, replay, deployment, upstream publication or initial-heartbeat resume.
-# Accepted HTTP socket exception cleanup (10 October continuation)
+Source checks verified 28 MCP and 17 HTTP unique pinned projections and exact
+source/control correspondence. The focused host sources exercise production
+phase, callback, bus, pool, socket, session and provider ownership primitives.
+The standalone transport target additionally exercises actual bind refusal,
+repeated Stop/Start, throwing/null HTTP queue creation, blocking Start/Stop,
+stdio refusal, partial-route poison and either startup-thread creation failure.
+Successful owned fixture startup is a throwing prerequisite before any public
+OPTIONS request, so failed startup never authorizes contacting another listener.
 
-The exact pinned non-SSL process_and_close_socket now establishes an
-allocation-free HttpSocketOwner before address strings/request work. Shutdown
-and close move into the owner destructor and occur on normal and exceptional
-exit, including when native shutdown returns an error. The full original
-function is an exact unique overlay anchor; pinned dependency remains unchanged.
-Two source fixtures exercise the production ownership class with cleanup
-callbacks, not real sockets. They are uncompiled/unrun. Combined startup cases
-now28, latest12since exact compiled e312 uncompiled/unrun.
+Compilation is not assertion execution. The owner has not run these candidates;
+the requester owns bounded host/transport execution and runtime acceptance.
+The pure host suite does not compile the transport fixture translation unit.
+Neither source checks nor compile receipts prove SKSE hooks, game behavior,
+historical capacity-refusal cause, session-holder identity or scientific results.
 
-This does not repair accepted sockets before queue admission, prebound listener
-rollback, listener-entry exceptions, partial start, session/SSE producer joining,
-full stop/drain/retry or hung application work. Socket cleanup error codes are
-not proof of successful network shutdown. Changed mirrors need final Broker
-assessment; no inherited compilation or review verdict is relabelled.
-# Actual transport worker-entry containment (10 October next continuation)
+Lifecycle/retirement APIs are owner-thread operations: never call them from
+their own admitted callbacks or tasks. A callback, task or request that never
+returns can still block safe drain. This correction introduces no bounded-drain
+promise, unsafe detach, foreign-session deletion, global reset or saturation
+experiment. Atomic/mutex coordination does not prove latency or fairness.
 
-Exact nonblocking listener/maintenance blocks are wrapped by the production
-ContainedThreadEntry. Exceptions in listener logging/listen/HTTP queue creation,
-maintenance wait/loop or its error logging cannot escape either worker entry.
-Failure records only an atomic counter, with no fallible logging/callback on the
-containment path. The generated server running flag is atomic; is_running refuses
-a recorded failed entry and worker_entry_failures exposes that exact count.
-Later normal completion does not clear failure history or attest owner retirement.
-Two host source cases exercise the production boundary for normal/standard/unknown
-exception outcomes;30combined startup cases/new14since compiled e312 uncompiled/unrun.
-
-This remains incomplete: owner-thread construction failures, synchronous bind and
-readiness, safe partial stop, session/SSE ownership/drain and stopped retry still
-require correction. Sticky entry failure will need owner-confirmed recreation or
-an explicitly quiescent recovery path; no safe retry or teardown is claimed here.
-No changed-control compilation, recipe execution, assertions or runtime performed.
+This isolated lineage excludes later observe and MCP logging changes. It is not
+an installable replacement for the current experimental integration. A future
+coherent composition must preserve those features and receive its own exact
+source, build, review and requester qualification treatment. No compile result
+implies review PASS, promotion, upstream publication or runtime acceptance.
