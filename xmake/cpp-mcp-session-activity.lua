@@ -8,7 +8,7 @@ return {
     header = {
         {
             from = "#define MCP_SERVER_H",
-            to = '#define MCP_SERVER_H\n#include "ContainedThreadEntry.h"\n#include "SessionCapacityAdmission.h"\n#include "SessionInitializationState.h"\n#include "SessionRegistrationRollback.h"',
+            to = '#define MCP_SERVER_H\n#include "ContainedThreadEntry.h"\n#include "SessionCapacityAdmission.h"\n#include "SessionInitializationState.h"\n#include "SessionRegistrationRollback.h"\n#include "SseProviderPump.h"',
         },
         {
             from = "    bool running_ = false;",
@@ -76,7 +76,23 @@ private:
         },
         {
             from = "    void close_session(const std::string& session_id);",
-            to = "    void close_session(const std::string& session_id, bool idle_only = false);",
+            to = "    void close_session(const std::string& session_id, bool idle_only = false, std::shared_ptr<event_dispatcher> expected = {});",
+        },
+        {
+            from = [[    bool wait_event(httplib::DataSink* sink, const std::chrono::milliseconds& timeout = std::chrono::milliseconds(10000)) {
+        if (!sink || closed_.load(std::memory_order_acquire)) {]],
+            to = [[    bool wait_event(httplib::DataSink* sink, const std::chrono::milliseconds& timeout = std::chrono::milliseconds(10000), bool* timed_out = nullptr) {
+        if (timed_out) *timed_out = false;
+        if (!sink || closed_.load(std::memory_order_acquire)) {]],
+        },
+        {
+            from = [[            if (!result) {
+                return false;
+            }]],
+            to = [[            if (!result) {
+                if (timed_out) *timed_out = true;
+                return false;
+            }]],
         },
     },
     source = {
@@ -134,33 +150,6 @@ private:
         // The helper uses the same owner lock as registration and retirement.
         (void)dvb::SetRegisteredSessionInitialized(
             session_dispatchers_, session_initialized_, mutex_, session_id, initialized);]],
-        },
-        {
-            from = [[    // Enforce session limit
-    if (max_sessions_ > 0) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (session_dispatchers_.size() >= max_sessions_) {
-            LOG_WARNING("Max sessions reached (", max_sessions_, "), rejecting SSE connection");
-            res.status = 503;
-            res.set_content("{\"error\":\"Too many sessions\"}", "application/json");
-            return;
-        }
-    }
-]],
-            to = "",
-        },
-        {
-            from = [[    // Add session dispatcher to mapping table
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        session_dispatchers_[session_id] = session_dispatcher;
-    }]],
-            to = [[    // Both transports share atomic count-and-insert admission.
-    if (!dvb::AdmitSession(session_dispatchers_, mutex_, max_sessions_, session_id, session_dispatcher)) {
-        res.status = 503;
-        res.set_content("{\"error\":\"Too many sessions\"}", "application/json");
-        return;
-    }]],
         },
         {
             from = [[        // Enforce session limit
@@ -279,7 +268,7 @@ private:
         },
         {
             from = "void server::close_session(const std::string& session_id) {",
-            to = "void server::close_session(const std::string& session_id, bool idle_only) {",
+            to = "void server::close_session(const std::string& session_id, bool idle_only, std::shared_ptr<event_dispatcher> expected) {",
         },
         {
             from = [[        for (const auto& [key, handler] : session_cleanup_handler_) {
@@ -298,6 +287,7 @@ private:
             // a maintenance candidate. No application callbacks under mutex_.
             auto dispatcher_it = session_dispatchers_.find(session_id);
             if (dispatcher_it == session_dispatchers_.end()) return;
+            if (expected && dispatcher_it->second != expected) return;
             if (idle_only && !dispatcher_it->second->close_if_inactive(
                     std::chrono::steady_clock::now(), std::chrono::seconds(session_timeout_))) return;
             cleanup_handlers = session_cleanup_handler_;

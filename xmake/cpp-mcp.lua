@@ -217,8 +217,17 @@ private:
         io.readfile(path.join(os.projectdir(), "src", "SessionInitializationState.h")))
     io.writefile(path.join(out, "SessionRegistrationRollback.h"),
         io.readfile(path.join(os.projectdir(), "src", "SessionRegistrationRollback.h")))
+    io.writefile(path.join(out, "SseProviderPump.h"),
+        io.readfile(path.join(os.projectdir(), "src", "SseProviderPump.h")))
     os.mkdir(patched_src)
+    -- Full-function comparison precedes the smaller session overlays. A changed
+    -- dependency implementation cannot silently select the local SSE producer.
+    local sse_original = io.readfile(path.join(os.projectdir(), "xmake", "cpp-mcp-sse-original.cpp"))
+    local sse_owned = io.readfile(path.join(os.projectdir(), "src", "PinnedMcpSseHandler.inc"))
+    local server_source = overlay_once(io.readfile(path.join(root, "src", "mcp_server.cpp")), {
+        { from = sse_original:gsub("\r\n", "\n"):gsub("\n$", ""), to = sse_owned },
+    })
     io.writefile(path.join(patched_src, "mcp_server.cpp"),
-        overlay_once(io.readfile(path.join(root, "src", "mcp_server.cpp")), overlays.source))
+        overlay_once(server_source, overlays.source))
 end)
 target_end()
