@@ -15,9 +15,10 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
         try { close_session(session_id, false, session_dispatcher); }
         catch (...) {} // Cleanup/logging exceptions cannot escape Response destruction.
     };
-    if (!dvb::AdmitSession(session_dispatchers_, mutex_, max_sessions_, session_id, session_dispatcher)) {
+    bool admission_closed = false;
+    if (!dvb::AdmitSession(session_dispatchers_, mutex_, max_sessions_, session_id, session_dispatcher, &session_admission_open_, &admission_closed)) {
         res.status = 503;
-        res.set_content("{\"error\":\"Too many sessions\"}", "application/json");
+        res.set_content(admission_closed ? "{\"error\":\"Server stopping\"}" : "{\"error\":\"Too many sessions\"}", "application/json");
         return;
     }
     try {

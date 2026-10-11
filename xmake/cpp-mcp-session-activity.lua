@@ -8,11 +8,20 @@ return {
     header = {
         {
             from = "#define MCP_SERVER_H",
-            to = '#define MCP_SERVER_H\n#include "ContainedThreadEntry.h"\n#include "SessionCapacityAdmission.h"\n#include "SessionInitializationState.h"\n#include "SessionRegistrationRollback.h"\n#include "SseProviderPump.h"',
+            to = '#define MCP_SERVER_H\n#include "ContainedThreadEntry.h"\n#include "SessionCapacityAdmission.h"\n#include "SessionInitializationState.h"\n#include "SessionRegistrationRollback.h"\n#include "SseProviderPump.h"\n#include "ImmutableCallbackSnapshot.h"',
         },
         {
             from = "    bool running_ = false;",
-            to = "    dvb::ContainedThreadEntry thread_entry_state_;\n    std::atomic<bool> running_{false};",
+            to = "    dvb::ContainedThreadEntry thread_entry_state_;\n    bool session_admission_open_{false};  // protected by mutex_\n    std::atomic<bool> running_{false};",
+        },
+        {
+            from = [[    // SSE thread
+    std::map<std::string, std::unique_ptr<std::thread>> sse_threads_;]],
+            to = "    // Legacy SSE is owned by the HTTP response provider; no auxiliary worker.",
+        },
+        {
+            from = "    std::map<std::string, session_cleanup_handler> session_cleanup_handler_;",
+            to = "    using cleanup_handler_map = std::map<std::string, session_cleanup_handler>;\n    std::shared_ptr<const cleanup_handler_map> session_cleanup_handler_;",
         },
         {
             from = "    bool is_running() const;",
@@ -97,6 +106,19 @@ private:
     },
     source = {
         {
+            from = [[    session_cleanup_handler_[key] = handler;]],
+            to = [[    dvb::UpdateCallbackSnapshot(session_cleanup_handler_, key, std::move(handler));]],
+        },
+        {
+            from = [[    LOG_INFO("Starting MCP server on ", host_, ":", port_);]],
+            to = [[    thread_pool_.restart();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        session_admission_open_ = true;
+    }
+    LOG_INFO("Starting MCP server on ", host_, ":", port_);]],
+        },
+        {
             from = [[        auto mcp_req = parse_jsonrpc_message(items[0]);
         json result = handle_initialize(mcp_req, session_id);
 
@@ -169,9 +191,10 @@ private:
             std::lock_guard<std::mutex> lock(mutex_);
             session_dispatchers_[session_id] = session_dispatcher;
         }]],
-            to = [[        if (!dvb::AdmitSession(session_dispatchers_, mutex_, max_sessions_, session_id, session_dispatcher)) {
+            to = [[        bool admission_closed = false;
+        if (!dvb::AdmitSession(session_dispatchers_, mutex_, max_sessions_, session_id, session_dispatcher, &session_admission_open_, &admission_closed)) {
             res.status = 503;
-            res.set_content("{\"error\":\"Too many sessions\"}", "application/json");
+            res.set_content(admission_closed ? "{\"error\":\"Server stopping\"}" : "{\"error\":\"Too many sessions\"}", "application/json");
             return;
         }]],
         },
@@ -265,46 +288,6 @@ private:
         close_session(session_id);]],
             to = [[        // Recheck activity and retire under the same lock as POST admission.
         close_session(session_id, true);]],
-        },
-        {
-            from = "void server::close_session(const std::string& session_id) {",
-            to = "void server::close_session(const std::string& session_id, bool idle_only, std::shared_ptr<event_dispatcher> expected) {",
-        },
-        {
-            from = [[        for (const auto& [key, handler] : session_cleanup_handler_) {
-            handler(key);
-        }]],
-            to = "        std::map<std::string, session_cleanup_handler> cleanup_handlers;",
-        },
-        {
-            from = [[            // Get dispatcher pointer
-            auto dispatcher_it = session_dispatchers_.find(session_id);
-            if (dispatcher_it != session_dispatchers_.end()) {
-                dispatcher_to_close = dispatcher_it->second;
-                session_dispatchers_.erase(dispatcher_it);
-            }]],
-            to = [[            // Only the winning retirement owns callbacks, even if DELETE races
-            // a maintenance candidate. No application callbacks under mutex_.
-            auto dispatcher_it = session_dispatchers_.find(session_id);
-            if (dispatcher_it == session_dispatchers_.end()) return;
-            if (expected && dispatcher_it->second != expected) return;
-            if (idle_only && !dispatcher_it->second->close_if_inactive(
-                    std::chrono::steady_clock::now(), std::chrono::seconds(session_timeout_))) return;
-            cleanup_handlers = session_cleanup_handler_;
-            dispatcher_to_close = dispatcher_it->second;
-            session_dispatchers_.erase(dispatcher_it);]],
-        },
-        {
-            from = "        // Release thread resources\n        if (thread_to_release) {",
-            to = [[        LOG_INFO("Closed session: ", session_id, idle_only ? " (idle)" : " (explicit)");
-        for (const auto& [key, handler] : cleanup_handlers) {
-            try { handler(key); }
-            catch (const std::exception& e) { LOG_WARNING("Session cleanup handler failed: ", key, ", ", e.what()); }
-            catch (...) { LOG_WARNING("Session cleanup handler failed: ", key); }
-        }
-
-        // Release thread resources
-        if (thread_to_release) {]],
         },
     },
 }

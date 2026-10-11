@@ -12,9 +12,16 @@ namespace dvb
 	// This is not idle expiry, caller custody, or session-worker lifetime ownership.
 	template<class Map>
 	bool AdmitSession(Map& sessions, std::mutex& mutex, std::size_t maximum,
-		const typename Map::key_type& id, const typename Map::mapped_type& dispatcher)
+		const typename Map::key_type& id, const typename Map::mapped_type& dispatcher,
+		const bool* admissionOpen = nullptr, bool* ownerClosed = nullptr)
 	{
 		std::lock_guard lock(mutex);
+		if (ownerClosed) *ownerClosed = false;
+		// If supplied, this flag is read/written only under this same owner mutex.
+		if (admissionOpen && !*admissionOpen) {
+			if (ownerClosed) *ownerClosed = true;
+			return false;
+		}
 		if (maximum != 0 && sessions.size() >= maximum)
 			return false;
 		if (!sessions.emplace(id, dispatcher).second)

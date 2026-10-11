@@ -28,6 +28,41 @@ TEST_CASE("session admission preserves unlimited mode and rejects ID replacement
 	CHECK(sessions.at("one") == 1);
 }
 
+TEST_CASE("stopped session admission refuses even with capacity available")
+{
+	std::map<std::string, int> sessions;
+	std::mutex mutex;
+	bool open = false;
+	bool ownerClosed = false;
+	CHECK(!dvb::AdmitSession(sessions, mutex, 10, "new", 1, &open, &ownerClosed));
+	CHECK(ownerClosed);
+	CHECK(!dvb::AdmitSession(sessions, mutex, 0, "unlimited", 2, &open));
+	CHECK(sessions.empty());
+	{
+		std::lock_guard lock(mutex);
+		open = true;
+	}
+	CHECK(dvb::AdmitSession(sessions, mutex, 1, "owned", 1, &open, &ownerClosed));
+	CHECK(!ownerClosed);
+	CHECK(!dvb::AdmitSession(sessions, mutex, 1, "capacity", 2, &open, &ownerClosed));
+	CHECK(!ownerClosed);
+}
+
+TEST_CASE("session admission after owner closure preserves existing holders")
+{
+	std::map<std::string, int> sessions;
+	std::mutex mutex;
+	bool open = true;
+	CHECK(dvb::AdmitSession(sessions, mutex, 10, "owned", 1, &open));
+	{
+		std::lock_guard lock(mutex);
+		open = false;
+	}
+	CHECK(!dvb::AdmitSession(sessions, mutex, 10, "new", 2, &open));
+	CHECK(sessions.size() == 1);
+	CHECK(sessions.at("owned") == 1);
+}
+
 TEST_CASE("concurrent session admission shares one remaining slot")
 {
 	std::map<std::string, int> sessions;
