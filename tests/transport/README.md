@@ -6,8 +6,9 @@ does not contact a running game, deploy artifacts, or operate calendar/probe
 custody. Build Broker must assess this new compile target and source-overlay
 recipe. Compile success alone is not an assertion pass.
 
-The receiving task may run the returned executable in isolation with a bounded
-330-second process deadline. It starts its own loopback server on port37391;
+The receiving task may run the returned aggregate executable once in isolation
+with a bounded 600-second process deadline. The session cases start their own
+loopback server on port37391; the startup cases use port37392.
 an occupied port is a failure, never permission to use that listener. Preserve
 exit code, stdout/stderr, exact executable hash and its source/build receipt.
 Do not run this fixture concurrently with another copy.
@@ -36,14 +37,19 @@ null queue; blocking start stopped by another owner; fail-closed embedded stdio;
 partial invalid-regex route registration refusing graph reuse; and injected first
 or second worker creation failure. Factories must return the owned joinable thread
 running the supplied body exactly once asynchronously, never inline or detached.
-These are authored source cases, NOT compiled/executed evidence. The dependency
+These cases compiled at exact ed16b82; no assertion execution is claimed here. The dependency
 configuration seam is not a DevBench tool or permission to create runtime workers.
 
 No test may attach to a game, delete a foreign session or retry arbitrary production
 failure. Named injected failures permit the one explicit fixture retry described
-above. Existing330s session fixture deadline needs a separately assessed larger
-budget before running the aggregate with startup cases: their preparation wait is
-30s each and cannot be silently treated as zero or squeezed into the old budget.
+above. The former 330-second session-only budget does not cover this aggregate.
+Its successful session lane already includes 180s of POST-only activity plus a
+35s admitted request and idle maintenance; startup preparation can wait 30s per
+case. The 600-second aggregate bound permits that finite additional work, but is
+still a hard deadline, not a guarantee that a failed drain terminates naturally.
+Preserve timeout/hang evidence and cancel only the owned standalone fixture
+through the requester's supported process wrapper; never target a game, foreign
+listener or unrelated process. Do not automatically replay a failed fixture.
 The manager does not run this executable; Broker compilation and requester-owned
 host qualification remain distinct stages. Persistent Mapping environments need
 no restart for these standalone host fixtures. A future installed startup candidate
