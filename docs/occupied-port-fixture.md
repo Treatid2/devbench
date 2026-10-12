@@ -34,7 +34,15 @@ decision and requires its own compatibility assessment, not a silent test fix.
 References: [Microsoft SO_REUSEADDR/SO_EXCLUSIVEADDRUSE semantics](https://learn.microsoft.com/en-us/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse)
 and [SO_EXCLUSIVEADDRUSE](https://learn.microsoft.com/en-us/windows/win32/winsock/so-exclusiveaddruse).
 Exclusivity must be requested before bind. Production restart behavior is not
-changed; the fixture's reserved socket accepts no client connections before release.
+changed; the fixture starts no accept loop and services no client request before release.
+
+The test-only OwnedPortBlocker stops the socket on every scope exit, including
+exceptions between reservation and the explicit release before retry. It owns
+the Server before binding rather than relying on the dependency's default
+destructor. A named injected-exception case reserves the socket, unwinds, then
+requires a fresh exclusive reservation of the same port. Any different premise
+failure cannot satisfy the named exception check. This is declared coverage
+until the new exact binary is compiled and executed by its requester.
 
 This changes only transport-test source and this document. Exact new transport
 compilation and requester assertions are required. Old production/host sources,

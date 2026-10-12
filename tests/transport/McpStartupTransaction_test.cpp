@@ -56,6 +56,14 @@ namespace
 			throw std::runtime_error("owned occupied-port fixture could not verify non-shareable socket policy");
 		}
 	}
+	struct OwnedPortBlocker
+	{
+		httplib::Server server;
+		// httplib::Server's default destructor does not stop its bound listener.
+		// Install ownership before reservation, so later construction/fixture
+		// exceptions cannot leave this port occupied for subsequent cases.
+		~OwnedPortBlocker() { server.stop(); }
+	};
 	mcp::server::configuration Config()
 	{
 		mcp::server::configuration result;
@@ -83,13 +91,13 @@ namespace
 
 TEST_CASE("actual bound socket failure cannot report startup success; retry owns the freed port")
 {
-	httplib::Server blocker;
-	ReserveNonShareablePort(blocker);
+	OwnedPortBlocker blocker;
+	ReserveNonShareablePort(blocker.server);
 	mcp::server server(Config());
 	CHECK(!server.start(false));
 	CHECK(server.last_start_bind_failed());
 	CHECK(!server.is_running());
-	blocker.stop();
+	blocker.server.stop(); // Explicitly release before retry; scope cleanup remains armed.
 	RequireStarted(server);
 	CHECK(!server.last_start_bind_failed());
 	CHECK(server.is_running());
@@ -99,6 +107,20 @@ TEST_CASE("actual bound socket failure cannot report startup success; retry owns
 	RequireStarted(server); // completed routes reused, not registered again
 	CheckPublicOptions(server);
 	server.stop();
+}
+
+TEST_CASE("owned occupied-port reservation releases after an exceptional fixture exit")
+{
+	struct AfterReservationExit {};
+	CHECK_THROWS_AS(([] {
+		OwnedPortBlocker blocker;
+		ReserveNonShareablePort(blocker.server);
+		throw AfterReservationExit{};
+	}()), AfterReservationExit);
+	// An unrelated premise failure cannot satisfy the named injected exception.
+	// The same exclusive reservation now succeeding proves this owner released it.
+	OwnedPortBlocker next;
+	ReserveNonShareablePort(next.server);
 }
 
 TEST_CASE("actual HTTP queue constructor failure is rolled back before a bounded explicit retry")
