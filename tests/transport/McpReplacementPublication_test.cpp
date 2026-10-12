@@ -32,6 +32,13 @@ namespace
 {
 	constexpr int port = 37394;
 	using Json = mcp::json;
+	bool SameSchema(const Json& actual, const Json& expected)
+	{
+		// MCP uses ordered_json; the registry uses json. Object-member order is
+		// not schema content. Canonicalize objects, without changing array order,
+		// fields or values, before comparing the public catalogue with its source.
+		return dvb::json(actual) == dvb::json(expected);
+	}
 	void Require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
 	Json Request(const char* method, Json params = Json::object())
 	{
@@ -73,6 +80,24 @@ namespace
 		std::promise<void>& release;
 		~ReleaseOnExit() { try { release.set_value(); } catch (...) {} }
 	};
+}
+
+TEST_CASE("catalogue schema comparison ignores object member order but preserves schema content")
+{
+	const Json expected{ { "type", "object" }, { "properties", { { "value", { { "type", "integer" } } } } } };
+	const Json registryRoundtrip = dvb::json(expected);
+	CHECK(registryRoundtrip.dump() != expected.dump()); // Deliberately different serialization order.
+	CHECK(SameSchema(registryRoundtrip, expected));
+	auto older = registryRoundtrip;
+	older["properties"]["value"]["type"] = "string";
+	CHECK(!SameSchema(older, expected));
+	auto missing = registryRoundtrip;
+	missing.erase("properties");
+	CHECK(!SameSchema(missing, expected));
+	const Json positional{ { "type", "array" }, { "prefixItems", Json::array({ Json{ { "type", "integer" } }, Json{ { "type", "string" } } }) } };
+	auto reversed = positional;
+	reversed["prefixItems"] = Json::array({ positional["prefixItems"][1], positional["prefixItems"][0] });
+	CHECK(!SameSchema(reversed, positional));
 }
 
 TEST_CASE("same-name replacement with inverted real adapter callbacks converges to final registry generation")
@@ -122,7 +147,9 @@ TEST_CASE("same-name replacement with inverted real adapter callbacks converges 
 	Require(tools.size() == 1, "unexpected catalogue fixture inventory");
 	CHECK(tools.at(0).at("name") == "replace");
 	CHECK(tools.at(0).at("description") == "final");
-	CHECK(tools.at(0).at("inputSchema") == finalSchema);
+	const auto& publishedSchema = tools.at(0).at("inputSchema");
+	CHECK_MESSAGE(SameSchema(publishedSchema, finalSchema),
+		"catalogue inputSchema differs: actual=" + publishedSchema.dump() + "; expected=" + finalSchema.dump());
 	auto call = f.Post(session, Request("tools/call", { { "name", "replace" }, { "arguments", { { "value", 42 } } } }));
 	Require(call && call->status == 200, "final public callable unavailable");
 	const auto result = Json::parse(call->body).at("result");
