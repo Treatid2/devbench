@@ -12,6 +12,50 @@ namespace
 	// Own isolated loopback sockets only; never attach to a game or delete an
 	// unknown session. A collision fails the fixture, not a foreign owner.
 	constexpr int port = 37392;
+	bool SocketOptionEquals(socket_t socket, int option, int expected)
+	{
+		int value = 0;
+		socklen_t length = sizeof(value);
+		return ::getsockopt(socket, SOL_SOCKET, option,
+#ifdef _WIN32
+			reinterpret_cast<char*>(&value),
+#else
+			&value,
+#endif
+			&length) == 0 && length == sizeof(value) && value == expected;
+	}
+	void ReserveNonShareablePort(httplib::Server& blocker)
+	{
+		// The pinned default enables reuse. On Windows two reusable sockets can
+		// bind/listen at the same endpoint, so an ordinary blocker is NOT a
+		// deterministic bind-failure premise. Only this fixture owner changes policy.
+		bool policyVerified = false;
+		blocker.set_socket_options([&](socket_t socket) {
+			bool configured = httplib::detail::set_socket_opt(socket, SOL_SOCKET, SO_REUSEADDR, 0);
+#ifdef SO_REUSEPORT
+			configured = httplib::detail::set_socket_opt(socket, SOL_SOCKET, SO_REUSEPORT, 0) && configured;
+#endif
+#ifdef _WIN32
+			configured = httplib::detail::set_socket_opt(socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1) && configured;
+#endif
+			policyVerified = configured && SocketOptionEquals(socket, SO_REUSEADDR, 0);
+#ifdef SO_REUSEPORT
+			policyVerified = SocketOptionEquals(socket, SO_REUSEPORT, 0) && policyVerified;
+#endif
+#ifdef _WIN32
+			policyVerified = SocketOptionEquals(socket, SO_EXCLUSIVEADDRUSE, 1) && policyVerified;
+#endif
+			// No throw here: pinned create_socket owns cleanup only after this
+			// callback returns. Fail the premise after bind returns to its owner.
+		});
+		const bool bound = blocker.bind_to_port("127.0.0.1", port);
+		// Do not leave an installed callback referring to this local flag.
+		blocker.set_socket_options(nullptr);
+		if (!bound || !policyVerified) {
+			blocker.stop();
+			throw std::runtime_error("owned occupied-port fixture could not verify non-shareable socket policy");
+		}
+	}
 	mcp::server::configuration Config()
 	{
 		mcp::server::configuration result;
@@ -40,8 +84,7 @@ namespace
 TEST_CASE("actual bound socket failure cannot report startup success; retry owns the freed port")
 {
 	httplib::Server blocker;
-	if (!blocker.bind_to_port("127.0.0.1", port))
-		throw std::runtime_error("startup fixture port already owned");
+	ReserveNonShareablePort(blocker);
 	mcp::server server(Config());
 	CHECK(!server.start(false));
 	CHECK(server.last_start_bind_failed());
