@@ -8,6 +8,7 @@
 
 namespace {
 bool inLoader = false;
+struct InjectedPreparationExit {};
 dvb::PostLoadStartup startup;
 struct Operations {
     dvb::EventBus bus{false}; // Exact production thread-free ownership mode.
@@ -15,10 +16,11 @@ struct Operations {
     std::atomic<unsigned> workers{0};
     unsigned factoryCalls = 0;
     bool fail = false, failPrepare = false, registered = false, published = false, quarantined = false;
+    bool exactPreparationFailure = false;
     bool Configure() { return true; }
     void Construct() {} // Transport must not be constructed in this half.
     void Prepare() {
-        if (failPrepare) throw std::runtime_error("injected thread-free preparation failure");
+        if (failPrepare) throw InjectedPreparationExit{};
         registered = true;
     }
     bool Listen() {
@@ -42,7 +44,12 @@ struct Operations {
     }
     void Publish() { published = true; }
     void Quarantine() { quarantined = true; published = false; }
-    void Report(dvb::PostLoadStartup::Outcome, dvb::PostLoadStartup::Phase, std::exception_ptr) {}
+    void Report(dvb::PostLoadStartup::Outcome, dvb::PostLoadStartup::Phase phase, std::exception_ptr error) {
+        if (phase != dvb::PostLoadStartup::Phase::Preparation || !error) return;
+        try { std::rethrow_exception(error); }
+        catch (const InjectedPreparationExit&) { exactPreparationFailure = true; }
+        catch (...) {}
+    }
 };
 Operations* ops = nullptr;
 }
@@ -72,6 +79,9 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
             ops->failPrepare = GetEnvironmentVariableW(L"DEVBENCH_LOADER_FIXTURE_FAIL_PREPARE", flag, 2) != 0;
             const auto result = startup.Prepare(*ops);
             if (result != dvb::PostLoadStartup::Outcome::Prepared) {
+                if (ops->exactPreparationFailure && ops->quarantined && !ops->server &&
+                    !ops->published && ops->factoryCalls == 0 && ops->workers == 0)
+                    SetEnvironmentVariableW(L"DEVBENCH_LOADER_FIXTURE_PREPARE_FAILED", L"1");
                 delete ops; // Bus was explicitly thread-free; a regression hangs this real loader test.
                 ops = nullptr;
             }
