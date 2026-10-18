@@ -6,8 +6,12 @@ void server::close_session(const std::string& session_id, bool idle_only, std::s
         auto session = session_dispatchers_.find(session_id);
         if (session == session_dispatchers_.end()) return;
         if (expected && session->second != expected) return;
-        if (idle_only && !session->second->close_if_inactive(
-                std::chrono::steady_clock::now(), std::chrono::seconds(session_timeout_))) return;
+        // Owner mutex -> dispatcher mutex, as in POST admission. Explicit
+        // closure stops new admissions immediately, but cleanup must not run
+        // beneath an already admitted request. Maintenance completes retirement.
+        if (!session->second->try_retire(
+                std::chrono::steady_clock::now(), std::chrono::seconds(session_timeout_),
+                !idle_only)) return;
         // These shared_ptr copies do not allocate or copy a user callable.
         handlers = session_cleanup_handler_;
         dispatcher = session->second;

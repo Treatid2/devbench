@@ -25,7 +25,15 @@ return {
         },
         {
             from = "#define MCP_SERVER_H",
-            to = '#define MCP_SERVER_H\n#include <future>\n#include "ContainedThreadEntry.h"\n#include "SessionCapacityAdmission.h"\n#include "SessionInitializationState.h"\n#include "SessionRegistrationRollback.h"\n#include "SseProviderPump.h"\n#include "ImmutableCallbackSnapshot.h"',
+            to = '#define MCP_SERVER_H\n#include <future>\n#include "ContainedThreadEntry.h"\n#include "SessionCapacityAdmission.h"\n#include "SessionInitializationState.h"\n#include "SessionRegistrationRollback.h"\n#include "SseProviderPump.h"\n#include "ImmutableCallbackSnapshot.h"\nnamespace dvb { struct McpSessionRetirementFixture; }',
+        },
+        {
+            from = "class event_dispatcher {",
+            to = "class event_dispatcher {\n    friend struct ::dvb::McpSessionRetirementFixture;",
+        },
+        {
+            from = "class server {",
+            to = "class server {\n    friend struct ::dvb::McpSessionRetirementFixture;",
         },
         {
             from = "    bool running_ = false;",
@@ -85,21 +93,34 @@ return {
         last_activity_ = std::chrono::steady_clock::now();
     }
 
-    bool close_if_inactive(std::chrono::steady_clock::time_point now,
-                           std::chrono::seconds timeout) {
+    // Terminal state and idle expiry share the actual request-admission lock.
+    // A closed stream is eligible even when healthy idle expiry is disabled.
+    bool try_retire(std::chrono::steady_clock::time_point now,
+                    std::chrono::seconds timeout, bool close_requested = false) {
         std::lock_guard<std::mutex> lk(m_);
-        if (closed_.load(std::memory_order_acquire) || active_requests_ != 0 ||
-            now - last_activity_ <= timeout) return false;
+        if (close_requested) {
+            closed_.store(true, std::memory_order_release);
+            cv_.notify_all();
+        }
+        if (retirement_claimed_ || active_requests_ != 0) return false;
+        if (!closed_.load(std::memory_order_acquire) &&
+            (timeout.count() == 0 || now - last_activity_ <= timeout)) return false;
+        retirement_claimed_ = true;
         closed_.store(true, std::memory_order_release);
         cv_.notify_all();
         return true;
+    }
+
+    bool close_if_inactive(std::chrono::steady_clock::time_point now,
+                           std::chrono::seconds timeout) {
+        return try_retire(now, timeout);
     }
 
     // Get the last activity time]],
         },
         {
             from = "    std::chrono::steady_clock::time_point last_activity_{std::chrono::steady_clock::now()};",
-            to = "    unsigned int active_requests_{0};\n    std::chrono::steady_clock::time_point last_activity_{std::chrono::steady_clock::now()};",
+            to = "    unsigned int active_requests_{0};\n    bool retirement_claimed_{false};  // protected by m_\n    std::chrono::steady_clock::time_point last_activity_{std::chrono::steady_clock::now()};",
         },
         {
             from = "/**\n * @class server",
@@ -303,8 +324,51 @@ private:
             from = [[        LOG_INFO("Closing inactive session: ", session_id);
         
         close_session(session_id);]],
-            to = [[        // Recheck activity and retire under the same lock as POST admission.
-        close_session(session_id, true);]],
+            to = [[        // Exact instance recheck under the same lock as POST admission.
+        close_session(session_id, true, dispatcher);]],
+        },
+        {
+            from = "    if (!running_ || session_timeout_ == 0) return;",
+            to = "    if (!running_) return;",
+        },
+        {
+            from = "    std::vector<std::string> sessions_to_close;",
+            to = "    std::vector<std::pair<std::string, std::shared_ptr<event_dispatcher>>> sessions_to_close;",
+        },
+        {
+            from = "            if (now - dispatcher->last_activity() > timeout) {",
+            to = "            if (dispatcher->is_closed() || (session_timeout_ != 0 && now - dispatcher->last_activity() > timeout)) {",
+        },
+        {
+            from = "                sessions_to_close.push_back(session_id);",
+            to = "                sessions_to_close.emplace_back(session_id, dispatcher);",
+        },
+        {
+            from = "    for (const auto& session_id : sessions_to_close) {",
+            to = "    for (const auto& [session_id, dispatcher] : sessions_to_close) {",
+        },
+        {
+            from = [[    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (session_dispatchers_.find(session_id) == session_dispatchers_.end()) {
+            res.status = 404;
+            return;
+        }
+    }
+
+    close_session(session_id);]],
+            to = [[    std::shared_ptr<event_dispatcher> expected;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto session = session_dispatchers_.find(session_id);
+        if (session == session_dispatchers_.end()) {
+            res.status = 404;
+            return;
+        }
+        expected = session->second;
+    }
+
+    close_session(session_id, false, expected);]],
         },
     },
 }
