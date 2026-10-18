@@ -268,7 +268,7 @@ namespace
 						try { logs::error("devbench: deferred input/UI publication failed; admission revoked"); } catch (...) {}
 					}
 				});
-				logs::info("devbench: prepared; safe main-thread startup task queued (not ready)");
+				try { logs::info("devbench: prepared; safe main-thread startup task queued (not ready)"); } catch (...) {}
 			} catch (...) {
 				(void)g_startup.SchedulingFailed(operations, std::current_exception());
 			}
@@ -292,7 +292,9 @@ namespace
 			// Latch even before readiness, then install only on the safe main queue.
 			if (!g_startup.Ready()) return; // Complete drains these latches after commit.
 			try {
-				if (auto* tasks = SKSE::GetTaskInterface()) tasks->AddTask([] {
+				auto* tasks = SKSE::GetTaskInterface();
+				if (!tasks) throw std::runtime_error("SKSE task interface unavailable for input/UI publication");
+				tasks->AddTask([] {
 					try { DrainStartupMilestones(); } catch (...) {
 						if (g_postLoadOperations) (void)g_startup.PublicationFailed(*g_postLoadOperations, std::current_exception());
 					}
