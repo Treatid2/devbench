@@ -38,9 +38,19 @@ namespace dvb
 			json        payload;
 		};
 
-		EventBus()
+		explicit EventBus(bool a_startDelivery = true)
 		{
+			if (a_startDelivery) StartDelivery();
+		}
+
+		// Owner-only safe-phase operation. Server prepares a thread-free bus in
+		// PostLoad and starts delivery only outside Windows loader serialization.
+		void StartDelivery()
+		{
+			std::lock_guard lock(m_mutex);
+			if (m_worker.joinable()) return;
 			m_worker = std::thread([this] { DeliverLoop(); });
+			m_deliveryStarted = true;
 		}
 
 		~EventBus()
@@ -110,7 +120,9 @@ namespace dvb
 					m_recent.erase(m_recent.begin());
 				// A failed worker still leaves the recent ring available for inspection,
 				// but must not accumulate an undrainable delivery queue indefinitely.
-				if (!m_deliveryStopped.load(std::memory_order_acquire))
+				// Pre-start events remain in the bounded recent ring only. No
+				// unbounded queue or implied subscriber delivery before safe startup.
+				if (m_deliveryStarted && !m_deliveryStopped.load(std::memory_order_acquire))
 					m_deliverQueue.push_back(ev);  // hand off; worker delivers
 			}
 			m_cv.notify_one();
@@ -210,6 +222,7 @@ namespace dvb
 		std::condition_variable m_cv;
 		std::thread             m_worker;
 		bool                    m_stop = false;
+		bool                    m_deliveryStarted = false; // protected by m_mutex
 		std::mutex              m_deliverMutex;  // held across a notify batch; Unsubscribe barriers on it
 		std::atomic<uint64_t>    m_subscriberFailures{ 0 };
 		std::atomic<bool>        m_deliveryStopped{ false };

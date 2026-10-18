@@ -67,6 +67,28 @@ add_files("src/RecordingsMenu.cpp")
 add_includedirs("src")
 target_end()
 
+-- Offline Windows load-context regression. Broker owns compilation; the host
+-- alone LoadLibrary/FreeLibrary's its exact fixture. No game/SKSE/installed DLL.
+target("devbench-loader-fixture")
+set_kind("shared")
+set_default(false)
+set_languages("c++23")
+add_deps("cpp-mcp")
+add_packages("nlohmann_json")
+add_includedirs("src", "tests")
+add_files("tests/loader/LoaderFixture.cpp")
+set_pcxxheader("tests/pch.h")
+add_cxflags("/utf-8", "/EHsc", { force = true })
+target_end()
+
+target("devbench-loader-tests")
+set_kind("binary")
+set_default(false)
+set_languages("c++23")
+add_files("tests/loader/LoaderHost.cpp")
+add_cxflags("/utf-8", "/EHsc", { force = true })
+target_end()
+
 -- Standalone transport regression: the exact patched cpp-mcp server, no SKSE,
 -- CommonLib, game, deployment or external endpoint. Compile-only via Broker;
 -- assertion execution belongs to the receiving task. Not selected by default.

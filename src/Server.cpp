@@ -100,6 +100,7 @@ namespace dvb
 		if (const auto current = std::atomic_load(&m_mcp); current && current->is_running())
 			return true;
 		StopLocked();  // a failed retained owner must not masquerade as success
+		m_events.StartDelivery(); // Start is invoked only from the safe main-thread task.
 		constexpr int kMaxTries = 16;
 		for (int offset = 0; offset < kMaxTries; ++offset) {
 			// Avoid overflow/out-of-range ports before creating any transport owner.

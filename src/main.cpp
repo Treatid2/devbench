@@ -37,6 +37,12 @@ namespace
 	spdlog::logger* g_mcpLogger = nullptr;
 	dvb::RetainedLogResult g_retainedLog;
 	dvb::PostLoadStartup g_startup;
+	std::atomic<bool> g_interfacePrepared{ false };
+	std::atomic<bool> g_inputObserved{ false }, g_dataObserved{ false };
+	bool g_inputInstalled = false, g_dataInstalled = false; // safe main-thread tasks only
+	thread_local unsigned g_postLoadCallbackDepth = 0;
+	void DrainStartupMilestones();
+	void InstallObservedMilestones();
 
 	void InitLogging() noexcept
 	{
@@ -125,7 +131,7 @@ namespace
 	// interface request would never reach us without this. Only acts on the request.
 	void OnInterfaceMessage(SKSE::MessagingInterface::Message* a_msg)
 	{
-		if (g_startup.Ready() && g_server && g_server->Ready())
+		if (g_interfacePrepared.load() && g_server)
 			dvb::HostApi::OnInterfaceRequest(a_msg);
 	}
 
@@ -160,7 +166,13 @@ namespace
 			dvb::Capture::SetEvents(&g_server->Events());
 			dvb::Capture::SetDefaults(config);
 			dvb::ArmAutoRun(g_server->Tools(), config.autoRunPath, config.autoRunRestoreScene);
-			dvb::HostApi::Init(g_server->Tools(), g_server->Events());
+			dvb::HostApi::Init(g_server->Tools(), g_server->Events(), g_server->AdmissionToken());
+			// Consumers may register at DataLoaded before the task queue drains.
+			// This publishes registration ownership, NOT transport/tool readiness.
+			auto* messaging = SKSE::GetMessagingInterface();
+			if (!messaging || !messaging->RegisterListener(nullptr, OnInterfaceMessage))
+				throw std::runtime_error("devbench interface listener registration failed");
+			g_interfacePrepared.store(true);
 		}
 
 		bool Listen() { return g_server->Start(); }
@@ -174,14 +186,13 @@ namespace
 			dvb::ConsoleHook::Install(g_server->Events());
 			dvb::ConsoleLogCapture::InstallPrintHook();
 			dvb::CameraOrbit::Install();
-			auto* messaging = SKSE::GetMessagingInterface();
-			if (!messaging || !messaging->RegisterListener(nullptr, OnInterfaceMessage))
-				throw std::runtime_error("devbench interface listener registration failed");
+			InstallObservedMilestones();
 			g_server->SetReady(true);
 		}
 
 		void Quarantine() noexcept
 		{
+			g_interfacePrepared.store(false);
 			if (g_server)
 				g_server->SetReady(false);
 			// Do NOT run pinned stop/destruction here until its cleanup is proven.
@@ -207,14 +218,60 @@ namespace
 			}
 		}
 	};
+	PostLoadOperations* g_postLoadOperations = nullptr; // retained, like registry/bus owner
+
+	void InstallObservedMilestones()
+	{
+		if (g_inputObserved.load() && !g_inputInstalled) {
+			g_inputInstalled = true; // never repeat a partially installed hook
+			dvb::MarkKeyboardInputReady();
+			dvb::MarkVRInputReady(g_server->Events());
+			dvb::InstallInputHotkeys(g_server->Tools(), g_config);
+		}
+		if (g_dataObserved.load() && !g_dataInstalled) {
+			g_dataInstalled = true;
+			dvb::UI::Register();
+			dvb::UI::RegisterFuck();
+			dvb::OnSKSEMessage(SKSE::MessagingInterface::kDataLoaded);
+		}
+	}
+	void DrainStartupMilestones()
+	{
+		if (!g_startup.Ready() || !g_server || !g_server->Ready()) return;
+		InstallObservedMilestones();
+	}
 
 	void StartPostLoad() noexcept
 	{
 		// Even construction of the operation/config object belongs to the SKSE
 		// boundary; no diagnostic failure may escape to another plugin's listener.
 		try {
-			PostLoadOperations operations;
-			g_startup.Run(operations);
+			if (g_startup.Current() != dvb::PostLoadStartup::State::Idle) return;
+			g_postLoadOperations = new PostLoadOperations;
+			auto& operations = *g_postLoadOperations;
+			if (g_startup.Prepare(operations) != dvb::PostLoadStartup::Outcome::Prepared) return;
+			try {
+				auto* tasks = SKSE::GetTaskInterface();
+				if (!tasks) throw std::runtime_error("SKSE task interface unavailable for safe startup");
+				const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+				tasks->AddTask([deadline] {
+					// Fail closed if an adapter violates the deferred-task contract.
+					// Never construct/drain transport workers on inline loader reentry.
+					if (g_postLoadCallbackDepth != 0 || std::chrono::steady_clock::now() >= deadline) {
+						(void)g_startup.SchedulingFailed(*g_postLoadOperations, {});
+						return;
+					}
+					(void)g_startup.Complete(*g_postLoadOperations);
+					try { DrainStartupMilestones(); }
+					catch (...) {
+						(void)g_startup.PublicationFailed(*g_postLoadOperations, std::current_exception());
+						try { logs::error("devbench: deferred input/UI publication failed; admission revoked"); } catch (...) {}
+					}
+				});
+				logs::info("devbench: prepared; safe main-thread startup task queued (not ready)");
+			} catch (...) {
+				(void)g_startup.SchedulingFailed(operations, std::current_exception());
+			}
 		} catch (...) {
 			try { logs::error("devbench: could not construct startup operations"); } catch (...) {}
 		}
@@ -225,7 +282,24 @@ namespace
 		if (!a_msg)
 			return;
 		if (a_msg->type == SKSE::MessagingInterface::kPostLoad) {
+			struct Boundary { Boundary() { ++g_postLoadCallbackDepth; } ~Boundary() { --g_postLoadCallbackDepth; } } boundary;
 			StartPostLoad();
+			return;
+		}
+		if (a_msg->type == SKSE::MessagingInterface::kInputLoaded || a_msg->type == SKSE::MessagingInterface::kDataLoaded) {
+			if (a_msg->type == SKSE::MessagingInterface::kInputLoaded) g_inputObserved.store(true);
+			else g_dataObserved.store(true);
+			// Latch even before readiness, then install only on the safe main queue.
+			if (!g_startup.Ready()) return; // Complete drains these latches after commit.
+			try {
+				if (auto* tasks = SKSE::GetTaskInterface()) tasks->AddTask([] {
+					try { DrainStartupMilestones(); } catch (...) {
+						if (g_postLoadOperations) (void)g_startup.PublicationFailed(*g_postLoadOperations, std::current_exception());
+					}
+				});
+			} catch (...) {
+				if (g_postLoadOperations) (void)g_startup.PublicationFailed(*g_postLoadOperations, std::current_exception());
+			}
 			return;
 		}
 		if (!g_startup.Ready() || !g_server || !g_server->Ready())
@@ -238,19 +312,10 @@ namespace
 			dvb::FreeCamera::EndLoad();
 		// Register input hotkeys at kInputLoaded — BSInputDeviceManager is null at kPostLoad,
 		// so registering then silently no-ops. kInputLoaded fires once the input subsystem is up.
-		if (a_msg->type == SKSE::MessagingInterface::kInputLoaded && g_server) {
-			dvb::MarkKeyboardInputReady();
-			dvb::MarkVRInputReady(g_server->Events());
-			dvb::InstallInputHotkeys(g_server->Tools(), g_config);
-		}
 
 		// Register the optional in-game menus at kDataLoaded (the frameworks are up by then). Each
 		// is inert if its framework isn't installed; both drive devbench via dvb::RunTool, so they
 		// need committed server readiness. SMF and FUCK are independent — host either, both, or neither.
-		if (a_msg->type == SKSE::MessagingInterface::kDataLoaded && g_server) {
-			dvb::UI::Register();
-			dvb::UI::RegisterFuck();
-		}
 
 		if (g_server) {
 			// Never carry a synthetic held key across a scene reset. This callback is on Skyrim's

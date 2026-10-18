@@ -46,6 +46,7 @@ namespace dvb
 		// session IDs cannot admit new requests and retire through idle/owner Stop.
 		void SetReady(bool a_ready) noexcept;
 		bool Ready() const noexcept { return m_ready.load(); }
+		const std::atomic<bool>& AdmissionToken() const noexcept { return m_ready; }
 		// Optional discovery/reporting, outside the required startup transaction.
 		void ReportDiscovery();
 
@@ -55,7 +56,7 @@ namespace dvb
 		std::string                  m_host;
 		int                          m_port;
 		ToolRegistry                 m_registry;
-		EventBus                     m_events;
+		EventBus                     m_events{ false }; // no workers in loader-context preparation
 		std::atomic<bool>            m_ready{ false };
 		// Atomic shared snapshots let Running() inspect without taking the
 		// lifecycle mutex that Stop holds while joining transport callbacks.
