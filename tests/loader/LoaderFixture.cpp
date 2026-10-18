@@ -14,10 +14,13 @@ struct Operations {
     std::unique_ptr<mcp::server> server;
     std::atomic<unsigned> workers{0};
     unsigned factoryCalls = 0;
-    bool fail = false, registered = false, published = false, quarantined = false;
+    bool fail = false, failPrepare = false, registered = false, published = false, quarantined = false;
     bool Configure() { return true; }
     void Construct() {} // Transport must not be constructed in this half.
-    void Prepare() { registered = true; }
+    void Prepare() {
+        if (failPrepare) throw std::runtime_error("injected thread-free preparation failure");
+        registered = true;
+    }
     bool Listen() {
         if (inLoader) throw std::runtime_error("worker phase entered in DllMain");
         bus.StartDelivery();
@@ -65,7 +68,13 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         inLoader = true;
         try {
             ops = new Operations;
+            wchar_t flag[2]{};
+            ops->failPrepare = GetEnvironmentVariableW(L"DEVBENCH_LOADER_FIXTURE_FAIL_PREPARE", flag, 2) != 0;
             const auto result = startup.Prepare(*ops);
+            if (result != dvb::PostLoadStartup::Outcome::Prepared) {
+                delete ops; // Bus was explicitly thread-free; a regression hangs this real loader test.
+                ops = nullptr;
+            }
             inLoader = false;
             return result == dvb::PostLoadStartup::Outcome::Prepared;
         } catch (...) { inLoader = false; return FALSE; }

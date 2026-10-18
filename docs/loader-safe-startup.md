@@ -49,8 +49,9 @@ New Windows-only devbench-loader-fixture DLL executes the actual controller's
 Prepare and thread-free EventBus mode from real DllMain. Its loader host performs
 LoadLibrary, then invokes exported Complete outside loader serialization. Complete
 uses the actual patched mcp::server, exercising pristine startup and injected
-second-worker construction failure/rollback; explicit owned cleanup precedes
-FreeLibrary. It owns only isolated loopback37395; a collision fails, never kills
+second-worker construction failure/rollback; a third load injects preparation
+failure and destroys the thread-free owner inside real DllMain. Explicit safe-phase
+worker cleanup precedes FreeLibrary. It owns only isolated loopback37395; a collision fails, never kills
 another owner. The fixture does not compile SKSE main.cpp or model every consumer;
 actual engine task/milestone ordering still requires source review and requester
 live acceptance. Ordinary host tests cover phase split/scheduling failure and
@@ -58,7 +59,7 @@ deferred EventBus behavior, not the loader context by themselves.
 
 All new artifacts must be exact committed Broker outputs. Compile-only results
 are not assertions. Run loader host with exact issued fixture path, hard45s,
-once per new binary pair; it reports two cases, pristine and rollback. Preserve
+once per new binary pair; it reports three loader cases. Preserve
 old3d19-case suite and live failure, no source-verdict transfer or live retry here.
 Broker must assess the two new nondefault offline targets and lazy-bus/native
 source, retain xmake/pin/generated mirror/source/artifact identities. No install,
