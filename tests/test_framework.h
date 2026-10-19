@@ -45,10 +45,13 @@ namespace tf
 
 	/// Run every registered case; print a per-case PASS/FAIL line and a summary.
 	/// Returns a process exit code: 0 = all passed, 1 = at least one failure.
-	inline int run()
+	inline int run(const std::string& prefix = {})
 	{
 		int failed = 0;
+		std::size_t selected = 0;
 		for (auto& c : cases()) {
+			if (!std::string(c.name).starts_with(prefix)) continue;
+			++selected;
 			const int before = failures();
 			try {
 				c.fn();
@@ -62,8 +65,9 @@ namespace tf
 			if (!ok)
 				++failed;
 		}
-		std::printf("\n%zu case(s), %d failed\n", cases().size(), failed);
-		return failed == 0 ? 0 : 1;
+		std::printf("\n%zu case(s), %d failed\n", selected, failed);
+		if (selected == 0) std::printf("FAIL: no cases matched the selected prefix\n");
+		return selected != 0 && failed == 0 ? 0 : 1;
 	}
 }
 

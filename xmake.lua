@@ -7,6 +7,14 @@ set_xmakever("2.8.2")
 set_config("rex_ini", true)
 set_config("skse_xbyak", true)
 
+-- Private offline qualification variant. Configure in its own managed build
+-- workspace: this changes cpp-mcp class tokens consistently for library + users.
+option("devbench_retirement_tests")
+    set_default(false)
+    set_showmenu(false)
+    set_description("Enable the private no-listener MCP retirement fixtures")
+option_end()
+
 -- includes
 includes("lib/commonlibsse-ng")
 includes("xmake/cpp-mcp.lua")
@@ -78,6 +86,9 @@ add_deps("cpp-mcp")
 add_packages("nlohmann_json")
 add_includedirs("tests", "src")
 add_files("tests/transport/*.cpp", "tests/test_main.cpp")
+if not has_config("devbench_retirement_tests") then
+    remove_files("tests/transport/McpClosedRetirement_test.cpp")
+end
 -- Exercise the real late-registration adapter, not a test-only forwarding seam.
 add_files("src/McpAdapter.cpp", "src/ToolRegistry.cpp")
 set_pcxxheader("tests/pch.h")
@@ -101,6 +112,11 @@ target_end()
 
 -- target
 target("devbench")
+before_build(function(target)
+    if has_config("devbench_retirement_tests") then
+        raise("devbench: retirement fixture variant is offline-only; use a separate default production configuration")
+    end
+end)
 add_deps("commonlibsse-ng", "cpp-mcp", "devbench-UI", "devbench-UI-fuck")
 add_packages("nlohmann_json", "stb")
 
