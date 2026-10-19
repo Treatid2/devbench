@@ -179,3 +179,28 @@ TEST_CASE("reentrant PostLoad does not repeat construction or irreversible publi
 	CHECK(ops.entered.size() == 5);
 	CHECK(startup.Ready());
 }
+
+TEST_CASE("loader preparation returns without worker phases and completes once on safe phase")
+{
+	Startup startup;
+	Operations ops{ &startup };
+	CHECK(startup.Prepare(ops) == Outcome::Prepared);
+	CHECK(startup.Current() == Startup::State::Prepared);
+	CHECK(!startup.Ready());
+	CHECK(ops.entered == std::vector<Phase>({Phase::Configuration, Phase::Construction, Phase::Preparation}));
+	CHECK(!ops.published);
+	CHECK(startup.Complete(ops) == Outcome::Ready);
+	CHECK(startup.Complete(ops) == Outcome::AlreadyAttempted);
+}
+
+TEST_CASE("failed safe-phase scheduling quarantines prepared owner without worker startup")
+{
+	Startup startup;
+	Operations ops{ &startup };
+	CHECK(startup.Prepare(ops) == Outcome::Prepared);
+	CHECK(startup.SchedulingFailed(ops, {}) == Outcome::Failed);
+	CHECK(ops.entered.size() == 3);
+	CHECK(ops.quarantined);
+	CHECK(startup.Complete(ops) == Outcome::AlreadyAttempted);
+	CHECK(!startup.Ready());
+}

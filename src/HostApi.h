@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -14,9 +15,10 @@ namespace dvb
 	namespace HostApi
 	{
 		// Wire the host interface to a process-lifetime registry + bus at kPostLoad.
-		// Interface delivery is gated by committed PostLoad readiness; consumers
-		// request it at kDataLoaded, after every plugin's kPostLoad has finished.
-		void Init(ToolRegistry& a_registry, EventBus& a_events);
+		// Registration interface is available after thread-free preparation, so
+		// DataLoaded consumers need not wait for transport startup. Runtime mutation
+		// remains gated by the retained admission token; no public ABI change.
+		void Init(ToolRegistry& a_registry, EventBus& a_events, const std::atomic<bool>& a_ready);
 
 		// Handle a DevBenchMessage::kMessage_GetInterface request. Call from the SKSE
 		// message listener for every message — it no-ops unless it's the request.

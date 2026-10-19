@@ -18,6 +18,7 @@ namespace dvb::HostApi
 	{
 		ToolRegistry* g_registry = nullptr;
 		EventBus*     g_events = nullptr;
+		const std::atomic<bool>* g_ready = nullptr;
 
 		// Registrant ledger: who asked for the C-ABI interface, and what they registered
 		// through it. Both grow only (append-only, process lifetime) — a plugin unregistering
@@ -146,6 +147,7 @@ namespace dvb::HostApi
 
 			bool SetTimeScale(float a_scale, std::uint32_t a_leaseMs, const char* a_owner) override
 			{
+				if (!g_ready || !g_ready->load()) return false;
 				// No allowHigh/allowTimeScale through the ABI: a consumer gets the documented range
 				// and never a scale that would silently invalidate another caller's capture.
 				const auto validation = TimeScaleControl::Validate(a_scale, false, false);
@@ -204,10 +206,11 @@ namespace dvb::HostApi
 		}
 	}
 
-	void Init(ToolRegistry& a_registry, EventBus& a_events)
+	void Init(ToolRegistry& a_registry, EventBus& a_events, const std::atomic<bool>& a_ready)
 	{
 		g_registry = &a_registry;
 		g_events = &a_events;
+		g_ready = &a_ready;
 		RegisterSelfTest();
 		RegisterExtensionSelfTests();
 	}
