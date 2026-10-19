@@ -11,7 +11,9 @@ set_config("skse_xbyak", true)
 -- workspace: this changes cpp-mcp class tokens consistently for library + users.
 option("devbench_retirement_tests")
     set_default(false)
-    set_showmenu(false)
+    -- Explicit CLI selection must survive xmake f. A hidden option is not a
+    -- supported selectable variant; seeding config before f is reset to false.
+    set_showmenu(true)
     set_description("Enable the private no-listener MCP retirement fixtures")
 option_end()
 
