@@ -1,6 +1,10 @@
 #include "test_framework.h"
 #include "mcp_server.h"
 
+#if !defined(DEVBENCH_MCP_RETIREMENT_TESTS)
+#error Retirement fixtures require the consistently configured private offline variant
+#endif
+
 #include <atomic>
 #include <future>
 #include <latch>
@@ -50,6 +54,16 @@ struct McpSessionRetirementFixture {
         std::lock_guard lock(d->m_);
         d->last_activity_ = std::chrono::steady_clock::now() - 1h;
     }
+    static void PrimePendingPayload(const std::shared_ptr<mcp::event_dispatcher>& d) {
+        // Pinned send_event publishes cid=old-id and increments id. A waiter
+        // arriving afterwards snapshots the new id and otherwise just times out.
+        // Set only that private test precondition under the production lock;
+        // wait_event itself must copy the payload and invoke the real sink path.
+        std::lock_guard lock(d->m_);
+        if (d->message_.empty() || d->closed_.load() || d->id_.load() != d->cid_.load() + 1)
+            throw std::runtime_error("unexpected pinned dispatcher generation");
+        d->cid_.store(d->id_.load());
+    }
     void Sweep() { server.check_inactive_sessions(); }
     void Close(const std::string& id, const std::shared_ptr<mcp::event_dispatcher>& d, bool idle = false) {
         server.close_session(id, idle, d);
@@ -85,12 +99,20 @@ void SinkFailure(bool throws) {
     auto d = f.Insert("owned");
     if (!d) throw std::runtime_error("fixture admission failed");
     httplib::DataSink sink;
-    sink.write = [throws](const char*, std::size_t) -> bool {
+    unsigned writes = 0;
+    const std::string payload = "event: message\ndata: payload\n\n";
+    sink.write = [throws, &writes, &payload](const char* data, std::size_t size) -> bool {
+        ++writes;
+        CHECK(std::string(data, size) == payload);
         if (throws) throw std::runtime_error("injected sink failure");
         return false;
     };
-    CHECK(d->send_event("event: message\ndata: payload\n\n"));
-    CHECK(!d->wait_event(&sink, 0ms));
+    CHECK(d->send_event(payload));
+    Fixture::PrimePendingPayload(d);
+    bool timedOut = true;
+    CHECK(!d->wait_event(&sink, 0ms, &timedOut));
+    CHECK(!timedOut);
+    CHECK(writes == 1);
     CHECK(d->is_closed());
     f.Sweep();
     CHECK(f.Count() == 0);

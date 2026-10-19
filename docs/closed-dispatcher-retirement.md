@@ -1,7 +1,6 @@
 # Closed dispatcher retirement
 
-This change is based on experimental composition `31e9c98`, not the older
-`216866` module presently reported by Mapping. It changes maintained cpp-mcp
+This change is based on experimental composition `31e9c98`. It changes maintained cpp-mcp
 overlays and the owned close-session fragment, never the pinned dependency.
 It is a source correction, not proof of the cause of any observed live 503.
 
@@ -31,13 +30,28 @@ remains unchanged; failed-initialize exact-instance rollback is also unchanged.
 
 ## Offline qualification
 
-The new `McpSessionRetirementFixture` friend is defined only in the transport-test
-translation unit. It drives the actual production dispatcher, table,
+The new `McpSessionRetirementFixture` is available only in a separately configured
+offline variant (`devbench_retirement_tests=true`). The cpp-mcp target exports
+`DEVBENCH_MCP_RETIREMENT_TESTS` PUBLIC so both the actual library and every
+consumer see identical class definitions; no consumer-only macro/ODR mismatch.
+The default production configuration has no active fixture declaration/friends
+and excludes the fixture TU. Building the production DLL in the offline fixture
+configuration is explicitly refused. Broker must qualify both option states in
+separate managed build workspaces. No installed dependency copy is modified.
+
+The fixture drives the actual production dispatcher, table,
 `close_session`, maintenance, DELETE and POST handler. No parallel toy table,
 listener, socket, game connection or native SDK is used. It controls fixture
 activity timestamps and maintenance invocation instead of sleeping through real
 idle intervals. The actual admitted-POST case synchronizes on handler entry,
 limits its release wait to two seconds and verifies completion before retirement.
+For sink-failure cases it deterministically primes the pending message generation
+under the dispatcher mutex, then invokes production `wait_event`. This is a
+disclosed private fixture precondition, not proof of all provider scheduling.
+Both false-return and throwing sinks must be invoked exactly once with the exact
+payload, report no timeout, close the dispatcher, retire with timeout zero, run
+cleanup once and allow slot reuse. Sending before a zero-time wait alone cannot
+exercise that pinned generation protocol; original d4 review finding is retained.
 
 Run the issued **new exact transport-test binary** with the single argument:
 

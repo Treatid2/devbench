@@ -25,15 +25,15 @@ return {
         },
         {
             from = "#define MCP_SERVER_H",
-            to = '#define MCP_SERVER_H\n#include <future>\n#include "ContainedThreadEntry.h"\n#include "SessionCapacityAdmission.h"\n#include "SessionInitializationState.h"\n#include "SessionRegistrationRollback.h"\n#include "SseProviderPump.h"\n#include "ImmutableCallbackSnapshot.h"\nnamespace dvb { struct McpSessionRetirementFixture; }',
+            to = '#define MCP_SERVER_H\n#include <future>\n#include "ContainedThreadEntry.h"\n#include "SessionCapacityAdmission.h"\n#include "SessionInitializationState.h"\n#include "SessionRegistrationRollback.h"\n#include "SseProviderPump.h"\n#include "ImmutableCallbackSnapshot.h"\n#if defined(DEVBENCH_MCP_RETIREMENT_TESTS)\nnamespace dvb { struct McpSessionRetirementFixture; }\n#endif',
         },
         {
             from = "class event_dispatcher {",
-            to = "class event_dispatcher {\n    friend struct ::dvb::McpSessionRetirementFixture;",
+            to = "class event_dispatcher {\n#if defined(DEVBENCH_MCP_RETIREMENT_TESTS)\n    friend struct ::dvb::McpSessionRetirementFixture;\n#endif",
         },
         {
             from = "class server {",
-            to = "class server {\n    friend struct ::dvb::McpSessionRetirementFixture;",
+            to = "class server {\n#if defined(DEVBENCH_MCP_RETIREMENT_TESTS)\n    friend struct ::dvb::McpSessionRetirementFixture;\n#endif",
         },
         {
             from = "    bool running_ = false;",

@@ -52,6 +52,12 @@ add_defines(
     { public = true }
 )
 
+-- A separately configured offline binary, never the production DLL. PUBLIC is
+-- essential: the library and every consuming TU must see the same class tokens.
+if has_config("devbench_retirement_tests") then
+    add_defines("DEVBENCH_MCP_RETIREMENT_TESTS", { public = true })
+end
+
 add_cxflags("/utf-8", "/bigobj", "/W0", "/std:c++17", { force = true })
 add_packages("nlohmann_json")
 add_syslinks("ws2_32", "crypt32")
