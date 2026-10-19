@@ -39,6 +39,15 @@ and excludes the fixture TU. Building the production DLL in the offline fixture
 configuration is explicitly refused. Broker must qualify both option states in
 separate managed build workspaces. No installed dependency copy is modified.
 
+The option is explicitly selectable: pass `--devbench_retirement_tests=y` to
+the owning offline xmake configuration. The ordinary default remains false.
+Broker must read the actual post-configure value and generated library/consumer
+commands, requiring the macro on every relevant TU and the fixture TU present
+BEFORE starting the compile. The original hidden-option attempt configured false
+despite a prior private seed; its transport output is retained but ineligible for
+these seven cases. Do not relabel that binary, seed an unproven private option or
+retry a compiler whose generated inputs demonstrably exclude the fixture.
+
 The fixture drives the actual production dispatcher, table,
 `close_session`, maintenance, DELETE and POST handler. No parallel toy table,
 listener, socket, game connection or native SDK is used. It controls fixture
