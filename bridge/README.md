@@ -66,6 +66,44 @@ You can also get this exact snippet live from a running game: `GET /api/tools`'s
 - `--install <path>` — target a specific Skyrim install directory (required if devbench
   isn't in one of the default Steam locations, or you're running a non-default copy).
 - `setup` — print the `.mcp.json` snippet instead of running as an MCP server.
+- `--rest-timeout-ms <milliseconds>` — tool-call REST deadline, integer1..540000;
+  default30000. Applies to the response headers AND complete body of each single
+  forwarded tool call. `tools/list` discovery retains its independent30s bound.
+  Invalid/missing/duplicate timeout values and unknown flags fail before starting
+  stdio or issuing requests. `setup` preserves an explicitly selected value in
+  its printed snippet; it still writes no configuration.
+
+## Long calls and uncertain results
+
+This option is per bridge process, not a native argument or an MCP per-call timeout
+extension. It forwards the SAME native method/arguments ONCE, without splitting
+waits or replaying. Example: `--game vr --rest-timeout-ms 124000` admits a120000ms
+server operation only if the independently configured MCP client envelope is
+strictly longer (e.g.125000ms). Other selected envelopes are60000/64000/65000 and
+30000/34000/35000ms (server/bridge/client). A shared bridge configuration must be
+large enough for its longest admitted operation. The entire owning package still
+has its own600s limit; selecting540000 does not establish that other work fits.
+Changing an outer client timeout alone cannot extend this bridge deadline.
+
+The maximum is a finite bridge guard, not proof that a particular native operation,
+client, artifact or SDK supports that duration. Callers must qualify the actual
+selected bridge binary and client configuration. The old a1c0056/77104d76 issued
+binary has NO timeout flag and remains fixed30s; new source is not its runtime.
+Neither this option nor `setup` edits/reloads client config or deploys a bridge.
+
+POST timeout, transport/read failure, malformed response or HTTP error returns
+an MCP error with `restError` including code, outcome="unknown", retrySafe=false
+and timeoutMs; HTTP responses also preserve status and exact parsed body (or raw
+non-JSON text). A complete successful JSON response is passed through unchanged,
+including native error values in HTTP200. In particular a timed-out POST is NOT
+relabeled "game not running": native work may already have happened or may still
+complete. Reconcile its original identity/effects; never automatically replay.
+The abort bounds bridge response waiting, not native task cancellation or cleanup.
+
+`node --test test/rest-policy.test.mjs` runs offline policy/owned-loopback tests
+on Node24's native TypeScript stripping, no tsc/build output or game connection.
+Standalone executable compilation, matching issued source/artifact identity and
+actual stdio adapter/client qualification remain separate owner stages.
 
 ## Development
 
