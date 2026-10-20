@@ -117,6 +117,13 @@ namespace dvb
 		using RegistrationListener = std::function<void(const ToolDescriptor&)>;
 		void SetRegistrationListener(RegistrationListener a_listener);
 
+		/// Atomically cover every commit with either the returned current snapshot or
+		/// the installed listener. Snapshot allocation completes before installation,
+		/// so failure leaves the previous listener unchanged. Invoke callbacks only
+		/// after releasing this method's lock; concurrent replacement notifications
+		/// may overlap the snapshot and still require serialized current-state reads.
+		std::vector<ToolDescriptor> InstallRegistrationListenerAndSnapshot(RegistrationListener a_listener);
+
 	private:
 		// Narrow host-fixture access to wrap the actual installed callback and force
 		// post-commit inversion. No production diagnostic hook or alternate code path.

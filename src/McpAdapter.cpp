@@ -60,13 +60,15 @@ namespace dvb
 			});
 		};
 
-		for (const auto& desc : m_registry.List())
+		// A registry commit must be covered by the in-lock snapshot or by its
+		// listener (possibly both). List() followed by SetRegistrationListener()
+		// leaves early concurrent consumer registrations in neither coverage path.
+		for (const auto& desc : m_registry.InstallRegistrationListenerAndSnapshot(registerOne))
 			registerOne(desc);
 
-		// Expose tools registered after wiring (cross-plugin consumers). Note: this can
-		// call register_tool after clients connect. The pinned transport synchronizes
-		// catalogue reads and copies a callable before invoking it without its mutex.
-		m_registry.SetRegistrationListener(registerOne);
+		// Snapshot/callback overlap is idempotent by name. registerOne re-reads the
+		// latest descriptor under the callback lease's publication serialization.
+		// Readiness still suppresses notifications until startup commits.
 		m_callbacks->Invoke([](McpAdapter& self) { self.m_announceChanges = true; });
 
 		// Forward bus events to connected MCP clients as notifications.

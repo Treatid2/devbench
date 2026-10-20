@@ -15,8 +15,10 @@ struct Operations {
     std::unique_ptr<mcp::server> server;
     std::atomic<unsigned> workers{0};
     unsigned factoryCalls = 0;
-    bool fail = false, failPrepare = false, registered = false, published = false, quarantined = false;
+    int failureMode = 0;
+    bool failPrepare = false, registered = false, published = false, quarantined = false;
     bool exactPreparationFailure = false;
+    bool injectedSecondWorkerFailure = false, unrelatedFirstWorkerFailure = false;
     bool Configure() { return true; }
     void Construct() {} // Transport must not be constructed in this half.
     void Prepare() {
@@ -31,8 +33,15 @@ struct Operations {
         cfg.port = 37395; // Owned isolated fixture; collision is a failed test.
         cfg.threadpool_size = 2;
         cfg.startup_thread_factory = [this](std::function<void()> body) {
-            if (++factoryCalls == 2 && fail)
+            ++factoryCalls;
+            if (factoryCalls == 1 && failureMode == 2) {
+                unrelatedFirstWorkerFailure = true;
+                throw std::runtime_error("negative control: first worker construction failure");
+            }
+            if (factoryCalls == 2 && failureMode == 1) {
+                injectedSecondWorkerFailure = true;
                 throw std::runtime_error("injected listener worker construction failure");
+            }
             return std::thread([this, body = std::move(body)] {
                 ++workers;
                 struct Exit { std::atomic<unsigned>& count; ~Exit() { --count; } } exit{workers};
@@ -41,6 +50,10 @@ struct Operations {
         };
         server = std::make_unique<mcp::server>(cfg);
         return server->start(false);
+    }
+    bool ExactSecondWorkerFailure() const {
+        return factoryCalls == 2 && injectedSecondWorkerFailure &&
+            !unrelatedFirstWorkerFailure && server && !server->last_start_bind_failed();
     }
     void Publish() { published = true; }
     void Quarantine() { quarantined = true; published = false; }
@@ -54,14 +67,20 @@ struct Operations {
 Operations* ops = nullptr;
 }
 
-extern "C" __declspec(dllexport) int CompleteStartup(int fail) {
+extern "C" __declspec(dllexport) int CompleteStartup(int mode) {
     if (!ops || inLoader || startup.Current() != dvb::PostLoadStartup::State::Prepared ||
-        ops->server || ops->factoryCalls != 0 || !ops->registered) return 10;
-    ops->fail = fail != 0;
+        ops->server || ops->factoryCalls != 0 || !ops->registered || mode < 0 || mode > 2) return 10;
+    ops->failureMode = mode;
     const auto outcome = startup.Complete(*ops);
-    const bool stateOK = fail ? outcome == dvb::PostLoadStartup::Outcome::Failed &&
-        !startup.Ready() && ops->quarantined && !ops->published :
-        outcome == dvb::PostLoadStartup::Outcome::Ready && startup.Ready() && ops->published;
+    const bool failedState = outcome == dvb::PostLoadStartup::Outcome::Failed &&
+        !startup.Ready() && ops->quarantined && !ops->published;
+    const bool exactSecond = ops->ExactSecondWorkerFailure();
+    const bool stateOK = mode == 0 ?
+        outcome == dvb::PostLoadStartup::Outcome::Ready && startup.Ready() && ops->published :
+        mode == 1 ? failedState && exactSecond :
+        failedState && !exactSecond && ops->unrelatedFirstWorkerFailure &&
+            ops->factoryCalls == 1 && !ops->injectedSecondWorkerFailure &&
+            ops->server && !ops->server->last_start_bind_failed();
     if (ops->server) ops->server->stop(); // Actual production drain, outside loader context.
     const bool drained = ops->workers == 0;
     // Explicit owner cleanup before FreeLibrary; DllMain never joins/detaches.

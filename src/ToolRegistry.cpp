@@ -25,6 +25,17 @@ namespace dvb
 		m_onRegister = std::move(a_listener);
 	}
 
+	std::vector<ToolDescriptor> ToolRegistry::InstallRegistrationListenerAndSnapshot(RegistrationListener a_listener)
+	{
+		std::lock_guard             lock(m_mutex);
+		std::vector<ToolDescriptor> snapshot;
+		snapshot.reserve(m_tools.size());
+		for (const auto& [name, entry] : m_tools)
+			snapshot.push_back(entry.desc);
+		m_onRegister = std::move(a_listener);
+		return snapshot;
+	}
+
 	bool ToolRegistry::Has(std::string_view a_name) const
 	{
 		std::lock_guard lock(m_mutex);

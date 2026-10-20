@@ -30,6 +30,10 @@ namespace dvb
 		void Wire();
 
 	private:
+		// Same narrow host fixture as ToolRegistry: hold actual publication while
+		// observing the real handoff, without adding a production hook/code path.
+		friend struct ToolRegistryPublicationFixture;
+
 		ToolRegistry& m_registry;
 		EventBus&     m_events;
 		mcp::server&  m_server;
