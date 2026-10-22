@@ -884,6 +884,8 @@ namespace dvb::Recording
 				openMenus.push_back(menu);
 			manifest["openMenusAtStart"] = std::move(openMenus);
 			manifest["menuInventoryInitializedAtStart"] = menuInventory.initialized;
+			manifest["menuInventoryEventsSubscribedAtStart"] = menuInventory.eventsSubscribed;
+			manifest["menuInventorySourceAtStart"] = menuInventory.Source();
 			manifest["startState"] = anchored ? "playerLoaded" : "noPlayer";
 			if (manifest.value("entryPoint", json::object()).value("kind", std::string{}) == "unknown")
 				logs::info(

@@ -222,6 +222,9 @@ namespace
 
 	void InstallObservedMilestones()
 	{
+		// Runs only on the already-qualified main task, never in the loader callback.
+		// Recover a null UI / raced seed without duplicating event registrations.
+		dvb::RefreshMenuEventInventory();
 		if (g_inputObserved.load() && !g_inputInstalled) {
 			g_inputInstalled = true; // never repeat a partially installed hook
 			dvb::MarkKeyboardInputReady();

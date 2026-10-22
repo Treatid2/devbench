@@ -109,23 +109,30 @@ namespace dvb
 		// replay, if ever wanted, needs a lower-frequency or off-main-thread approach, not this.
 	}
 
-	void InstallGameEvents(EventBus& a_bus)
+	void RefreshMenuEventInventory()
 	{
-		g_bus = &a_bus;
-		if (auto* ui = RE::UI::GetSingleton()) {
+		auto* ui = RE::UI::GetSingleton();
+		const auto result = g_menus.Install(ui != nullptr, [ui] {
 			ui->AddEventSink<RE::MenuOpenCloseEvent>(&g_menuSink);
-			const auto revision = g_menus.BeginSeed();
+		}, [ui] {
 			std::vector<std::string> open;
 			// This stage runs on the main thread. A registered factory or retained
 			// menu instance is not enough: match UI::IsMenuOpen's OnStack predicate.
 			for (const auto& entry : ui->menuMap)
 				if (entry.second.menu && entry.second.menu->OnStack())
 					open.emplace_back(entry.first.c_str());
-			if (!g_menus.Seed(revision, open))
-				logs::warn("devbench: initial menu snapshot raced an event; inventory absence remains unknown");
-		} else {
-			logs::warn("devbench: UI unavailable at sink installation; menu inventory absence remains unknown");
-		}
+			return open;
+		});
+		if (result == MenuInventory::InstallResult::SeedRaced)
+			logs::warn("devbench: initial menu snapshot raced an event; inventory absence remains unknown");
+		else if (result == MenuInventory::InstallResult::UiUnavailable)
+			logs::warn("devbench: UI unavailable; menu subscription/seed deferred to later main-thread milestones");
+	}
+
+	void InstallGameEvents(EventBus& a_bus)
+	{
+		g_bus = &a_bus;
+		RefreshMenuEventInventory();
 		if (auto* holder = RE::ScriptEventSourceHolder::GetSingleton())
 			holder->AddEventSink<RE::TESCellFullyLoadedEvent>(&g_cellSink);
 	}

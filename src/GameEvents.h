@@ -26,6 +26,12 @@ namespace dvb
 	/// Subscribe then seed from the current UI; do not synthesize open events.
 	void InstallGameEvents(EventBus& a_bus);
 
+	/// Retry only an incomplete menu subscription/seed on a qualified main-thread
+	/// task. Idempotent: never duplicates the sink or overwrites a complete seed.
+	/// If all existing milestones still lack UI, provenance stays no-sink/unknown;
+	/// this does not promise a background retry or block server readiness.
+	void RefreshMenuEventInventory();
+
 	/// Forward an SKSE MessagingInterface message type; publishes a "lifecycle" event
 	/// (dataLoaded / newGame / preLoadGame / postLoadGame / saveGame / deleteGame).
 	/// No-op until InstallGameEvents has run.

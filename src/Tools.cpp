@@ -2081,25 +2081,16 @@ namespace dvb
 		{
 			try {
 				const json names = MainThread::RunAndWait([]() -> json {
-					json out = json::array();
 					const auto inventory = GetMenuInventory();
-					if (!inventory.initialized)
-						return json::array({ "<menu-inventory-unknown>" });
-					if (auto* ui = RE::UI::GetSingleton()) {
-						for (const auto& name : inventory.openMenus) {
-							if (name == RE::Console::MENU_NAME)
-								continue;
-							const auto menu = ui->GetMenu(name);
-							auto*      m = menu.get();
-							if (!m || m->AlwaysOpen())
-								continue;
-							if (m->PausesGame() || m->Modal() || m->UsesCursor() || m->FreezeFramePause())
-								out.push_back(name);
-						}
-					} else {
-						return json::array({ "<ui-unavailable>" });
-					}
-					return out;
+					auto* ui = RE::UI::GetSingleton();
+					return ReadBlockingMenus(inventory, ui != nullptr, RE::Console::MENU_NAME,
+						[ui](const std::string& a_name) -> std::optional<MenuBlockingFlags> {
+							const auto menu = ui->GetMenu(a_name);
+							if (!menu)
+								return std::nullopt;
+							return MenuBlockingFlags{ menu->AlwaysOpen(), menu->PausesGame(), menu->Modal(),
+								menu->UsesCursor(), menu->FreezeFramePause() };
+						});
 				},
 					milliseconds(1000));
 				return names.get<std::vector<std::string>>();
