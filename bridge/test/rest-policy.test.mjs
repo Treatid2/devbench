@@ -2,8 +2,43 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { test } from "node:test";
+import { registerHooks } from "node:module";
+import { mkdtemp, writeFile, unlink, rmdir } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { parseBridgeArgs, validateRestTimeout, fetchToolJson, RestCallError,
   DEFAULT_REST_TIMEOUT_MS, MAX_REST_TIMEOUT_MS } from "../src/rest-policy.ts";
+
+// Node strips the real production TS; only its two .js import specifiers need
+// mapping to their exact TS sources. No production code or HTTP is replaced.
+// Scope the hook to proxy.ts and remove it immediately after module loading.
+async function sourceProxy() {
+  const proxyUrl = new URL("../src/proxy.ts", import.meta.url).href;
+  const loader = registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (context.parentURL === proxyUrl &&
+          (specifier === "./runtime.js" || specifier === "./rest-policy.js")) {
+        return nextResolve(new URL(specifier.replace(/\.js$/, ".ts"), proxyUrl).href, context);
+      }
+      return nextResolve(specifier, context);
+    },
+  });
+  try { return await import(proxyUrl); }
+  finally { loader.deregister(); }
+}
+const { callTool } = await sourceProxy();
+
+async function targetFixture(url, run) {
+  const dir = await mkdtemp(join(tmpdir(), "devbench-redirect-owned-"));
+  const file = join(dir, "runtime.json");
+  try {
+    await writeFile(file, JSON.stringify({ port: Number(new URL(url).port) }));
+    await run({ label: "owned-loopback", runtimeDir: dir });
+  } finally {
+    await unlink(file).catch((error) => { if (error.code !== "ENOENT") throw error; });
+    await rmdir(dir);
+  }
+}
 
 async function fixture(handler, run) {
   const server = createServer(handler);
@@ -133,4 +168,82 @@ test("rest policy: disconnected response is uncertain, not a missing game claim"
     });
   });
   assert.equal(calls, 1);
+});
+
+for (const status of [301, 302, 303, 307, 308]) {
+  test(`rest policy: production callTool never follows ${status} or resends its POST body`, async () => {
+    let calls = 0, redirected = 0;
+    const args = { operation: "owned-mutation", nested: [null, false, "original"] };
+    const refusal = { error: "owned redirect refusal", status };
+    await fixture((_req, res) => { redirected++; res.end('{"unexpected":"followed"}'); }, async (other) => {
+      await fixture(async (req, res) => {
+        calls++;
+        assert.equal(req.method, "POST");
+        assert.equal(req.url, "/api/tool/fixture%2Fmutation");
+        let text = "";
+        for await (const chunk of req) text += chunk;
+        assert.equal(text, JSON.stringify(args));
+        res.writeHead(status, { Location: `${other}/must-not-receive-body` });
+        res.end(JSON.stringify(refusal));
+      }, async (url) => {
+        await targetFixture(url, async (target) => {
+          await assert.rejects(callTool(target, "fixture/mutation", args, 1500), (error) => {
+            assert.ok(error instanceof RestCallError);
+            assert.deepEqual(error.details(), {
+              code: "REST_HTTP_ERROR", outcome: "unknown", retrySafe: false,
+              timeoutMs: 1500, httpStatus: status, responseBody: refusal,
+            });
+            return true;
+          });
+        });
+      });
+    });
+    assert.equal(calls, 1);
+    assert.equal(redirected, 0); // no POST replay, transformed GET, or target qualification
+  });
+}
+
+test("rest policy: caller redirect follow option cannot override the no-replay policy", async () => {
+  let calls = 0, redirected = 0;
+  await fixture((_req, res) => { redirected++; res.end('{"unexpected":true}'); }, async (other) => {
+    await fixture((_req, res) => {
+      calls++;
+      res.writeHead(307, { Location: `${other}/not-called` });
+      res.end("original non-JSON redirect body");
+    }, async (url) => {
+      await assert.rejects(fetchToolJson(url, { method: "POST", body: "original", redirect: "follow" }, 1500), (error) => {
+        assert.equal(error.code, "REST_HTTP_ERROR");
+        assert.equal(error.httpStatus, 307);
+        assert.equal(error.responseBody, "original non-JSON redirect body");
+        assert.equal(error.retrySafe, false);
+        return true;
+      });
+    });
+  });
+  assert.equal(calls, 1);
+  assert.equal(redirected, 0);
+});
+
+test("rest policy: production redirect body retains the original finite deadline", async () => {
+  let calls = 0, redirected = 0;
+  await fixture((_req, res) => { redirected++; res.end('{}'); }, async (other) => {
+    await fixture((_req, res) => {
+      calls++;
+      res.writeHead(308, { Location: `${other}/not-called` });
+      res.flushHeaders();
+      res.write('{"unfinished":');
+    }, async (url) => {
+      await targetFixture(url, async (target) => {
+        await assert.rejects(callTool(target, "fixture-deadline", {}, 150), (error) => {
+          assert.equal(error.code, "REST_TIMEOUT");
+          assert.equal(error.timeoutMs, 150);
+          assert.equal(error.outcome, "unknown");
+          assert.equal(error.retrySafe, false);
+          return true;
+        });
+      });
+    });
+  });
+  assert.equal(calls, 1);
+  assert.equal(redirected, 0);
 });

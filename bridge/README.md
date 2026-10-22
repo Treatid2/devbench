@@ -77,7 +77,13 @@ You can also get this exact snippet live from a running game: `GET /api/tools`'s
 
 This option is per bridge process, not a native argument or an MCP per-call timeout
 extension. It forwards the SAME native method/arguments ONCE, without splitting
-waits or replaying. Example: `--game vr --rest-timeout-ms 124000` admits a120000ms
+waits or replaying. Tool requests force manual redirect handling after caller
+options: no `Location` is followed, including POST-preserving307/308 and
+method-transforming301/302/303. A3xx response is an uncertain, non-retryable HTTP
+error, preserving the original status and JSON/raw body where the runtime exposes
+them. No second request probes or qualifies the redirect target. The same deadline
+still covers the original response body; a stalled redirect body can time out.
+Example: `--game vr --rest-timeout-ms 124000` admits a120000ms
 server operation only if the independently configured MCP client envelope is
 strictly longer (e.g.125000ms). Other selected envelopes are60000/64000/65000 and
 30000/34000/35000ms (server/bridge/client). A shared bridge configuration must be
@@ -102,6 +108,12 @@ The abort bounds bridge response waiting, not native task cancellation or cleanu
 
 `node --test test/rest-policy.test.mjs` runs offline policy/owned-loopback tests
 on Node24's native TypeScript stripping, no tsc/build output or game connection.
+The test-only resolver maps proxy.ts's two relative.js imports to their exact.ts
+sources during loading, then deregisters; it does not replace HTTP or production
+logic. Redirect regressions exercise actual `callTool` using an owned temporary
+runtime.json and two ephemeral loopback servers. They require one original POST,
+unchanged arguments, zero redirect-target requests, uncertain errors for each of
+301/302/303/307/308, non-overridable policy and a bounded stalled redirect body.
 Standalone executable compilation, matching issued source/artifact identity and
 actual stdio adapter/client qualification remain separate owner stages.
 

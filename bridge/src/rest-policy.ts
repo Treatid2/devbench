@@ -76,6 +76,7 @@ export class RestCallError extends Error {
 
 // The one deadline covers both response headers and the complete body. A timeout
 // cancels only our fetch; it does NOT establish native cancellation or no effect.
+// Never follow Location: even one fetch can otherwise resend/transform a POST.
 export async function fetchToolJson(
   url: string,
   init: RequestInit,
@@ -86,7 +87,7 @@ export async function fetchToolJson(
   let response: Response;
   let text: string;
   try {
-    response = await fetch(url, { ...init, signal });
+    response = await fetch(url, { ...init, signal, redirect: "manual" });
     text = await response.text();
   } catch (error) {
     const timeout = signal.aborted;
