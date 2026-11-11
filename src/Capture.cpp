@@ -1,5 +1,6 @@
 #include "Capture.h"
 
+#include "CaptureProviderBurst.h"
 #include "Config.h"
 #include "EventBus.h"
 #include "GameState.h"
@@ -524,12 +525,15 @@ namespace dvb::Capture
 
 		// ---- provider dispatch ----
 
-		json DispatchToProvider(const std::string& a_providerKey, const json& a_args, const ToolContext& a_ctx)
+		json DispatchToProvider(const std::string& a_providerKey, const json& a_args, const ToolContext& a_ctx, bool a_burst)
 		{
 			const auto start = steady_clock::now();
 			auto       entry = ToolExtensions::Find("capture", a_providerKey);
 			if (!entry)
 				throw ToolError(404, std::format("no capture provider registered under '{}'", a_providerKey));
+
+			if (a_burst)
+				return InvokeProviderBurst(*entry, a_args, a_ctx);
 
 			RejectMisnamedArgs(a_args);
 			const std::string checkpointId = a_args.value("checkpointId", std::string{});
@@ -705,10 +709,16 @@ namespace dvb::Capture
 			return json{ { "extensions", std::move(out) } };
 		}
 
-		// Past the discovery kinds a capture may actually run. It has to be taken at the speed its
-		// golden was, so a scaled game is refused rather than producing an incomparable image.
+		const auto action = a_args.find("action");
+		const bool burstStatus = action != a_args.end() && *action == "burstStatus";
+		const bool burst = burstStatus || (action != a_args.end() && *action == "burst");
+		if (burst && kind == "native")
+			throw ToolError(400, "capture burst actions require a registered provider");
+
+		// Check time scale when starting a capture, including the burst request.
+		// A status query can settle an existing run even if time scale has changed.
 		std::optional<Capturing> capturing;
-		{
+		if (!burstStatus) {
 			// Atomic with TimeScaleControl::Set's own check (same mutex), so a concurrent
 			// setTimeScale can't slip a non-normal scale past this check, or vice versa.
 			std::lock_guard admissionLock(TimeScaleControl::AdmissionMutex());
@@ -725,8 +735,10 @@ namespace dvb::Capture
 		if (kind == "auto") {
 			const auto keys = ToolExtensions::Keys("capture");
 			if (keys.size() == 1)
-				return DispatchToProvider(keys.front(), a_args, a_ctx);
+				return DispatchToProvider(keys.front(), a_args, a_ctx, burst);
 			if (keys.empty()) {
+				if (burst)
+					throw ToolError(404, "capture burst actions require a registered provider");
 				if (a_args.value("allowNative", false))
 					return Native(a_args);
 				throw ToolError(404,
@@ -741,7 +753,7 @@ namespace dvb::Capture
 		}
 
 		// A named provider.
-		return DispatchToProvider(kind, a_args, a_ctx);
+		return DispatchToProvider(kind, a_args, a_ctx, burst);
 	}
 
 	bool InFlight()
@@ -754,7 +766,12 @@ namespace dvb::Capture
 		ToolDescriptor d;
 		d.name = "capture";
 		d.description =
-			"Capture a frame (screenshot) and return its file path plus correlation metadata. "
+			"Capture a frame and return its file path plus correlation metadata. "
+			"Providers that advertise action='burst' in kind='extensions' can also start asynchronous bursts. "
+			"Keep the provider's runId and apiRequestId. Use the same provider with action='burstStatus' and runId, "
+			"or read capture.burst.progress and capture.burst.ready events. The provider reports progress, "
+			"terminal success or failure, and any published manifest. A queued result is only acceptance. "
+			"DevBench checks time scale at burst admission and returns the provider reply without waiting for files. "
 			"kind='auto' (default) picks the sole registered capture provider (a mod that "
 			"registered under the C-ABI RegisterToolExtension(\"capture\", <key>, …) — see inspect "
 			"kind=registrants); zero registered providers is a 404 UNLESS allowNative=true, and two "
@@ -763,7 +780,7 @@ namespace dvb::Capture
 			"directory poll — no path control, no completion signal beyond polling, format fixed by "
 			"the user's .ini, may include open UI) — NOT comparable against a provider-authored "
 			"golden image. kind='providers' lists registered provider keys; kind='extensions' lists "
-			"them with descriptors. The request names the file with 'checkpointId' (not 'id'); "
+			"them with descriptors. A single capture names the file with 'checkpointId' (not 'id'); "
 			"'cleanup':true (native only; not 'deleteSource') deletes the game's own screenshot after "
 			"the copy. The result's 'path' is where the GAME sees the file; 'realPath' is where it "
 			"really is on disk — they differ under Mod Organizer 2, which puts files written into Data "
@@ -772,7 +789,7 @@ namespace dvb::Capture
 			"via SSIM and adds {ssim, threshold, passed} to the result (or 'regions' for independent "
 			"per-region scores, {name,ssim,threshold,passed} each, overall 'passed' is AND across "
 			"all — see record{action:'replay'}'s 'goldens' arg, the normal way this gets set for a "
-			"checkpoint). Every result also carries {inconclusive, inconclusiveReason?} — true when "
+			"checkpoint). A single capture result also carries {inconclusive, inconclusiveReason?} — true when "
 			"sceneMismatch, any 'degraded' entry, or a native-fallback capture means 'passed' (if "
 			"present) should NOT be trusted as a real verdict; always check this before acting on "
 			"'passed'. This is devbench's fast single-checkpoint verdict; batch/corpus regression "
@@ -785,23 +802,46 @@ namespace dvb::Capture
 			{ "type", "object" },
 			{ "properties", json{
 								{ "kind", json{ { "type", "string" }, { "enum", kinds }, { "description", "auto (default) | native | providers | extensions | a registered provider key" } } },
-								{ "checkpointId", json{ { "type", "string" }, { "description", "REQUIRED — stable file stem and correlation key" } } },
+								{ "action", json{ { "type", "string" }, { "enum", { "capture", "burst", "burstStatus" } }, { "default", "capture" } } },
+								{ "checkpointId", json{ { "type", "string" }, { "description", "Single capture: stable file stem and correlation key" } } },
+								{ "requestId", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "Burst: caller-supplied request identity. Keep it when reconciling an uncertain reply." } } },
+								{ "outputDir", json{ { "type", "string" }, { "description", "Burst: absolute output directory in the game's filesystem" } } },
+								{ "prefix", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "Burst: safe frame filename stem" } } },
+								{ "count", json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 600 }, { "description", "Burst: requested frame count" } } },
+								{ "everyNFrames", json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 600 }, { "default", 1 }, { "description", "Burst: frame cadence. The CSX provider bounds (count-1)*everyNFrames to 216000." } } },
+								{ "manifestPath", json{ { "type", "string" }, { "description", "Burst: optional absolute JSON manifest path" } } },
+								{ "runId", json{ { "type", "integer" }, { "description", "For burstStatus, use the runId returned by the same provider." } } },
+								{ "scale", json{ { "type", "number" }, { "description", "Burst: the CSX provider supports scale=1." } } },
 								{ "recording", json{ { "type", "string" }, { "description", "recording file stem, for correlation (default 'adhoc')" } } },
 								{ "variant", json{ { "type", "string" }, { "description", "variant under test, for correlation (default 'default')" } } },
 								{ "allowNative", json{ { "type", "boolean" }, { "description", "permit kind=auto to fall back to the vanilla path when no provider is registered (default false)" } } },
 								{ "allowTimeScale", json{ { "type", "boolean" }, { "description", "capture anyway while the game's time scale is not 1 (default false; a scaled frame is not comparable to a golden taken at normal speed)" } } },
 								{ "excludeUi", json{ { "type", "boolean" }, { "description", "request a pre-UI capture source; native cannot honor this (default true)" } } },
 								{ "outDir", json{ { "type", "string" }, { "description", "override the capture bundle directory" } } },
-								{ "timeoutMs", json{ { "type", "integer" }, { "description", "how long to wait for the capture to be ready (default 8000)" } } },
-								{ "pollMs", json{ { "type", "integer" }, { "description", "poll interval while waiting (default 100)" } } },
-								{ "subrect", json{ { "type", "object" }, { "description", "optional {x,y,w,h} in 0..1 UV — provider-only, native ignores it" } } },
+								{ "timeoutMs", json{ { "type", "integer" }, { "description", "Single capture: how long to wait for readiness (default 8000)" } } },
+								{ "pollMs", json{ { "type", "integer" }, { "description", "Single capture: poll interval while waiting (default 100)" } } },
+								{ "subrect", json{ { "type", { "object", "null" } }, { "description", "Single capture: optional {x,y,w,h} in 0..1 UV. Omit or use null for burst." } } },
 								{ "cleanup", json{ { "type", "boolean" }, { "description", "native only: delete the game's source screenshot after copying (default false)" } } },
 								{ "golden", json{ { "type", "string" }, { "description", "path to a reference image to SSIM-compare this capture against (absolute, or relative to the game root); adds {ssim,threshold,passed} to the result" } } },
 								{ "threshold", json{ { "type", "number" }, { "description", "golden: SSIM >= threshold passes (default 0.98)" } } },
 								{ "regions", json{ { "type", "array" }, { "description", "golden: optional [{name,x,y,w,h,threshold?}] in 0..1 UV — score independent regions instead of the whole frame; overall passed is AND across all" } } },
 							} },
-			{ "required", json::array({ "checkpointId" }) },
 		};
+		d.inputSchema.update(json::parse(R"({
+			"if": {"properties": {"action": {"const": "burst"}}, "required": ["action"]},
+			"then": {
+				"required": ["requestId", "outputDir", "prefix", "count"],
+				"properties": {"scale": {"const": 1}, "subrect": {"type": "null"}}
+			},
+			"else": {
+				"if": {"properties": {"action": {"const": "burstStatus"}}, "required": ["action"]},
+				"then": {
+					"required": ["runId"],
+					"properties": {"runId": {"minimum": 1, "maximum": 9007199254740991}}
+				},
+				"else": {"required": ["checkpointId"], "properties": {"subrect": {"type": "object"}}}
+			}
+		})"));
 		return d;
 	}
 
