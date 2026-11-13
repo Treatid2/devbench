@@ -58,6 +58,7 @@
 #include <fstream>
 #include <functional>
 #include <future>
+#include <limits>
 #include <map>
 #include <optional>
 #include <thread>
@@ -1360,6 +1361,16 @@ namespace dvb
 			return DescribeHands(a_actor, context);
 		}
 
+		int InspectLimit(const json& a_args, const char* a_kind)
+		{
+			constexpr int kMaximum = std::numeric_limits<int>::max();
+			try {
+				return static_cast<int>(ParseBoundedIntegerArgument(a_args, "limit", 100, 0, kMaximum));
+			} catch (const std::invalid_argument&) {
+				throw ToolError(400, std::format("inspect {}: 'limit' must be an integer 0..{}", a_kind, kMaximum));
+			}
+		}
+
 		// Normalize a form-type filter to a substring needle. The engine's type strings are 4-char
 		// codes (ACHR, NPC_, CONT, WEAP); map common friendly names ('actor', 'weapon') onto them so
 		// a substring match works (a longer friendly name like "weapon" never matches "weap"
@@ -2480,26 +2491,6 @@ namespace dvb
 						const auto right = ReadHand(pc, false);
 						return *HandObservation::Condition(a_cond, { true, drawn, left.policy, right.policy });
 					},
-						milliseconds(2000));
-					return r.get<bool>();
-				} catch (const ToolError&) {
-					return false;
-				}
-			}
-			if (a_cond == "weaponDrawn" || a_cond == "handsReady" || a_cond == "castingArtLeft" || a_cond == "castingArtRight") {
-				try {
-					const json r = MainThread::RunAndWait([a_cond]() -> json {
-						auto* pc = RE::PlayerCharacter::GetSingleton();
-						if (!pc || !pc->Get3D())
-							return false;
-						const auto snap = SnapshotHands(pc, nullptr, nullptr);
-						if (a_cond == "weaponDrawn")
-							return snap.observation.settledDrawn;
-						if (a_cond == "handsReady")
-							return InspectLogic::HandsReady(snap.observation);
-						const auto& hand = a_cond == "castingArtLeft" ? snap.observation.left : snap.observation.right;
-						return hand.casterPresent && hand.artAttached;
-					},
 						a_stallLimit);
 					return r.get<bool>();
 				} catch (const ToolError&) {
@@ -2509,10 +2500,8 @@ namespace dvb
 			if (a_cond == "noMenu")
 				return GetMenuInventory().KnownEmpty();
 			if (a_cond == "noBlockingMenu")
-				return BlockingMenus().empty();
-			throw ToolError(400, std::format("unknown waitUntil condition '{}' (playerLoaded|noModal|noMenu|noBlockingMenu|weaponStateSettledDrawn|handsArtObserved|castingArtAttachedLeft|castingArtAttachedRight; deprecated aliases weaponDrawn|handsReady|castingArtLeft|castingArtRight)", a_cond));
 				return BlockingMenus(std::min(a_stallLimit, milliseconds(1000))).empty();
-			throw ToolError(400, std::format("unknown waitUntil condition '{}' (playerLoaded|noModal|noMenu|noBlockingMenu|weaponDrawn|handsReady|castingArtLeft|castingArtRight)", a_cond));
+			throw ToolError(400, std::format("unknown waitUntil condition '{}' (playerLoaded|noModal|noMenu|noBlockingMenu|weaponStateSettledDrawn|handsArtObserved|castingArtAttachedLeft|castingArtAttachedRight; deprecated aliases weaponDrawn|handsReady|castingArtLeft|castingArtRight)", a_cond));
 		}
 
 		constexpr long long kMaxRealWaitMs = 25000;  // under the bridge's 30 s request timeout
