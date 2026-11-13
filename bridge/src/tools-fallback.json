@@ -441,10 +441,6 @@
             "description": "save file name (required for save/load/delete; from action='list')",
             "type": "string"
           },
-          "requireReached": {
-            "description": "setTimeScale: answer 504 when the request has not reached the engine within waitMs, as before waitMs existed (default false: answer with its state)",
-            "type": "boolean"
-          },
           "scale": {
             "description": "setTimeScale: game speed multiplier, 0.1..3.0 (0 freezes, and needs freeze:true)",
             "type": "number"
@@ -452,10 +448,6 @@
           "waitMs": {
             "description": "setTimeScale: how long to wait, after admission, for this request to settle (reached, expired or displaced) before answering (default 2000, 0..30000)",
             "type": "integer"
-          },
-          "save": {
-            "type": "string",
-            "description": "alias for name"
           },
           "confirmNewGame": {
             "description": "newGame confirm: explicit true required before starting normal game initialization",
@@ -772,7 +764,8 @@
               "capture",
               "screenshot",
               "burst",
-              "status"
+              "status",
+              "burstStatus"
             ],
             "type": "string"
           },
@@ -863,6 +856,26 @@
           "variant": {
             "description": "variant under test, for correlation (default 'default')",
             "type": "string"
+          },
+          "requestId": {
+            "type": "string",
+            "description": "provider-managed burst: caller request identity for reconciliation"
+          },
+          "outputDir": {
+            "type": "string",
+            "description": "provider-managed burst: absolute output directory"
+          },
+          "prefix": {
+            "type": "string",
+            "description": "provider-managed burst: frame filename stem"
+          },
+          "manifestPath": {
+            "type": "string",
+            "description": "provider-managed burst: optional absolute manifest path"
+          },
+          "scale": {
+            "type": "number",
+            "description": "provider-managed burst: requested scale (CSX supports 1)"
           }
         },
         "type": "object"
