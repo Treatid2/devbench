@@ -1,5 +1,6 @@
 #include "Papyrus.h"
 
+#include "GameText.h"
 #include "Json.h"
 #include "MainThread.h"
 #include "PapyrusCallPolicy.h"
@@ -61,15 +62,20 @@ namespace dvb::Papyrus
 			if (!formBacked)
 				return out;
 
+			// Only native classes have a VM type id; a form's attached custom script resolves
+			// through its nearest native ancestor (TGNQuestScript → Quest).
 			RE::VMTypeID typeID{};
-			auto*        policy = a_vm->GetObjectHandlePolicy();
-			if (policy && a_vm->GetTypeIDForScriptObject(cls.c_str(), typeID)) {
+			auto*        native = typeInfo;
+			while (native && !a_vm->GetTypeIDForScriptObject(native->GetName(), typeID))
+				native = native->GetParent();
+			auto* policy = a_vm->GetObjectHandlePolicy();
+			if (policy && native) {
 				if (auto* form = static_cast<RE::TESForm*>(policy->GetObjectForHandle(typeID, obj->GetHandle()))) {
 					out["formId"] = std::format("0x{:08X}", form->GetFormID());
 					out["formType"] = std::format("{}", static_cast<int>(form->GetFormType()));
 					out["editorId"] = Str(form->GetFormEditorID());
 					if (const char* n = form->GetName(); n && *n)
-						out["name"] = n;
+						out["name"] = FromGame(n);
 				}
 			}
 			return out;
@@ -86,7 +92,7 @@ namespace dvb::Papyrus
 			if (a_var.IsFloat())
 				return a_var.GetFloat();
 			if (a_var.IsString())
-				return std::string(a_var.GetString());
+				return FromGame(a_var.GetString());
 			if (a_var.IsObject())
 				return ObjectToJson(a_vm, a_var);
 			if (a_var.IsArray()) {
@@ -201,8 +207,9 @@ namespace dvb::Papyrus
 
 		// One JSON arg → one Variable. Scalars are direct; { "form": "0x14" | "EditorID" } resolves
 		// a TESForm and packs it to the declared param type (a_paramType) so base-typed params bind,
-		// else to its native type; a JSON array becomes a typed Papyrus array. Touches the VM (form
-		// handles / array alloc) — call on the main thread.
+		// else to its native type; a JSON array becomes a typed Papyrus array; null is None (an
+		// object or array param only, as in Papyrus). Touches the VM (form handles / array alloc) —
+		// call on the main thread.
 		BSScript::Variable JsonToVariable(BSScript::Internal::VirtualMachine* a_vm, const json& a_arg, const BSScript::TypeInfo* a_paramType)
 		{
 			BSScript::Variable v;
@@ -216,11 +223,11 @@ namespace dvb::Papyrus
 			} else if (a_arg.is_number_integer() || a_arg.is_number_unsigned()) {
 				v.SetSInt(a_arg.get<std::int32_t>());
 			} else if (a_arg.is_string()) {
-				v.SetString(a_arg.get<std::string>());
+				v.SetString(ToGame(a_arg.get<std::string>()));
 			} else if (a_arg.is_array()) {
 				return JsonArrayToVariable(a_vm, a_arg);
-			} else if (a_arg.is_object() && a_arg.contains("form")) {
-				const std::string ref = a_arg["form"].get<std::string>();
+			} else if (a_arg.is_object() && (a_arg.contains("form") || a_arg.contains("formId"))) {
+				const std::string ref = a_arg[a_arg.contains("form") ? "form" : "formId"].get<std::string>();
 				RE::TESForm*      form = LookupForm(ref);
 				if (!form)
 					throw ToolError(400, std::format("papyrus call: form '{}' not found (formId hex or EditorID)", ref));
@@ -229,7 +236,7 @@ namespace dvb::Papyrus
 				else
 					BSScript::PackHandle(&v, form, static_cast<RE::VMTypeID>(form->GetFormType()));
 			} else {
-				throw ToolError(400, "papyrus call: each arg must be a bool, number, string, array, or { \"form\": \"0x.. | EditorID\" }");
+				throw ToolError(400, "papyrus call: each arg must be a bool, number, string, array, null (None), or { \"form\": \"0x.. | EditorID\" }");
 			}
 			return v;
 		}
@@ -299,8 +306,10 @@ namespace dvb::Papyrus
 			std::mutex              m;
 			std::condition_variable cv;
 			bool                    done = false;
-			int                     status = 400;  // HTTP status to surface when `error` is set
-			std::string             error;         // non-empty → arg-build / bind / dispatch failed
+
+
+			int                     status = 400;        // HTTP status to surface when `error` is set
+			std::string             error;               // non-empty → arg-build / bind / dispatch failed
 			BSScript::Variable      result;
 		};
 
@@ -437,7 +446,11 @@ namespace dvb::Papyrus
 			auto*             policy = a_vm->GetObjectHandlePolicy();
 			RE::VMTypeID      reqTypeID{};
 			const auto        handle = policy ? policy->GetHandleForObject(static_cast<RE::VMTypeID>(form->GetFormType()), form) : RE::VMHandle{};
-			const bool        isRequestedType = policy && a_vm->GetTypeIDForScriptObject(a_className, reqTypeID) && policy->HandleIsType(reqTypeID, handle);
+			// Only native classes have a VM type id, so an attached custom script never passes the
+			// check below; look it up by name among the scripts bound to the form first.
+			if (policy && handle != policy->EmptyHandle() && a_vm->FindBoundObject(handle, a_className.c_str(), a_out) && a_out)
+				return true;
+			const bool isRequestedType = policy && a_vm->GetTypeIDForScriptObject(a_className, reqTypeID) && policy->HandleIsType(reqTypeID, handle);
 			if (!isRequestedType) {
 				RE::BSTSmartPointer<BSScript::ObjectTypeInfo> nativeType;
 				if (a_vm->GetScriptObjectType(static_cast<RE::VMTypeID>(form->GetFormType()), nativeType) && nativeType && nativeType->GetName())

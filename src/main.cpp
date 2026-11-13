@@ -1,4 +1,6 @@
+#include "ActorIdle.h"
 #include "Autorun.h"
+#include "BackgroundRun.h"
 #include "CameraOrbit.h"
 #include "Capture.h"
 #include "Config.h"
@@ -7,18 +9,21 @@
 #include "FreeCamera.h"
 #include "GameEvents.h"
 #include "GameState.h"
+#include "GameText.h"
 #include "HostApi.h"
 #include "InputHotkeys.h"
 #include "McpLog.h"
 #include "RetainedLogInitialization.h"
 #include "KeyboardInput.h"
 #include "PostLoadStartup.h"
+#include "ModalWatch.h"
 #include "Recording.h"
 #include "RecordingsMenu.h"
 #include "Server.h"
 #include "StallWatchdog.h"
 #include "Tools.h"
 #include "VRInput.h"
+#include "VanityCamera.h"
 #include "Version.h"
 
 #include <cstring>
@@ -158,7 +163,9 @@ namespace
 		void Prepare()
 		{
 			g_server->Events().SetFrameProvider(&dvb::game::CurrentFrame);
+			g_server->Tools().SetStrictArgs(config.strictToolArgs);
 			dvb::RegisterCoreTools(g_server->Tools(), g_server->Events());
+			dvb::ModalWatch::Init(g_server->Tools(), g_server->Events(), config.autoDismissMenus);
 			dvb::Recording::SetLoadSettleMs(config.loadSettleMs);
 			dvb::Recording::SetDefaultIntervalMs(config.recordIntervalMs);
 			dvb::Recording::SetCoupling(config.couplingAnchorMs, config.couplingCellMs, config.cleanTransition, config.cleanTransitionCell);
@@ -186,6 +193,8 @@ namespace
 			dvb::ConsoleHook::Install(g_server->Events());
 			dvb::ConsoleLogCapture::InstallPrintHook();
 			dvb::CameraOrbit::Install();
+			if (config.disableVanityCamera)
+				dvb::VanityCamera::Install();
 			InstallObservedMilestones();
 			g_server->SetReady(true);
 		}
@@ -233,6 +242,8 @@ namespace
 		}
 		if (g_dataObserved.load() && !g_dataInstalled) {
 			g_dataInstalled = true;
+			if (g_config.alwaysActive && !dvb::BackgroundRun::SetAlwaysActive(true))
+				logs::warn("devbench: alwaysActive requested but bAlwaysActive:General is unavailable");
 			dvb::UI::Register();
 			dvb::UI::RegisterFuck();
 			dvb::OnSKSEMessage(SKSE::MessagingInterface::kDataLoaded);
@@ -309,8 +320,10 @@ namespace
 		}
 		if (!g_startup.Ready() || !g_server || !g_server->Ready())
 			return;
-		if (a_msg->type == SKSE::MessagingInterface::kPreLoadGame || a_msg->type == SKSE::MessagingInterface::kNewGame)
-			dvb::CameraOrbit::Stop();  // an orbit never carries into another game
+		if (a_msg->type == SKSE::MessagingInterface::kPreLoadGame || a_msg->type == SKSE::MessagingInterface::kNewGame) {
+			dvb::CameraOrbit::EndSession();
+			dvb::ActorIdle::EndSession();
+		}
 		if (a_msg->type == SKSE::MessagingInterface::kPreLoadGame)
 			dvb::FreeCamera::BeginLoad();
 		else if (a_msg->type == SKSE::MessagingInterface::kNewGame || a_msg->type == SKSE::MessagingInterface::kPostLoadGame)
@@ -348,7 +361,7 @@ namespace
 					a_msg->type == SKSE::MessagingInterface::kSaveGame) &&
 				a_msg->data) {
 				const char* raw = static_cast<const char*>(a_msg->data);
-				std::string name(raw, strnlen(raw, 255));  // capped; never trust dataLen
+				std::string name = dvb::FromGame(std::string_view(raw, strnlen(raw, 255)));  // capped; never trust dataLen
 				if (name.size() > 4 && name.compare(name.size() - 4, 4, ".ess") == 0)
 					name.resize(name.size() - 4);  // the load tool takes the stem, not the filename
 				if (!name.empty())

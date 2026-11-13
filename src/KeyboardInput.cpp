@@ -8,6 +8,7 @@
 #include "KeyboardInputState.h"
 #include "MainThread.h"
 #include "MainThreadTask.h"
+#include "MouseInput.h"
 #include "ToolRegistry.h"
 #include "VRInput.h"
 #include "VRInputState.h"
@@ -22,6 +23,7 @@
 #include <cstring>
 #include <future>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -47,22 +49,21 @@ namespace dvb
 
 		std::atomic<bool> g_inputReady{ false };
 
-		// Codes from kMouseBase up are mouse buttons (see the key catalog); lower codes are keyboard scan codes.
-		constexpr std::uint16_t kMouseBase = 0x100;
-		constexpr std::uint16_t kMouseLast = 0x102;
-
-		RE::INPUT_DEVICE DeviceOf(std::uint16_t a_code) { return a_code >= kMouseBase ? RE::INPUT_DEVICE::kMouse : RE::INPUT_DEVICE::kKeyboard; }
-
-		std::int32_t IdCodeOf(std::uint16_t a_code) { return a_code >= kMouseBase ? a_code - kMouseBase : a_code; }
-
-		// Preserve mouse button normalization; only keyboard events use no-wand parity.
-		void EnqueueButton(RE::BSInputEventQueue& a_queue, std::uint16_t a_code, bool a_down, float a_heldSeconds)
+		RE::INPUT_DEVICE DeviceOf(std::uint16_t a_code)
 		{
-			if (DeviceOf(a_code) == RE::INPUT_DEVICE::kKeyboard)
-				EnqueueKeyboardButton(a_queue, RE::INPUT_DEVICE::kKeyboard, IdCodeOf(a_code), a_down, a_heldSeconds);
-			else
-				a_queue.AddButtonEvent(RE::INPUT_DEVICE::kMouse, 0, IdCodeOf(a_code),
-					a_down ? 1.0F : 0.0F, a_heldSeconds);
+			return EngineButtonOf(a_code).device == EngineDevice::kMouse ? RE::INPUT_DEVICE::kMouse : RE::INPUT_DEVICE::kKeyboard;
+		}
+
+		// Unsigned on purpose: an std::int32_t id binds BSInputEventQueue's VR-only AddButtonEvent overload, which does
+		// nothing on SE/AE, instead of the AddEvent<ButtonEvent> template every runtime uses.
+		std::uint32_t IdCodeOf(std::uint16_t a_code) { return static_cast<std::uint32_t>(EngineButtonOf(a_code).id); }
+
+		// An interned empty string, not a null BSFixedString: MenuControls only forwards keys whose userEvent is non-null.
+		// Leaked so it is not released at exit.
+		const RE::BSFixedString& DeviceUserEvent()
+		{
+			static const auto* empty = new RE::BSFixedString("");
+			return *empty;
 		}
 
 		std::int64_t NowMs()
@@ -155,19 +156,23 @@ namespace dvb
 					continue;
 				if (queue->buttonEventCount >= RE::BSInputEventQueue::MAX_BUTTON_EVENTS)
 					break;
-				// Do not emit a held event in the same poll as the initial down.
+				// Do not emit a held event in the same poll as the initial down; a queued release of the
+				// same button does not stand in for it.
 				bool queued = false;
 				for (auto* event = queue->GetQueueHead(); event; event = event->next) {
 					const auto* button = event->AsButtonEvent();
-					if (button && button->device == DeviceOf(key.scancode) &&
-						button->GetIDCode() == IdCodeOf(key.scancode)) {
+					if (!button || (button->device != RE::INPUT_DEVICE::kKeyboard && button->device != RE::INPUT_DEVICE::kMouse))
+						continue;
+					const EngineButton seen{ button->device == RE::INPUT_DEVICE::kMouse ? EngineDevice::kMouse : EngineDevice::kKeyboard,
+						static_cast<std::int32_t>(button->GetIDCode()) };
+					if (QueuedPressCovers(seen, button->Value(), key.scancode)) {
 						queued = true;
 						break;
 					}
 				}
 				if (!queued) {
 					const float heldSecs = HeldDownSeconds(key.pressedAtGameMs, gameNow);
-					EnqueueButton(*queue, key.scancode, true, heldSecs);
+					queue->AddButtonEvent(DeviceOf(key.scancode), 0, IdCodeOf(key.scancode), 1.0F, heldSecs, DeviceUserEvent());
 				}
 			}
 		}
@@ -199,7 +204,7 @@ namespace dvb
 			if (a_args["key"].is_string())
 				key = ResolveKeyboardKey(a_args["key"].get<std::string>());
 			else if (a_args["key"].is_number_integer()) {
-				const auto value = BoundedInteger(a_args, "key", 0, 0, kMouseLast);
+				const auto value = BoundedInteger(a_args, "key", 0, 0, kMouseCodeLast);
 				key = ResolveKeyboardKey(value);
 			} else
 				throw ToolError(400, "'key' must be a string name or integer DirectInput scancode");
@@ -227,7 +232,9 @@ namespace dvb
 
 		json KeyJson(const KeyboardKey& a_key)
 		{
-			return json{ { "key", a_key.name }, { "scancode", a_key.scancode } };
+			const auto engine = EngineButtonOf(a_key.scancode);
+			return json{ { "key", a_key.name }, { "scancode", a_key.scancode }, { "codeDomain", CodeDomainOf(a_key.scancode) },
+				{ "engineDevice", EngineDeviceName(engine.device) }, { "engineId", engine.id } };
 		}
 
 		json ContractJson()
@@ -288,8 +295,9 @@ namespace dvb
 															{ "maximumSequenceEvents", kMaximumSequenceEvents },
 															{ "maximumSequenceMs", kMaximumSequenceMs },
 															{ "keys", std::move(keys) },
-															{ "mouseButtons", json{ { "codeBase", kMouseBase }, { "keys", json::array({ "mouseLeft", "mouseRight", "mouseMiddle" }) } } },
+															{ "mouseButtons", json{ { "codeBase", kMouseCodeBase }, { "codeDomain", "mouseButton" }, { "engineDevice", "mouse" }, { "keys", json::array({ "mouseLeft", "mouseRight", "mouseMiddle" }) } } },
 														} },
+										  { "mouse", json{ { "actions", json::array({ "move", "down", "up", "tap", "click", "status" }) }, { "buttons", json::array({ "left", "right", "middle" }) }, { "coordinates", "game-window client pixels" } } },
 										  { "vrTrackedSet", VRInputCapabilities() },
 									  } },
 				};
@@ -569,8 +577,8 @@ namespace dvb
 						if (g_repeatingKeys.empty())
 							DisengageForHold();
 					}
-					EnqueueButton(*queue, a_lease.key.scancode,
-						a_down, a_down ? 0.0F : a_heldSecs);
+					queue->AddButtonEvent(DeviceOf(a_lease.key.scancode), 0, IdCodeOf(a_lease.key.scancode),
+						a_down ? 1.0F : 0.0F, a_down ? 0.0F : a_heldSecs, DeviceUserEvent());
 					return json{ { "frame", game::CurrentFrame() } };
 				});
 				if (completion.wait_for(milliseconds(0)) != std::future_status::ready)
@@ -782,8 +790,24 @@ namespace dvb
 			const std::string device = a_args.value("device", std::string("keyboard"));
 			if (IsVRInputDevice(device))
 				return HandleVRInput(a_args, a_ctx);
+			if (device == "mouse") {
+				if (action == "move" || action == "status")
+					return HandleMousePointer(a_args);
+				// Buttons are the keyboard path's mouse keys; 'click' is a tap.
+				static const std::map<std::string, std::string, std::less<>> kButtons{ { "left", "mouseLeft" }, { "right", "mouseRight" }, { "middle", "mouseMiddle" } };
+				const auto                                                   button = kButtons.find(a_args.value("button", std::string("left")));
+				if (button == kButtons.end())
+					throw ToolError(400, "mouse 'button' must be left, right or middle");
+				json keyed = a_args;
+				keyed["device"] = "keyboard";
+				keyed["key"] = button->second;
+				keyed["action"] = action == "click" ? std::string("tap") : action;
+				json result = HandleInputImpl(keyed, a_ctx);
+				result["device"] = "mouse";
+				return result;
+			}
 			if (device != "keyboard")
-				throw ToolError(400, "input contract v2 supports device='keyboard' or device='vrTrackedSet'");
+				throw ToolError(400, "input contract v2 supports device='keyboard', 'mouse' or 'vrTrackedSet'");
 			if (action == "status")
 				return KeyboardManager::Get().Status();
 
@@ -827,7 +851,9 @@ namespace dvb
 		input.description =
 			"Versioned synthetic input interface. action='capabilities' (default) returns the exact "
 			"contract/version, readiness, limits, injection path, supported actions, and complete "
-			"keyboard name→DirectInput-scan-code catalog (plus mouseLeft/mouseRight/mouseMiddle, injected as mouse button events); "
+			"keyboard name→DirectInput-scan-code catalog (plus mouseLeft/mouseRight/mouseMiddle, codes 256-258, injected as "
+			"mouse button events; each key lists its codeDomain, engineDevice and engineId, and mouseLeft is the left mouse "
+			"button, which is attack only under the default bindings and outside menus); "
 			"clients MUST capability-negotiate rather "
 			"than assuming this tool exists. Contract v1 implements device='keyboard' using Skyrim's "
 			"own BSInputEventQueue (not Windows SendInput, so window focus is irrelevant). Keyboard "
@@ -855,7 +881,17 @@ namespace dvb
 			"retryable through that token. Ad-hoc sequences stop on lifecycle boundaries; recording replay "
 			"may explicitly survive the load/new-game events it is reproducing. There are deliberately no per-device or "
 			"per-button VR mutation actions: submit the coherent tracked set so poses and controls cannot "
-			"come from different clocks.";
+			"come from different clocks. device='mouse': 'move' (x, y in game-window client pixels) sets the engine's menu cursor "
+			"and, with focusWindow=true, brings the game window to the foreground and sets the OS cursor so overlays that read it "
+			"(ImGui) see the pointer; 'down'/'up'/'tap'/'click' (button left|right|middle, default left) press through the same "
+			"engine input queue as the keyboard; 'status' reports the cursors and window focus. device='vrTrackedSet' action='reach' places one or both hands next to nodes of the player: "
+			"it calibrates how a tracking-space move shows up in the world, injects the tracked set, re-reads the hand and "
+			"target nodes after each settle (the body follows the arms, so a node moves when a hand reaches it) and corrects "
+			"until every hand is within toleranceUnits, then holds holdMs; 'head' optionally aims the HMD at the hands or a "
+			"node. It returns { queued, runId } at once; action='reachStatus' (runId) reports { phase (queued | calibrating | "
+			"reaching | holding | done | failed | stopped), iteration, worstErrorDistance, per hand { hand, node, error, errorDistance, handToNode }, "
+			"error, active, stopping (a stop was requested and the run is still releasing) }, and 'reachStop' ends it. One reach runs at a time (409); while it runs it replaces the HMD and both "
+			"controllers like a sequence, and it ends at a load. Fingers are not driven.";
 		input.inputSchema = InputToolSchema(kMaximumMaxHoldMs, kMaximumSequenceEvents, kMaximumVRTrackedFrames);
 		a_registry.Register(std::move(input), &HandleInput);
 	}

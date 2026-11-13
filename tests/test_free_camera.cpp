@@ -11,9 +11,23 @@
 // direct synchronous call.
 namespace dvb::MainThread
 {
-	json RunAndWait(std::function<json()> a_fn, std::chrono::milliseconds, const std::atomic<bool>*)
+	json RunAndWait(std::function<json()> a_fn, std::chrono::milliseconds, const std::atomic<bool>*, Queue)
 	{
 		return a_fn();
+	}
+}
+
+// Records the orbit ends the free camera asks for; the orbit itself is tested in CameraOrbitLogic_test.
+#include "CameraOrbit.h"
+namespace dvb::CameraOrbit
+{
+	int       g_testEnds = 0;
+	EndReason g_testLastEnd = EndReason::kNone;
+	bool      End(EndReason a_reason)
+	{
+		++g_testEnds;
+		g_testLastEnd = a_reason;
+		return false;
 	}
 }
 
@@ -637,4 +651,15 @@ TEST_CASE("flat camera BeginLoad/EndLoad invalidate an in-flight session without
 	CHECK(scene.camera.IsInFreeCameraMode());
 	CHECK(!Camera::IsOwned());
 	ExpectError(409, [&] { Camera::SetEnabled(true, session); });
+}
+
+TEST_CASE("turning the free camera on ends a camera orbit first; turning it off does not")
+{
+	Scene scene;
+	dvb::CameraOrbit::g_testEnds = 0;
+	scene.Enable(true);
+	CHECK(dvb::CameraOrbit::g_testEnds == 1);
+	CHECK(dvb::CameraOrbit::g_testLastEnd == dvb::CameraOrbit::EndReason::kFreeCamera);
+	scene.Enable(false);
+	CHECK(dvb::CameraOrbit::g_testEnds == 1);
 }

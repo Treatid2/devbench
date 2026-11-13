@@ -30,10 +30,10 @@ TEST_CASE("input public registry listing retains read-only tracked observe")
 	const auto& properties = notifiedSchema.at("properties");
 	CHECK(properties.at("action").at("type") == "string");
 	const auto actions = properties.at("action").at("enum").get<std::vector<std::string>>();
-	for (const char* action : { "capabilities", "status", "observe", "down", "up", "tap", "sequence", "stop", "releaseAll" })
+	for (const char* action : { "capabilities", "status", "observe", "down", "up", "tap", "click", "move", "sequence", "stop", "releaseAll", "reach", "reachStatus", "reachStop" })
 		CHECK(std::count(actions.begin(), actions.end(), action) == 1);
-	CHECK(actions.size() == 9);
-	CHECK(properties.at("device").at("enum") == json::array({ "keyboard", "vrTrackedSet" }));
+	CHECK(actions.size() == 14);
+	CHECK(properties.at("device").at("enum") == json::array({ "keyboard", "mouse", "vrTrackedSet" }));
 }
 
 TEST_CASE("input schema extraction preserves producer bounds and ownership fields")

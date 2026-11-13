@@ -4,25 +4,44 @@
 
 #include "CalendarAdmission.h"
 #include "CalendarControl.h"
+#include "ActorIdle.h"
+#include "ActorIdleLogic.h"
+#include "BackgroundRun.h"
+#include "CameraFrameLogic.h"
 
+#include "AssetInfo.h"
 #include "Capture.h"
 #include "ConsoleLogCapture.h"
+#include "DifficultyLogic.h"
+#include "DrawStats.h"
+#include "DrawStatsLogic.h"
 #include "EventBus.h"
+#include "FormLookup.h"
+#include "FormSearch.h"
+#include "FormSearchLogic.h"
 #include "FreeCamera.h"
 #include "GameEvents.h"
 #include "GameState.h"
 #include "HeldLightObservation.h"
 #include "HostApi.h"
 #include "HandObservation.h"
+#include "GameText.h"
+#include "Gfx.h"
+#include "HeldLightsLogic.h"
+#include "InspectLogic.h"
 #include "Json.h"
 #include "KeyboardInput.h"
 #include "LightObservation.h"
 #include "MainThread.h"
 #include "NewGameControl.h"
+#include "Map.h"
+#include "ModalWatch.h"
 #include "Papyrus.h"
 #include "Recording.h"
 #include "ReplayDriver.h"
 #include "ReplayTrajectory.h"
+#include "RunStatusLogic.h"
+#include "SaveDelete.h"
 #include "ScenarioPolicy.h"
 #include "Server.h"
 #include "TimeScaleControl.h"
@@ -32,17 +51,40 @@
 #include "Version.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <map>
 #include <optional>
 #include <thread>
+#include <unordered_set>
 
 namespace dvb
 {
+	namespace
+	{
+		// Main thread. What the orbit was asked for and whether it has applied yet (it applies on the next
+		// third-person camera update).
+		json OrbitJson()
+		{
+			const auto&     s = CameraOrbit::State();
+			const auto&     r = s.Requested();
+			constexpr float kRad = 180.0f / 3.14159265f;
+			json            requested = nullptr;
+			if (s.On())
+				requested = json{ { "yawDeg", r.yawRad * kRad },
+					{ "pitchDeg", r.pitchRad ? json(*r.pitchRad * kRad) : json(nullptr) },
+					{ "zoom", r.zoom ? json(*r.zoom) : json(nullptr) },
+					{ "right", r.offset ? json(r.offset->x) : json(nullptr) },
+					{ "up", r.offset ? json(r.offset->z) : json(nullptr) } };
+			return json{ { "on", s.On() }, { "applied", s.Applied() }, { "requested", requested },
+				{ "lastEnd", CameraOrbit::EndReasonName(s.LastEnd()) }, { "session", s.Session() }, { "revision", s.Revision() } };
+		}
+	}
 	namespace
 	{
 		bool Truthy(const json& a_v)
@@ -111,11 +153,17 @@ namespace dvb
 		json ConsoleHandler(const json& a_args, const ToolContext& a_ctx)
 		{
 			const std::string action = a_args.value("action", std::string("exec"));
+			const bool        capture = a_args.contains("capture") && Truthy(a_args["capture"]);
+			std::int64_t      maxLines = 200;
+			if (action == "read" || capture) {
+				try {
+					maxLines = ParseBoundedIntegerArgument(a_args, "maxLines", 200, 1, static_cast<std::int64_t>(ConsoleLogCapture::PrintCollector::kMaxLines));
+				} catch (const std::invalid_argument&) {
+					throw ToolError(400, std::format("console: 'maxLines' must be an integer 1..{}", ConsoleLogCapture::PrintCollector::kMaxLines));
+				}
+			}
 
 			if (action == "read") {
-				const int maxLines = a_args.value("maxLines", 200);
-				if (maxLines < 1 || maxLines > static_cast<int>(ConsoleLogCapture::PrintCollector::kMaxLines))
-					throw ToolError(400, std::format("console read: 'maxLines' must be 1..{}", ConsoleLogCapture::PrintCollector::kMaxLines));
 				std::uint64_t windowId = 0;
 				if (const auto id = a_args.find("windowId"); id != a_args.end()) {
 					if (!id->is_number_integer() || (!id->is_number_unsigned() && id->get<std::int64_t>() <= 0) ||
@@ -127,7 +175,7 @@ namespace dvb
 					const auto r = ConsoleLogCapture::ReadFenced(static_cast<std::size_t>(maxLines), windowId);
 					json       arr = json::array();
 					for (const auto& l : r.lines)
-						arr.push_back(l);
+						arr.push_back(FromGame(l));
 					return json{
 						{ "windowId", r.windowId },
 						{ "markersFound", r.sawBegin && r.sawEnd },
@@ -197,15 +245,25 @@ namespace dvb
 			if (!task)
 				throw ToolError(500, "SKSE TaskInterface unavailable");
 
-			const bool capture = a_args.contains("capture") && Truthy(a_args["capture"]);
-
 			if (!capture) {
-				task->AddTask([command]() { RE::Console::ExecuteCommand(command.c_str()); });
+				task->AddTask([command = ToGame(command)]() { RE::Console::ExecuteCommand(command.c_str()); });
 				return json{ { "queued", true }, { "command", command }, { "capturing", false } };
 			}
-			const auto outcome = ConsoleLogCapture::RunFencedCapture(command);
-			return json{ { "queued", false }, { "command", command }, { "capturing", true },
+			const auto outcome = ConsoleLogCapture::RunFencedCapture(ToGame(command));
+			json out{ { "queued", false }, { "command", command }, { "capturing", true },
 				{ "completed", outcome.completed }, { "windowId", outcome.windowId } };
+			try {
+				const auto capture = ConsoleLogCapture::ReadFenced(static_cast<std::size_t>(maxLines), outcome.windowId);
+				out["lines"] = json::array();
+				for (const auto& line : capture.lines)
+					out["lines"].push_back(FromGame(line));
+				out["source"] = capture.source;
+				out["lossPossible"] = capture.lossPossible;
+			} catch (const ToolError& e) {
+				// A competing capture may supersede the retained result after our command ran.
+				out["readError"] = e.what();
+			}
+			return out;
 		}
 
 		namespace fs = std::filesystem;
@@ -252,7 +310,7 @@ namespace dvb
 			std::error_code        ec;
 			for (const auto& e : fs::directory_iterator(a_dir, ec)) {
 				if (e.path().extension() == ".ess")
-					out.push_back({ e.path().stem().string(), e.last_write_time(ec) });
+					out.push_back({ Utf8(e.path().stem()), e.last_write_time(ec) });
 			}
 			std::sort(out.begin(), out.end(), [](const SaveEntry& a, const SaveEntry& b) { return a.mtime > b.mtime; });
 			return out;
@@ -388,6 +446,19 @@ namespace dvb
 				a_out["metaNote"] = "none of the matched saves' .ess headers could be read";
 		}
 
+		// Pending until the main thread starts the delete; Abandoned when the caller timed out first, so a late task is a no-op.
+		struct DeleteJob
+		{
+			enum : int
+			{
+				kPending,
+				kStarted,
+				kAbandoned
+			};
+			std::atomic<int>                 state{ kPending };
+			std::promise<SaveDelete::Result> result;
+		};
+
 		// game: programmatic save / load / list. Named saves use SKSE's Game.SaveGame
 		// request; loads use BGSSaveLoadManager. loadLast gives a settled real-save
 		// state for testing WITHOUT coc's heavy new-game init. Both are async — see kLoadNote.
@@ -508,6 +579,46 @@ namespace dvb
 			if (action == "getTimeScale")
 				return TimeScaleControl::Status();
 
+			if (action == "getAlwaysActive" || action == "setAlwaysActive") {
+				std::optional<bool> enabled;
+				if (action == "setAlwaysActive") {
+					const auto enabledArg = a_args.find("enabled");
+					if (enabledArg == a_args.end() || !enabledArg->is_boolean())
+						throw ToolError(400, "game setAlwaysActive: 'enabled' is required (boolean)");
+					enabled = enabledArg->get<bool>();
+				}
+				return MainThread::RunAndWait([enabled]() -> json {
+					if (enabled && !BackgroundRun::SetAlwaysActive(*enabled))
+						throw ToolError(503, "bAlwaysActive:General is not available in this runtime");
+					const auto current = BackgroundRun::AlwaysActive();
+					return json{ { "alwaysActive", current ? json(*current) : json(nullptr) }, { "windowFocused", BackgroundRun::WindowFocused() } };
+				});
+			}
+
+			if (action == "getDifficulty" || action == "setDifficulty") {
+				std::optional<int> level;
+				if (action == "setDifficulty") {
+					const auto levelArg = a_args.find("level");
+					if (levelArg == a_args.end())
+						throw ToolError(400, "game setDifficulty: 'level' is required (0-5 or Novice|Apprentice|Adept|Expert|Master|Legendary)");
+					level = DifficultyLogic::ParseLevel(*levelArg);
+					if (!level)
+						throw ToolError(400, std::format("game setDifficulty: invalid level '{}' (0-5 or Novice|Apprentice|Adept|Expert|Master|Legendary)", levelArg->dump()));
+				}
+				return MainThread::RunAndWait([level]() -> json {
+					auto* pc = RE::PlayerCharacter::GetSingleton();
+					if (!pc)
+						throw ToolError(503, "PlayerCharacter unavailable (no loaded world?)");
+					auto& state = pc->GetGameStatsData();
+					if (level) {
+						state.difficulty = *level;
+						if (auto* setting = RE::GetINISetting("iDifficulty:GamePlay"))
+							setting->data.i = *level;
+					}
+					return json{ { "level", state.difficulty }, { "name", DifficultyLogic::LevelName(state.difficulty) } };
+				});
+			}
+
 			if (action == "setTimeScale") {
 				const auto scaleArg = a_args.find("scale");
 				const bool freeze = BooleanArgument(a_args, "freeze", false);
@@ -557,7 +668,7 @@ namespace dvb
 					throw ToolError(404, std::format("no .ess saves in {}", saveDir.string()));
 				const std::string name = saves.front().name;
 				Recording::NoteLoadEntry(name);  // reproducible entry point for a later recording
-				task->AddTask([name]() {
+				task->AddTask([name = ToGame(name)]() {
 					if (auto* m = RE::BGSSaveLoadManager::GetSingleton())
 						m->Load(name.c_str(), false);
 				});
@@ -565,19 +676,21 @@ namespace dvb
 				return json{ { "queued", true }, { "action", action }, { "name", name }, { "note", kLoadNote } };
 			}
 			if (action == "save" || action == "load") {
-				const std::string name = a_args.value("name", std::string{});
+				const std::string name = a_args.value("name", a_args.value("save", std::string{}));
 				if (name.empty())
 					throw ToolError(400, std::format("action '{}' requires a 'name'", action));
 				const bool isSave = (action == "save");
+				auto       file = name;
 				if (!isSave) {
 					// Validate the save exists rather than silently queueing a no-op load
 					// (a bare {queued:true} on a bad name is a cold-start trap for agents).
 					const fs::path saveDir = ResolveSaveDir(a_args);
 					const auto     saves = EnumerateSaves(saveDir);
-					const bool     exists = std::any_of(saves.begin(), saves.end(),
+					const auto     it = std::find_if(saves.begin(), saves.end(),
 						[&](const SaveEntry& s) { return s.name == name; });
-					if (!exists)
+					if (it == saves.end())
 						throw ToolError(404, std::format("save '{}' not found in {} — use action='list' for valid names", name, saveDir.string()));
+					file = it->name;
 					Recording::NoteLoadEntry(name);  // reproducible entry point for a later recording
 				}
 				if (isSave) {
@@ -585,11 +698,11 @@ namespace dvb
 					// against the main thread's VM lock, so use SKSE's save request.
 					Papyrus::QueueCall(json{ { "script", "Game" }, { "function", "SaveGame" }, { "args", json::array({ name }) } });
 				} else {
-					task->AddTask([name]() {
+					task->AddTask([file = ToGame(file)]() {
 						auto* m = RE::BGSSaveLoadManager::GetSingleton();
 						if (!m)
 							return;
-						m->Load(name.c_str(), false);  // checkForMods=false skips the mod-mismatch modal
+						m->Load(file.c_str(), false);  // checkForMods=false skips the mod-mismatch modal
 					});
 				}
 				logs::info("devbench: game {} '{}'", action, name);
@@ -598,10 +711,54 @@ namespace dvb
 					out["note"] = kLoadNote;
 				return out;
 			}
-			throw ToolError(400, std::format("unknown action '{}' (list|save|load|loadLast|newGame|advanceTime|getTimeScale|setTimeScale)", action));
+			if (action == "delete") {
+				// The engine deletes from its own saves directory, so a 'dir' override would validate one file and delete another.
+				if (a_args.contains("dir"))
+					throw ToolError(400, "action 'delete' does not take 'dir'");
+				const std::string stem = SaveDelete::Stem(a_args.value("name", std::string{}));
+				if (stem.empty())
+					throw ToolError(400, "action 'delete' requires a 'name'");
+				const fs::path           saveDir = ResolveSaveDir(a_args);
+				const auto               saves = EnumerateSaves(saveDir);
+				std::vector<std::string> matches;
+				for (const auto& s : saves)
+					if (Lower(s.name) == Lower(stem))
+						matches.push_back(s.name);
+				if (matches.empty())
+					throw ToolError(404, std::format("save '{}' not found in {} — use action='list' for valid names", stem, saveDir.string()));
+				if (matches.size() > 1)
+					throw ToolError(409, std::format("'{}' matches {} saves that differ only by case; use the exact name", stem, matches.size()));
+				const std::string target = matches.front();
+
+				auto job = std::make_shared<DeleteJob>();
+				auto result = job->result.get_future();
+				task->AddTask([job, target]() {
+					int expected = DeleteJob::kPending;
+					if (!job->state.compare_exchange_strong(expected, DeleteJob::kStarted))
+						return;  // the caller already gave up; deleting now would be unreported
+					job->result.set_value(SaveDelete::Delete(ToGame(target)));
+				});
+				if (result.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+					int expected = DeleteJob::kPending;
+					if (job->state.compare_exchange_strong(expected, DeleteJob::kAbandoned))
+						throw ToolError(504, "game delete did not start within 5s and was cancelled; nothing was deleted");
+					result.wait();  // already started on the main thread, so it finishes shortly
+				}
+				switch (result.get()) {
+				case SaveDelete::Result::kDeleted:
+					logs::info("devbench: game delete '{}'", target);
+					return json{ { "deleted", true }, { "action", action }, { "name", target } };
+				case SaveDelete::Result::kUnsupported:
+					throw ToolError(501, "game delete is not supported on VR");
+				default:
+					throw ToolError(409, std::format("engine save list has no entry for '{}'", target));
+				}
+			}
+			throw ToolError(400, std::format("unknown action '{}' (list|save|load|loadLast|delete|newGame|advanceTime|getTimeScale|setTimeScale|getDifficulty|setDifficulty|getAlwaysActive|setAlwaysActive)", action));
 		}
 
 		bool ContainsCI(const std::string& a_hay, const std::string& a_needle);  // defined below (near CheckState)
+		using FormLookup::LookupFormArg;
 
 		// menu: detect/answer menus. 'list' = seeded menu-event inventory + completeness
 		// and consumer-registered handler names; 'describe' = the active
@@ -631,7 +788,7 @@ namespace dvb
 				auto entry = ToolExtensions::Find("menu", name);
 				if (!entry)
 					throw ToolError(404, std::format("no handler registered for menu '{}' (see menu list .registered)", name));
-				return entry->handler(a_args, a_ctx);
+				return entry->handler(a_ctx.rawArgs ? *a_ctx.rawArgs : a_args, a_ctx);
 			}
 
 			if (action == "open") {
@@ -658,6 +815,41 @@ namespace dvb
 				return json{ { "queued", true }, { "action", "open" }, { "name", name } };
 			}
 
+			if (action == "readBook") {
+				// BookMenu needs the book itself, so 'open' cannot show it: a world reference opens through
+				// OpenMenuFromReference and an inventory book through OpenMenuFromBaseForm.
+				const std::string arg = a_args.value("formId", std::string{});
+				if (arg.empty())
+					throw ToolError(400, "action 'readBook' requires a 'formId' (a book form or a reference to one)");
+				const bool activate = a_args.value("activate", false);
+				return MainThread::RunAndWait([arg, activate]() -> json {
+					auto* form = LookupFormArg(arg);
+					if (!form)
+						throw ToolError(404, std::format("no form for '{}'", arg));
+					auto* player = RE::PlayerCharacter::GetSingleton();
+					if (!player)
+						throw ToolError(409, "player is not loaded");
+					auto* ref = form->As<RE::TESObjectREFR>();
+					auto* base = ref ? ref->GetBaseObject() : form;
+					auto* book = base ? base->As<RE::TESObjectBOOK>() : nullptr;
+					if (!book)
+						throw ToolError(400, std::format("'{}' is not a book or a reference to one", arg));
+					if (activate) {
+						if (!ref)
+							throw ToolError(400, "readBook 'activate' needs a reference to a book; an inventory book has no entry point outside the InventoryMenu");
+						// The player's own activation: TESObjectBOOK::Activate, so a hook on its BookMenu call site fires.
+						const bool activated = ref->ActivateRef(player, 0, nullptr, 1, false);
+						return json{ { "action", "readBook" }, { "queued", true }, { "formId", std::format("{:08X}", book->GetFormID()) }, { "viaRef", true }, { "viaActivate", true }, { "activated", activated } };
+					}
+					if (ref) {
+						RE::BookMenu::OpenMenuFromReference(ref);
+					} else {
+						RE::BookMenu::OpenMenuFromBaseForm(book);
+					}
+					return json{ { "action", "readBook" }, { "queued", true }, { "formId", std::format("{:08X}", book->GetFormID()) }, { "viaRef", ref != nullptr } };
+				});
+			}
+
 			if (action == "close") {
 				// Dismiss a menu by name via the UI message queue (kHide). For a modal
 				// MessageBoxMenu this cancels/closes it — unblocking automated flows (e.g.
@@ -673,6 +865,18 @@ namespace dvb
 						q->AddMessage(name.c_str(), RE::UI_MESSAGE_TYPE::kHide, nullptr);
 				});
 				return json{ { "queued", true }, { "action", "close" }, { "name", name } };
+			}
+
+			if (action == "autoDismiss") {
+				if (a_args.contains("names")) {
+					if (!a_args["names"].is_array())
+						throw ToolError(400, "'names' must be an array of menu names");
+					std::vector<std::string> names;
+					for (const auto& n : a_args["names"])
+						names.push_back(n.get<std::string>());
+					ModalWatch::SetAutoDismiss(names);
+				}
+				return json{ { "autoDismiss", ModalWatch::AutoDismiss() } };
 			}
 
 			if (action == "describe") {
@@ -710,7 +914,7 @@ namespace dvb
 						auto* data = RE::MessageBoxMenu::GetCurrentMessageBoxData();
 						if (!data)
 							return json{ { "accepted", false }, { "reason", "no active MessageBoxMenu" } };
-						if (!data->bodyText.c_str() || !ContainsCI(data->bodyText.c_str(), matchBody))
+						if (!data->bodyText.c_str() || !ContainsCI(FromGame(data->bodyText.c_str()), matchBody))
 							return json{ { "accepted", false }, { "reason", "body did not match matchBody" } };
 						// Non-cancel button, but never out of range: fall back to 0 on a one-button box.
 						const int pick = (data->cancelButtonIndex == 0 && data->buttonText.size() > 1) ? 1 : 0;
@@ -728,12 +932,12 @@ namespace dvb
 				return json{ { "queued", true }, { "action", "accept" }, { "index", index } };
 			}
 
-			throw ToolError(400, std::format("unknown action '{}' (list|open|close|describe|accept|invoke)", action));
+			throw ToolError(400, std::format("unknown action '{}' (list|open|close|describe|accept|invoke|readBook)", action));
 		}
 
 		constexpr long long kMaxWaitHours = 100000;
-		// AdvanceSleepWaitTick() runs synchronously on the main thread once per tick, so an
-		// unbounded tick count hangs the game rather than just delaying it.
+		// The engine advances a wait one AdvanceSleepWaitTick() per frame, so the cap bounds how
+		// long the call blocks (20000 ticks = ~6 min at 60 fps).
 		constexpr long long kMaxWaitTicks = 20000;
 
 		// StartWaiting/StartSleeping's synchronous autosave (bSaveOnWait/bSaveOnRest) deadlocks
@@ -766,17 +970,18 @@ namespace dvb
 
 		json WaitOrSleepHandler(const json& a_args, bool a_sleep)
 		{
-			const auto it = a_args.find("hours");
+			const auto            it = a_args.find("hours");
+			constexpr const char* kHoursHint = "'hours' must be a positive integer of GAME-time hours (use `wait` with 'ms' or 'until' for real time)";
 			if (it == a_args.end() || !it->is_number_integer())
-				throw ToolError(400, "'hours' must be a positive integer");
+				throw ToolError(400, kHoursHint);
 			const long long hours = it->get<long long>();
 			if (hours <= 0)
-				throw ToolError(400, "'hours' must be a positive integer");
+				throw ToolError(400, kHoursHint);
 			if (hours > kMaxWaitHours)
 				throw ToolError(400, std::format("'hours' must be <= {}", kMaxWaitHours));
 			CalendarControl::RequireIdle(CalendarControl::Outstanding());
 
-			return MainThread::RunAndWait([hours, a_sleep]() -> json {
+			const json start = MainThread::RunAndWait([hours, a_sleep]() -> json {
 				CalendarControl::RequireIdle(CalendarControl::Outstanding());
 				auto* pc = RE::PlayerCharacter::GetSingleton();
 				if (!pc)
@@ -784,26 +989,40 @@ namespace dvb
 				if (!pc->CanSleepWait(nullptr))
 					return json{ { "completed", false }, { "reason", "blocked (see the in-game HUD message just shown)" } };
 
-				// SleepWaitMenu's own Update loop reads back its AS3 slider's displayed value each
-				// tick, so a native-only caller can't drive it to completion this way; call the
-				// tick function directly instead, bounded by how many ticks this duration needs.
 				using namespace RE::literals;
 				std::int32_t secondsPerTick = "iSecondsToSleepPerUpdate"_gs.value_or(900);
 				if (secondsPerTick <= 0)
 					secondsPerTick = 900;
-				const long long maxTicks = (hours * 3600 / secondsPerTick) + 1;
-				if (maxTicks > kMaxWaitTicks)
-					throw ToolError(400, std::format("'hours' needs {} ticks at the current {}s/tick rate (> {} limit)", maxTicks, secondsPerTick, kMaxWaitTicks));
+				const long long ticks = (hours * 3600 + secondsPerTick - 1) / secondsPerTick;
+				if (ticks > kMaxWaitTicks)
+					throw ToolError(400, std::format("'hours' needs {} ticks at the current {}s/tick rate (> {} limit)", ticks, secondsPerTick, kMaxWaitTicks));
 
 				ScopedAutoSaveSuppress noAutoSave(a_sleep ? "bSaveOnRest" : "bSaveOnWait");
 				if (a_sleep)
 					pc->StartSleeping(static_cast<std::int32_t>(hours));
 				else
 					pc->StartWaiting(static_cast<std::int32_t>(hours));
-				for (long long i = 0; i < maxTicks; ++i)
-					pc->AdvanceSleepWaitTick();
-				return json{ { "completed", true }, { "hours", hours } };
+				return json{ { "ticks", ticks } };
 			});
+			if (!start.contains("ticks"))
+				return start;
+
+			// Start* sets playerFlags.sleeping and PlayerCharacter::Update advances the wait one tick per
+			// frame until it clears, as with SleepWaitMenu open. Ticking it all inside one task never let
+			// the engine drain the tasks each tick queues: actor refcounts wrapped during a 24h wait.
+			// Each poll is its own main-thread task, so polls land on different frames: the poll count
+			// bounds the wait in frames without the frame counter, which can be unavailable (-1).
+			const long long maxPolls = start["ticks"].get<long long>() * 2 + 60;
+			long long       polls = 0;
+			while (MainThread::RunAndWait([]() -> json {
+				auto* pc = RE::PlayerCharacter::GetSingleton();
+				return pc && pc->GetPlayerFlags().sleeping;
+			}).get<bool>()) {
+				if (++polls > maxPolls)
+					throw ToolError(504, std::format("wait still running after {} polls", maxPolls));
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			}
+			return json{ { "completed", true }, { "hours", hours } };
 		}
 
 		// Identify any form as { formId, formType, name, editorId } — CommonLib's RE'd accessors.
@@ -816,20 +1035,25 @@ namespace dvb
 				{ "formType", std::string(RE::FormTypeToString(a_form->GetFormType())) },
 			};
 			if (const char* n = a_form->GetName(); n && *n)
-				j["name"] = n;
+				j["name"] = FromGame(n);
 			if (const char* e = a_form->GetFormEditorID(); e && *e)
 				j["editorId"] = e;
 			return j;
 		}
 
 		// Identify a placed reference — the form's identity plus its base object and position.
-		// Actors get a live combat snapshot (health, level, hostility) so 'refs formType=Actor'
+		// Actors get a live combat snapshot (health, stamina, attack state, level, hostility) so 'refs formType=Actor'
 		// is an actual check on the NPCs in the scene, not just their names.
 		json IdentifyRef(RE::TESObjectREFR* a_ref)
 		{
 			if (!a_ref)
 				return nullptr;
 			json j = IdentifyForm(a_ref);
+			if (!j.contains("name")) {
+				if (auto* actor = a_ref->As<RE::Actor>())
+					if (const char* n = actor->GetDisplayFullName(); n && *n)
+						j["name"] = n;
+			}
 			if (auto* base = a_ref->GetBaseObject()) {
 				j["base"] = IdentifyForm(base);
 				if (auto* model = base->As<RE::TESModel>(); model && model->GetModel() && *model->GetModel())
@@ -851,11 +1075,16 @@ namespace dvb
 			}
 
 			if (auto* actor = a_ref->As<RE::Actor>()) {
-				json a{ { "level", actor->GetLevel() } };
+				json a{ { "level", actor->GetLevel() }, { "alive", !actor->IsDead() }, { "loaded3D", actor->Is3DLoaded() } };
 				if (auto* avo = actor->AsActorValueOwner()) {
 					a["health"] = avo->GetActorValue(RE::ActorValue::kHealth);
 					a["healthMax"] = avo->GetPermanentActorValue(RE::ActorValue::kHealth);
+					a["stamina"] = avo->GetActorValue(RE::ActorValue::kStamina);
+					a["staminaMax"] = avo->GetPermanentActorValue(RE::ActorValue::kStamina);
 				}
+				// The console's GetAttackState: 0 none, 1 draw, 2 swing, 3 hit, 4 next attack, 5 follow-through, 6 bash, 8-13 bow.
+				if (auto* state = actor->AsActorState())
+					a["attackState"] = static_cast<int>(state->GetAttackState());
 				if (auto* pc = RE::PlayerCharacter::GetSingleton(); pc && actor != pc)
 					a["hostileToPlayer"] = actor->IsHostileToActor(pc);
 				a["playerTeammate"] = actor->IsPlayerTeammate();
@@ -1176,16 +1405,23 @@ namespace dvb
 			}
 
 			if (kind == "state") {
-				json out = MainThread::RunAndWait([]() -> json {
+				json       out = MainThread::RunAndWait([]() -> json {
 					auto*      pc = RE::PlayerCharacter::GetSingleton();
 					const bool loaded = pc && pc->Get3D() != nullptr;
+					const auto alwaysActive = BackgroundRun::AlwaysActive();
 					return json{
 						{ "plugin", "devbench" },
 						{ "version", DEVBENCH_VERSION_STRING },
 						{ "playerLoaded", loaded },
 						{ "frame", game::CurrentFrame() },
+						{ "alwaysActive", alwaysActive ? json(*alwaysActive) : json(nullptr) },
 					};
 				});
+				const bool focused = BackgroundRun::WindowFocused();
+				out["windowFocused"] = focused;
+				const auto alwaysActive = out["alwaysActive"].is_boolean() ? std::optional<bool>(out["alwaysActive"].get<bool>()) : std::nullopt;
+				if (auto warning = InspectLogic::BackgroundWarning(focused, alwaysActive); !warning.empty())
+					out["warning"] = std::move(warning);
 				// pid/port/exe/vr identify which instance answered — with multiple games on
 				// adjacent auto-iterated ports, a caller can confirm it's talking to the
 				// intended one instead of silently misattaching. Shared with /api/health.
@@ -1294,7 +1530,7 @@ namespace dvb
 						{ "gold", pc->GetGoldAmount() },
 					};
 					if (const char* n = pc->GetName(); n && *n)
-						j["name"] = n;
+						j["name"] = FromGame(n);
 					if (auto* base = pc->GetActorBase()) {
 						switch (base->GetSex()) {
 						case RE::SEX::kMale:
@@ -1340,9 +1576,7 @@ namespace dvb
 			if (kind == "inventory") {
 				const std::string formId = a_args.value("formId", std::string{});
 				const std::string typeFilter = a_args.value("formType", std::string{});
-				const int         limit = a_args.value("limit", 100);
-				if (limit < 0)
-					throw ToolError(400, "inspect inventory: 'limit' must be >= 0");
+				const int         limit = InspectLimit(a_args, "inventory");
 				return MainThread::RunAndWait([=]() -> json {
 					auto lower = [](std::string s) {
 						std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -1352,18 +1586,7 @@ namespace dvb
 					if (formId.empty()) {
 						owner = RE::PlayerCharacter::GetSingleton();
 					} else {
-						RE::TESForm* f = RE::TESForm::LookupByEditorID(formId);
-						if (!f) {
-							std::size_t        consumed = 0;
-							unsigned long long id = 0;
-							const std::string  hex = (formId.size() > 2 && formId[0] == '0' && (formId[1] == 'x' || formId[1] == 'X')) ? formId.substr(2) : formId;
-							try {
-								id = std::stoull(hex, &consumed, 16);
-							} catch (...) {
-							}
-							if (consumed == hex.size() && id <= 0xFFFFFFFFull)
-								f = RE::TESForm::LookupByID(static_cast<RE::FormID>(id));
-						}
+						RE::TESForm* f = LookupFormArg(formId);
 						owner = f ? f->As<RE::TESObjectREFR>() : nullptr;
 					}
 					if (!owner)
@@ -1407,9 +1630,7 @@ namespace dvb
 			// quests: the journal — quests that are running or completed, each with its current stage
 			// and non-dormant objectives. 'active' marks the player's tracked quest. 'limit' default 100.
 			if (kind == "quests") {
-				const int limit = a_args.value("limit", 100);
-				if (limit < 0)
-					throw ToolError(400, "inspect quests: 'limit' must be >= 0");
+				const int limit = InspectLimit(a_args, "quests");
 				return MainThread::RunAndWait([=]() -> json {
 					auto* dh = RE::TESDataHandler::GetSingleton();
 					if (!dh)
@@ -1485,18 +1706,7 @@ namespace dvb
 					if (formId.empty()) {
 						actor = RE::PlayerCharacter::GetSingleton();
 					} else {
-						RE::TESForm* f = RE::TESForm::LookupByEditorID(formId);
-						if (!f) {
-							std::size_t        consumed = 0;
-							unsigned long long id = 0;
-							const std::string  hex = (formId.size() > 2 && formId[0] == '0' && (formId[1] == 'x' || formId[1] == 'X')) ? formId.substr(2) : formId;
-							try {
-								id = std::stoull(hex, &consumed, 16);
-							} catch (...) {
-							}
-							if (consumed == hex.size() && id <= 0xFFFFFFFFull)
-								f = RE::TESForm::LookupByID(static_cast<RE::FormID>(id));
-						}
+						RE::TESForm* f = LookupFormArg(formId);
 						actor = f ? f->As<RE::Actor>() : nullptr;
 					}
 					if (!actor)
@@ -1659,11 +1869,9 @@ namespace dvb
 				const std::string typeFilter = a_args.value("formType", std::string{});
 				const std::string modelFilter = a_args.value("model", std::string{});
 				const double      radius = a_args.value("radius", 0.0);
-				const int         limit = a_args.value("limit", 100);
+				const int         limit = InspectLimit(a_args, "refs");
 				if (radius < 0.0)
 					throw ToolError(400, "inspect refs: 'radius' must be >= 0 (0 scans the whole loaded grid)");
-				if (limit < 0)
-					throw ToolError(400, "inspect refs: 'limit' must be >= 0");
 				return MainThread::RunAndWait([=]() -> json {
 					auto lower = [](std::string s) {
 						std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -1671,28 +1879,8 @@ namespace dvb
 					};
 
 					if (!formId.empty()) {
-						// Explicit 0x.. → FormID; otherwise EditorID first (so an all-hex EditorID
-						// isn't misread as a FormID), then a bare hex FormID fallback.
-						// Whole-string + 32-bit-range hex, so "14G" / overflow don't truncate to a
-						// valid FormID and resolve the wrong form.
-						auto byHex = [](const std::string& s) -> RE::TESForm* {
-							std::size_t        consumed = 0;
-							unsigned long long id = 0;
-							try {
-								id = std::stoull(s, &consumed, 16);
-							} catch (...) {
-								return nullptr;
-							}
-							if (consumed != s.size() || id > 0xFFFFFFFFull)
-								return nullptr;
-							return RE::TESForm::LookupByID(static_cast<RE::FormID>(id));
-						};
-						RE::TESForm* f = nullptr;
-						if (formId.size() > 2 && formId[0] == '0' && (formId[1] == 'x' || formId[1] == 'X'))
-							f = byHex(formId.substr(2));
-						else if (f = RE::TESForm::LookupByEditorID(formId); !f)
-							f = byHex(formId);
-						json one = (f && f->As<RE::TESObjectREFR>()) ? IdentifyRef(f->As<RE::TESObjectREFR>()) : IdentifyForm(f);
+						RE::TESForm* f = LookupFormArg(formId);
+						json         one = (f && f->As<RE::TESObjectREFR>()) ? IdentifyRef(f->As<RE::TESObjectREFR>()) : IdentifyForm(f);
 						return json{ { "count", f ? 1 : 0 }, { "refs", f ? json::array({ one }) : json::array() } };
 					}
 
@@ -1787,6 +1975,13 @@ namespace dvb
 			if (kind == "screenshots")
 				return Capture::ListScreenshots(a_args);
 
+			if (kind == "draws") {
+				if (auto provider = ToolExtensions::Find("inspect", "draws"))
+					return DrawStatsLogic::WithSource(provider->handler(a_args, a_ctx), DrawStatsLogic::ProviderSource(provider->descriptor));
+				const bool doReset = BooleanArgument(a_args, "reset", false);
+				return MainThread::RunAndWait([doReset]() { return DrawStatsLogic::WithSource(DrawStats::Read(doReset), DrawStatsLogic::kOwnSource); });
+			}
+
 			// 'extensions' lists consumer-registered inspect kinds (C-ABI RegisterToolExtension).
 			if (kind == "extensions") {
 				json out = json::array();
@@ -1801,9 +1996,9 @@ namespace dvb
 
 			// A consumer-registered inspect kind — route to its handler (receives the full args).
 			if (auto entry = ToolExtensions::Find("inspect", kind))
-				return entry->handler(a_args, a_ctx);
+				return entry->handler(a_ctx.rawArgs ? *a_ctx.rawArgs : a_args, a_ctx);
 
-			throw ToolError(400, std::format("unknown kind '{}' (state|vm|scene|mods|player|inventory|quests|effects|refs|registrants|screenshots|extensions, or a registered kind — see inspect kind=extensions)", kind));
+			throw ToolError(400, std::format("unknown kind '{}' (state|vm|scene|mods|player|inventory|quests|effects|refs|lights|draws|registrants|screenshots|extensions, or a registered kind — see inspect kind=extensions)", kind));
 		}
 
 		// camera: read or set the player camera point of view, so a recording can capture the
@@ -1831,7 +2026,7 @@ namespace dvb
 						{ "freeCamOwned", FreeCamera::IsOwned() },
 						{ "stateId", cam->currentState ? json(static_cast<std::uint32_t>(cam->currentState->id)) : json(nullptr) },
 						{ "freeCamBackend", REL::Module::IsVR() ? "vr-state" : "engine" } };
-					if (cam->IsInThirdPerson()) {
+					if (cam->IsInThirdPerson() && !REL::Module::IsVR()) {  // VR's ThirdPersonState layout is not mapped
 						if (auto* tps = static_cast<RE::ThirdPersonState*>(cam->currentState.get())) {
 							out["thirdPersonState"] = json{
 								{ "targetYaw", tps->targetYaw },
@@ -1845,7 +2040,7 @@ namespace dvb
 							};
 						}
 					}
-					out["orbit"] = CameraOrbit::Active();
+					out["orbit"] = OrbitJson();
 					if (cam->cameraRoot) {
 						const auto& t = cam->cameraRoot->world.translate;
 						out["camX"] = t.x;
@@ -1854,7 +2049,13 @@ namespace dvb
 						if (RE::NiPoint3 e; cam->cameraRoot->world.rotate.ToEulerAnglesXYZ(e)) {
 							out["camPitch"] = e.x;
 							out["camYaw"] = e.z;
+							out["camAngles"] = "worldEuler";
 						}
+					}
+					if (const auto native = FreeCamera::OwnedAngles()) {
+						out["camPitch"] = native->pitch;
+						out["camYaw"] = native->yaw;
+						out["camAngles"] = "freeCameraState";
 					}
 					return out;
 				});
@@ -1865,8 +2066,9 @@ namespace dvb
 				const bool on = a_args.value("on", true);
 				const auto session = FreeCamera::CurrentSession();
 				return MainThread::RunAndWait([on, session]() {
+					const bool orbitEnded = on && CameraOrbit::State().On();
 					FreeCamera::SetEnabled(on, session);
-					return json{ { "queued", false }, { "action", "freecam" }, { "on", on }, { "freeCam", on } };
+					return json{ { "queued", false }, { "action", "freecam" }, { "on", on }, { "freeCam", on }, { "orbitEnded", orbitEnded } };
 				});
 			}
 
@@ -1885,39 +2087,120 @@ namespace dvb
 				});
 			}
 
+			if (action == "frame") {
+				const std::string target = a_args.value("formId", std::string{});
+				if (target.empty())
+					throw ToolError(400, "camera frame requires 'formId' (FormID, EditorID or bare hex FormID of a placed reference)");
+				const std::string sideName = a_args.value("side", std::string("front"));
+				const auto        side = CameraFrame::ParseSide(sideName);
+				if (!side)
+					throw ToolError(400, "camera frame 'side' must be front | back | left | right | top | bottom");
+				auto number = [&](const char* a_key) -> std::optional<double> {
+					if (!a_args.contains(a_key))
+						return std::nullopt;
+					if (!a_args[a_key].is_number() || !std::isfinite(a_args[a_key].get<double>()))
+						throw ToolError(400, std::format("camera frame '{}' must be a finite number", a_key));
+					return a_args[a_key].get<double>();
+				};
+				CameraFrame::Options opts;
+				opts.side = *side;
+				if (const auto v = number("aroundDeg"))
+					opts.aroundRad = *v * CameraFrame::kDegToRad;
+				if (const auto v = number("distance"))
+					opts.distance = *v;
+				if (const auto v = number("distanceScale"))
+					opts.distanceScale = *v;
+				if (const auto v = number("eyeHeight"))
+					opts.eyeFraction = *v;
+				if (const auto v = number("pitchDeg"))
+					opts.pitchRad = *v * CameraFrame::kDegToRad;
+				if (const auto problem = CameraFrame::Validate(opts))
+					throw ToolError(400, std::format("camera frame {}", *problem));
+				const auto session = FreeCamera::CurrentSession();
+				return MainThread::RunAndWait([target, sideName, opts, session]() -> json {
+					auto* form = LookupFormArg(target);
+					auto* ref = form ? form->As<RE::TESObjectREFR>() : nullptr;
+					if (!ref)
+						throw ToolError(404, std::format("camera frame: '{}' is not a placed reference", target));
+					const auto          position = ref->GetPosition();
+					const auto          boundMin = ref->GetBoundMin();
+					const auto          boundMax = ref->GetBoundMax();
+					CameraFrame::Target place;
+					place.x = position.x;
+					place.y = position.y;
+					place.z = position.z;
+					place.heading = ref->GetAngle().z;
+					place.boundMinZ = boundMin.z;
+					place.boundMaxZ = boundMax.z;
+					const CameraFrame::Pose pose = CameraFrame::Frame(place, opts);
+					FreeCamera::Drive(static_cast<float>(pose.x), static_cast<float>(pose.y), static_cast<float>(pose.z),
+						static_cast<float>(pose.pitch), static_cast<float>(pose.yaw), session);
+					return json{
+						{ "queued", false },
+						{ "action", "frame" },
+						{ "side", sideName },
+						{ "target", IdentifyForm(ref) },
+						{ "pose", json{ { "x", pose.x }, { "y", pose.y }, { "z", pose.z }, { "pitch", pose.pitch }, { "yaw", pose.yaw } } },
+					};
+				});
+			}
+
 			// orbit: hold the gameplay third-person camera round the player. yawDeg 0 is behind, 180 in front; pitchDeg tilts
 			// (positive looks down; omitted leaves the tilt); zoom is the game's zoom offset in [-1, 1] (omitted keeps it);
 			// right / up offset the camera (omitted keeps the game's own). No free camera is involved, so gameplay input still
 			// reaches the player. on=false hands the camera back.
 			if (action == "orbit") {
+				if (a_args.contains("on") && !a_args["on"].is_boolean())
+					throw ToolError(400, "camera orbit 'on' must be a boolean");
 				const bool on = a_args.value("on", true);
 				if (!on) {
-					CameraOrbit::Set(false, 0.0f, -99.0f, -9.0f);
-					CameraOrbit::SetOffset(false, 0.0f, 0.0f);
-					return json{ { "action", "orbit" }, { "on", false } };
+					return MainThread::RunAndWait([]() -> json {
+						const bool wasOn = CameraOrbit::End(CameraOrbit::EndReason::kRequested);
+						return json{ { "action", "orbit" }, { "on", false }, { "wasOn", wasOn }, { "orbit", OrbitJson() } };
+					});
 				}
+				for (const char* key : { "yawDeg", "pitchDeg", "zoom", "right", "up" })
+					if (a_args.contains(key) && !a_args[key].is_number())
+						throw ToolError(400, std::format("camera orbit '{}' must be a number", key));
 				const float yaw = a_args.value("yawDeg", 180.0f);
-				const float pitch = a_args.value("pitchDeg", -999.0f);
-				const float zoom = a_args.value("zoom", -9.0f);
+				const float pitch = a_args.value("pitchDeg", 0.0f);
+				const float zoom = a_args.value("zoom", 0.0f);
 				const float right = a_args.value("right", 0.0f), up = a_args.value("up", 0.0f);
 				if (!std::isfinite(yaw) || !std::isfinite(pitch) || !std::isfinite(zoom) || !std::isfinite(right) || !std::isfinite(up))
 					throw ToolError(400, "camera orbit requires finite yawDeg / pitchDeg / zoom / right / up");
-				if (a_args.contains("zoom") && (zoom < -1.0f || zoom > 1.0f))
+				if (zoom < -1.0f || zoom > 1.0f)
 					throw ToolError(400, "camera orbit 'zoom' must be within [-1, 1]");
-				if (a_args.contains("pitchDeg") && (pitch < -89.0f || pitch > 89.0f))
+				if (pitch < -89.0f || pitch > 89.0f)
 					throw ToolError(400, "camera orbit 'pitchDeg' must be within [-89, 89]");
-				constexpr float kDeg = 3.14159265f / 180.0f;
-				return MainThread::RunAndWait([=]() -> json {
+				constexpr float      kDeg = 3.14159265f / 180.0f;
+				CameraOrbit::Request request;
+				request.yawRad = yaw * kDeg;
+				if (a_args.contains("pitchDeg"))
+					request.pitchRad = pitch * kDeg;
+				if (a_args.contains("zoom"))
+					request.zoom = zoom;
+				if (a_args.contains("right") || a_args.contains("up"))
+					request.offset = CameraOrbit::Vec3{ right, 0.0f, up };
+				const auto session = CameraOrbit::CurrentSession();
+				return MainThread::RunAndWait([request, session]() -> json {
 					auto* cam = RE::PlayerCamera::GetSingleton();
 					if (!cam)
 						throw ToolError(500, "PlayerCamera unavailable");
-					if (cam->IsInFreeCameraMode())
+					switch (CameraOrbit::Enable(request, session)) {
+					case CameraOrbit::Admission::kStaleSession:
+						throw ToolError(409, "camera orbit was requested before a load or new game; request it again");
+					case CameraOrbit::Admission::kLoading:
+						throw ToolError(409, "camera orbit is unavailable while the game is loading");
+					case CameraOrbit::Admission::kFreeCamera:
 						throw ToolError(409, "camera orbit holds the third-person camera; leave the free camera first");
+					case CameraOrbit::Admission::kUnsupportedRuntime:
+						throw ToolError(501, "camera orbit is not available on VR yet");
+					default:
+						break;
+					}
 					if (!cam->IsInThirdPerson())
 						cam->ForceThirdPerson();
-					CameraOrbit::SetOffset(a_args.contains("right") || a_args.contains("up"), right, up);
-					CameraOrbit::Set(true, yaw * kDeg, a_args.contains("pitchDeg") ? pitch * kDeg : -99.0f, a_args.contains("zoom") ? zoom : -9.0f);
-					return json{ { "action", "orbit" }, { "on", true }, { "thirdPerson", cam->IsInThirdPerson() } };
+					return json{ { "action", "orbit" }, { "on", true }, { "thirdPerson", cam->IsInThirdPerson() }, { "orbit", OrbitJson() } };
 				});
 			}
 
@@ -1933,6 +2216,7 @@ namespace dvb
 				auto* cam = RE::PlayerCamera::GetSingleton();
 				if (!cam)
 					throw ToolError(500, "PlayerCamera unavailable");
+				const bool orbitEnded = CameraOrbit::End(CameraOrbit::EndReason::kPov);
 				if (pov == "first")
 					cam->ForceFirstPerson();
 				else if (pov == "third")
@@ -1946,7 +2230,7 @@ namespace dvb
 					applied = "third";
 				else if (cam->currentState && cam->currentState->id == RE::CameraState::kAutoVanity)
 					applied = "vanity";
-				return json{ { "action", "setPov" }, { "requestedPov", pov }, { "pov", applied } };
+				return json{ { "action", "setPov" }, { "requestedPov", pov }, { "pov", applied }, { "orbitEnded", orbitEnded } };
 			});
 		}
 
@@ -2077,7 +2361,7 @@ namespace dvb
 		// Open menus that would make a replay meaningless — they pause the sim, are modal, or grab the
 		// cursor into menu-mode (inventory/dialogue/lockpick/messagebox). Always-open menus (HUD/cursor)
 		// and the console (SKSE task exec still runs) never block. Reads live UI flags on the main thread.
-		std::vector<std::string> BlockingMenus()
+		std::vector<std::string> BlockingMenus(milliseconds a_stallLimit = milliseconds(1000))
 		{
 			try {
 				const json names = MainThread::RunAndWait([]() -> json {
@@ -2092,7 +2376,7 @@ namespace dvb
 								menu->UsesCursor(), menu->FreezeFramePause() };
 						});
 				},
-					milliseconds(1000));
+					a_stallLimit);
 				return names.get<std::vector<std::string>>();
 			} catch (const ToolError&) {
 				// A failed read is not proof of a pausing menu. Keep the negative
@@ -2114,7 +2398,7 @@ namespace dvb
 			try {
 				return MainThread::RunAndWait([&a_matchBody]() -> json {
 					auto* data = RE::MessageBoxMenu::GetCurrentMessageBoxData();
-					if (!data || !data->bodyText.c_str() || !ContainsCI(data->bodyText.c_str(), a_matchBody))
+					if (!data || !data->bodyText.c_str() || !ContainsCI(FromGame(data->bodyText.c_str()), a_matchBody))
 						return false;
 					RE::MessageBoxMenu::SelectOption((data->cancelButtonIndex == 0 && data->buttonText.size() > 1) ? 1 : 0);
 					return true;
@@ -2167,7 +2451,7 @@ namespace dvb
 		// Live-state conditions for waitUntil. playerLoaded marshals to the main thread;
 		// a mid-load stall (RunAndWait 504) just means "not yet" → keep polling. Menu
 		// conditions read the thread-safe tracked set (no marshal).
-		bool CheckState(const std::string& a_cond)
+		bool CheckState(const std::string& a_cond, milliseconds a_stallLimit = milliseconds(2000))
 		{
 			if (a_cond == "playerLoaded") {
 				try {
@@ -2175,7 +2459,7 @@ namespace dvb
 						auto* pc = RE::PlayerCharacter::GetSingleton();
 						return pc && pc->Get3D() != nullptr;
 					},
-						milliseconds(2000));
+						a_stallLimit);
 					return r.get<bool>();
 				} catch (const ToolError&) {
 					return false;  // main thread stalled mid-load — condition not met yet
@@ -2202,11 +2486,68 @@ namespace dvb
 					return false;
 				}
 			}
+			if (a_cond == "weaponDrawn" || a_cond == "handsReady" || a_cond == "castingArtLeft" || a_cond == "castingArtRight") {
+				try {
+					const json r = MainThread::RunAndWait([a_cond]() -> json {
+						auto* pc = RE::PlayerCharacter::GetSingleton();
+						if (!pc || !pc->Get3D())
+							return false;
+						const auto snap = SnapshotHands(pc, nullptr, nullptr);
+						if (a_cond == "weaponDrawn")
+							return snap.observation.settledDrawn;
+						if (a_cond == "handsReady")
+							return InspectLogic::HandsReady(snap.observation);
+						const auto& hand = a_cond == "castingArtLeft" ? snap.observation.left : snap.observation.right;
+						return hand.casterPresent && hand.artAttached;
+					},
+						a_stallLimit);
+					return r.get<bool>();
+				} catch (const ToolError&) {
+					return false;
+				}
+			}
 			if (a_cond == "noMenu")
 				return GetMenuInventory().KnownEmpty();
 			if (a_cond == "noBlockingMenu")
 				return BlockingMenus().empty();
 			throw ToolError(400, std::format("unknown waitUntil condition '{}' (playerLoaded|noModal|noMenu|noBlockingMenu|weaponStateSettledDrawn|handsArtObserved|castingArtAttachedLeft|castingArtAttachedRight; deprecated aliases weaponDrawn|handsReady|castingArtLeft|castingArtRight)", a_cond));
+				return BlockingMenus(std::min(a_stallLimit, milliseconds(1000))).empty();
+			throw ToolError(400, std::format("unknown waitUntil condition '{}' (playerLoaded|noModal|noMenu|noBlockingMenu|weaponDrawn|handsReady|castingArtLeft|castingArtRight)", a_cond));
+		}
+
+		constexpr long long kMaxRealWaitMs = 25000;  // under the bridge's 30 s request timeout
+		constexpr long long kDefaultUntilTimeoutMs = 10000;
+		constexpr long long kStallLimitMs = 2000;
+		constexpr auto      kUntilPollInterval = milliseconds(100);
+
+		json RealTimeWait(const json& a_args)
+		{
+			const auto start = steady_clock::now();
+			const auto elapsedMs = [&] { return duration_cast<milliseconds>(steady_clock::now() - start).count(); };
+
+			if (a_args.contains("ms")) {
+				const json& ms = a_args["ms"];
+				if (!ms.is_number_integer() || ms.get<long long>() < 0 || ms.get<long long>() > kMaxRealWaitMs)
+					throw ToolError(400, std::format("'ms' must be an integer 0..{}", kMaxRealWaitMs));
+				std::this_thread::sleep_for(milliseconds(ms.get<long long>()));
+				return json{ { "completed", true }, { "waitedMs", elapsedMs() } };
+			}
+
+			const std::string until = a_args.value("until", std::string{});
+			long long         timeoutMs = kDefaultUntilTimeoutMs;
+			if (a_args.contains("timeoutMs")) {
+				const json& t = a_args["timeoutMs"];
+				if (!t.is_number_integer() || t.get<long long>() < 0 || t.get<long long>() > kMaxRealWaitMs)
+					throw ToolError(400, std::format("'timeoutMs' must be an integer 0..{}", kMaxRealWaitMs));
+				timeoutMs = t.get<long long>();
+			}
+			const auto remainingMs = [&] { return std::max(timeoutMs - elapsedMs(), 1LL); };
+			while (!CheckState(until, milliseconds(std::min(kStallLimitMs, remainingMs())))) {
+				if (elapsedMs() >= timeoutMs)
+					return json{ { "completed", false }, { "reason", "timeout" }, { "until", until }, { "waitedMs", elapsedMs() } };
+				std::this_thread::sleep_for(std::min(kUntilPollInterval, milliseconds(remainingMs())));
+			}
+			return json{ { "completed", true }, { "until", until }, { "waitedMs", elapsedMs() } };
 		}
 
 		// Caller must already know a_args["runId"] is present. A bare get<uint64_t>() on a
@@ -2306,6 +2647,20 @@ namespace dvb
 				return out;
 			}
 
+			/// Every retained run, oldest first, without transcripts.
+			json List()
+			{
+				std::lock_guard lock(m_mtx);
+				json            out = json::array();
+				for (const auto& [id, st] : m_runs) {
+					json entry{ { "runId", id }, { "done", st.done } };
+					if (st.done)
+						entry["ok"] = st.ok;
+					out.push_back(std::move(entry));
+				}
+				return out;
+			}
+
 		private:
 			struct State
 			{
@@ -2331,11 +2686,22 @@ namespace dvb
 			std::map<uint64_t, State> m_runs;
 		};
 
+		/// Which steps of a scenario run hold the recorder's replay mark.
+		enum class ReplayMarking
+		{
+			TrajectorySpan,  // the run's pose / player.setpos span only (ScenarioPolicy::TrajectorySpan)
+			WholeRun,        // record.replay: its injected input and VR stream must not be re-captured either
+		};
+
+		struct ScenarioRunOptions
+		{
+			ReplayMarking                    replayMarking = ReplayMarking::TrajectorySpan;
+			std::function<void(std::size_t)> beforeStep;  // called with each step's index right before it runs
+		};
+
 		/// Execute a scenario step list and return its complete transcript.
-		// a_beforeStep, when set, is called with each step's index right before it runs.
 		json ScenarioHandler(const json& a_args, const ToolContext& a_ctx,
-			const ToolRegistry& a_registry, EventBus& a_events,
-			const std::function<void(std::size_t)>& a_beforeStep = {})
+			const ToolRegistry& a_registry, EventBus& a_events, const ScenarioRunOptions& a_options = {})
 		{
 			if (!a_args.contains("steps") || !a_args["steps"].is_array())
 				throw ToolError(400, "scenario requires a 'steps' array");
@@ -2358,15 +2724,13 @@ namespace dvb
 			bool       anyFailure = false;
 			bool       aborted = false;
 
-			// Mark replaying for the whole run: if a recording is active (composition — recording
-			// a session that plays back a recipe), the pose sampler must not re-capture the
-			// teleported path; the issued setpos commands (seen by the console hook) are the
-			// trajectory. RAII so the flag clears on any return/throw.
-			Recording::SetReplaying(true);
-			struct ReplayGuard
-			{
-				~ReplayGuard() { Recording::SetReplaying(false); }
-			} replayGuard;
+			// While the player is teleported along a trajectory, a recording running beside it must
+			// not re-sample the path: the issued setpos commands (seen by the console hook) carry it.
+			Recording::ReplayMark                         replayMark;
+			const std::optional<ScenarioPolicy::StepSpan> trajectorySpan = ScenarioPolicy::TrajectorySpan(steps);
+			const bool                                    markWholeRun = a_options.replayMarking == ReplayMarking::WholeRun;
+			if (markWholeRun)
+				replayMark.Engage();
 
 			Recording::ReplayDriver::Playback playback(steps, a_args.value("smoothPose", false));
 
@@ -2375,11 +2739,21 @@ namespace dvb
 				// Per-repetition, not per-run: a scene mismatch on rep N must not poison rep N+1's
 				// captures if rep N+1's own scene assert succeeds.
 				bool runSceneMismatch = false;
+				// A waitFor right after a waitFor resumes from the event the previous one matched.
+				ScenarioPolicy::WaitForChain waitChain;
 				for (size_t i = 0; i < steps.size() && !aborted; ++i) {
-					if (a_beforeStep)
-						a_beforeStep(i);
+					// Taken by every step: only a waitFor branch that runs and matches sets it again.
+					const std::optional<uint64_t> prevWaitForSince = waitChain.Take();
+					if (a_options.beforeStep)
+						a_options.beforeStep(i);
 					const json& step = steps[i];
 					json        r{ { "index", i } };
+					if (!markWholeRun && trajectorySpan && i >= trajectorySpan->first && i <= trajectorySpan->last) {
+						if (ScenarioPolicy::HoldsReplayMark(step))
+							replayMark.Engage();
+						else
+							replayMark.Release();
+					}
 					if (repeat > 1)
 						r["repeat"] = rep;
 					const auto stepStart = steady_clock::now();
@@ -2475,8 +2849,8 @@ namespace dvb
 							// Optional: auto-answer a matching modal each poll (e.g. the content-mismatch
 							// box a restore raises before postLoadGame can fire).
 							const std::string acceptBody = step.value("acceptModal", json::object()).value("matchBody", std::string{});
-							// Only events published after this step begins count.
-							uint64_t   since = a_events.HeadSeq();
+							// Only events published after this step begins (or after the previous waitFor's match) count.
+							uint64_t   since = prevWaitForSince.value_or(a_events.HeadSeq());
 							bool       satisfied = false;
 							const auto deadline = steady_clock::now() + milliseconds(timeoutMs);
 							while (steady_clock::now() < deadline) {
@@ -2494,7 +2868,9 @@ namespace dvb
 								std::this_thread::sleep_for(milliseconds(pollMs));
 							}
 							r["satisfied"] = satisfied;
-							if (!satisfied) {
+							if (satisfied)
+								waitChain.Matched(since);
+							else {
 								r["timedOut"] = true;
 								stepFailed = true;
 							}
@@ -2667,6 +3043,8 @@ namespace dvb
 
 					r["elapsedMs"] = duration_cast<milliseconds>(steady_clock::now() - stepStart).count();
 					results.push_back(std::move(r));
+					if (!markWholeRun && trajectorySpan && i == trajectorySpan->last)
+						replayMark.Release();
 
 					if (stepFailed) {
 						anyFailure = true;
@@ -2723,7 +3101,9 @@ namespace dvb
 			inspect.description =
 				"Read live game/plugin state. Runs on the main thread and returns the value "
 				"synchronously (times out if the game is mid-load / not pumping tasks). kinds: "
-				"'state' → { plugin, version, vr, playerLoaded, frame, pid, port, exe } — pid/port/exe "
+				"'state' → { plugin, version, vr, playerLoaded, frame, pid, port, exe, windowFocused, alwaysActive "
+				"(null when unavailable), warning? } — warning appears when the window is in the background with "
+				"bAlwaysActive off, which pauses the engine; pid/port/exe "
 				"identify the answering instance, so a multi-instance session (e.g. SE + VR both "
 				"running, on adjacent auto-iterated ports) can confirm it's talking to the intended "
 				"one; 'vm' → Papyrus VM health "
@@ -2767,10 +3147,27 @@ namespace dvb
 				"'refs' → identify reference(s) sharing one shape { formId, formType, name, "
 				"editorId, base, position, rotation, cell, model, bounds } — 'model' is the base "
 				"object's mesh (.nif) path when it has one; 'bounds' is { min, max } local extents "
-				"for framing a shot; pass 'formId' for one form, 'selected'=true for the "
+				"for framing a shot; an actor ref also carries actor { level, health, healthMax, "
+				"stamina, staminaMax, attackState (the console's GetAttackState: 0 none, 2 swing, 3 hit, "
+				"...), hostileToPlayer, playerTeammate, alive, loaded3D } and, when the ref has no name, its "
+				"display name; pass 'formId' for one form, 'selected'=true for the "
 				"console/crosshair ref (set via prid), or neither to enumerate loaded refs in the grid "
-				"(optional 'formType' filter, 'model' substring filter against the mesh path, "
-				"'radius' from player, 'limit' default 100). "
+				"(optional 'formType' filter, 'model' substring filter against the base object's mesh path, "
+				"'radius' from player, 'limit' default 100); 'model' matches statics and furniture — "
+				"actors normally have no base mesh, so list NPCs with 'formType'=Actor. "
+				"'draws' → what the frames since the counting window began drew, per frame: { frames, seconds, fps, "
+				"frameMs (Present to Present), gpu:{timed, framesTimed, framesLost, frameMs}, passes:[{pass (main|sunShadows|spotShadows|"
+				"pointShadows), objects, objectsByShader (SetupGeometry calls per BSShader type); shadow passes add renders, "
+				"renderCpuMs, accumulateCpuMs, gpuMs, casters, casterSizes:[{atLeast, below, count}] (bound radius / camera "
+				"distance); sunShadows adds objectsPerDepthTarget (cascades)}], mainPassTargets:[{label, width, height, "
+				"format, arraySize, depth, objects, objectsByShader, gpuMs}] (the main pass by bound render target, the depth "
+				"view else the first color view), hooksReplaced } — the first read installs the hooks and returns an empty "
+				"window with started=true; 'reset'=true begins a new window after the reading. GPU times are D3D11 timestamp "
+				"queries read a few frames late without stalling; frames whose answers are late count as framesLost. A target's "
+				"GPU span runs to the next bind, so work issued between binds (compute passes included) counts toward it. "
+				"devbench's hooks are installed by the first draws call; a renderer mod that registers inspect key 'draws' "
+				"(RegisterToolExtension) answers instead, and devbench's hooks are then never installed or pass every call "
+				"through. Every reply names its source: 'devbench', or the provider's descriptor 'source'. "
 				"'registrants' → who has requested the C-ABI interface and what they registered "
 				"through it { consumers:[{name,atEpoch,atFrame}], registrations:[{kind,name,atEpoch,"
 				"atFrame,replaced}], capabilities:{capture,inspect,menu → [registered keys]} } — "
@@ -2785,20 +3182,22 @@ namespace dvb
 				"'extensions' lists those registered kinds + descriptors, and kind=<registered> dispatches.";
 			inspect.description += RegisteredExtensionSummary("inspect", "kinds");
 			inspect.readOnly = true;
-			json kinds = json::array({ "state", "health", "vm", "scene", "mods", "player", "inventory", "quests", "effects", "refs", "lights", "registrants", "screenshots", "extensions" });
+			json kinds = json::array({ "state", "health", "vm", "scene", "mods", "player", "inventory", "quests", "effects", "refs", "lights", "draws", "registrants", "screenshots", "extensions" });
 			for (const auto& k : ToolExtensions::Keys("inspect"))
-				kinds.push_back(k);
+				if (std::find(kinds.begin(), kinds.end(), json(k)) == kinds.end())
+					kinds.push_back(k);
 			inspect.inputSchema = json{
 				{ "type", "object" },
 				{ "properties", json{
-									{ "kind", json{ { "type", "string" }, { "enum", kinds }, { "description", "state | health | vm | scene | mods | player | inventory | quests | effects | refs | lights | registrants | screenshots | extensions (health answers off-thread for liveness+identity; or a registered mod kind — listed here + via kind=extensions)" } } },
+									{ "kind", json{ { "type", "string" }, { "enum", kinds }, { "description", "state | health | vm | scene | mods | player | inventory | quests | effects | refs | lights | draws | registrants | screenshots | extensions (health answers off-thread for liveness+identity; or a registered mod kind — listed here + via kind=extensions)" } } },
 									{ "formId", json{ { "type", "string" }, { "description", "refs: identify this form; inventory: the container ref to read (default player); effects: the actor to read (default player); lights: the reference whose 3D to read (default player) (hex formId, e.g. 0x14, or EditorID)" } } },
 									{ "selected", json{ { "type", "boolean" }, { "description", "refs/lights: use the console-selected / crosshair ref instead" } } },
-									{ "scope", json{ { "type", "string" }, { "enum", json::array({ "ref", "scene" }) }, { "description", "lights: omitted/ref observes one reference's bounded 3D graph; scene observes only shadowSceneNode[0] active/shadow lists with explicit availability/coverage and stable ordering; scene forbids presence of formId/selected" } } },
+									{ "scope", json{ { "type", "string" }, { "enum", json::array({ "ref", "scene" }) }, { "description", "lights: 'ref' (default) reads one reference's 3D; 'scene' lists every light the renderer is using, nearest the player first, each with the reference it hangs under; any other value is refused (400)" } } },
 									{ "formType", json{ { "type", "string" }, { "description", "refs/inventory: keep only entries whose type matches (e.g. Actor, Weapon, Potion)" } } },
-									{ "model", json{ { "type", "string" }, { "description", "refs enumerate: keep only refs whose base object's mesh path contains this substring (case-insensitive, e.g. 'wrcity01')" } } },
-									{ "radius", json{ { "type", "number" }, { "description", "refs enumerate / lights scope=scene: only those within this distance of the player (0 = no limit)" } } },
-									{ "limit", json{ { "type", "integer" }, { "description", "refs/inventory/lights scope=scene: max entries to return (default 100)" } } },
+									{ "model", json{ { "type", "string" }, { "description", "refs enumerate: keep only refs whose base object's mesh path contains this substring (case-insensitive, e.g. 'wrcity01'); matches statics and furniture, not actors" } } },
+									{ "radius", json{ { "type", "number" }, { "description", "refs enumerate: only refs within this distance of the player (0 = whole loaded grid); lights scope=scene: only lights within it (0 = no limit)" } } },
+									{ "limit", json{ { "type", "integer" }, { "description", "refs/inventory/lights: max entries to return (default 100; lights: lights emitted, 0..50000)" } } },
+									{ "reset", json{ { "type", "boolean" }, { "description", "draws: begin a new counting window after this reading" } } },
 								} },
 			};
 			return inspect;
@@ -2822,16 +3221,22 @@ namespace dvb
 				"'name' via the UI queue (kShow) — opens hub menus from a plain name (TweenMenu, "
 				"'Journal Menu', MagicMenu, MapMenu, StatsMenu, InventoryMenu, FavoritesMenu); context "
 				"menus that need a target ref (ContainerMenu/BarterMenu/BookMenu) won't open this way. "
-				"'close' hides a menu by 'name' via the UI queue (kHide). 'invoke' dispatches to a "
+				"'close' hides a menu by 'name' via the UI queue (kHide). 'readBook' opens the real BookMenu for a "
+				"book 'formId' (a book form or a reference to one; 'activate' reads a world reference as the player does). "
+				"'autoDismiss' with 'names' (an array; [] clears) hides those menus the moment they open (e.g. [\"Tutorial Menu\"]); without 'names' it "
+				"returns the list; a message box cannot be listed. 'invoke' dispatches to a "
 				"consumer-registered (mod) menu by 'name' — NOT 'open' (mod menus aren't engine menus). A mod "
 				"exposes its menu via the C-ABI RegisterMenuHandler; 'list' returns those under 'registered'.";
 			menu.description += RegisteredExtensionSummary("menu", "menus (invoke with action='invoke', name=<x>)");
 			menu.inputSchema = json{
 				{ "type", "object" },
 				{ "properties", json{
-									{ "action", json{ { "type", "string" }, { "enum", json::array({ "list", "describe", "accept", "open", "close", "invoke" }) }, { "description", "list | describe | accept | open | close | invoke" } } },
+									{ "action", json{ { "type", "string" }, { "enum", json::array({ "list", "describe", "accept", "open", "close", "invoke", "readBook", "autoDismiss" }) }, { "description", "list | describe | accept | open | close | invoke | readBook | autoDismiss" } } },
+									{ "formId", json{ { "type", "string" }, { "description", "readBook: hex FormID or EditorID of a book form (the tool does not check inventory) or of a reference to a book in the world; opens the real BookMenu." } } },
+									{ "activate", json{ { "type", "boolean" }, { "description", "readBook: activate the reference as the player does (TESObjectBOOK::Activate) instead of opening the menu directly; needs a reference." } } },
 									{ "name", json{ { "type", "string" }, { "description", "open/close: ENGINE menu to show/hide (e.g. TweenMenu). invoke/describe: a registered mod menu (see list .registered, or this tool's description)." } } },
 									{ "index", json{ { "type", "integer" }, { "description", "accept: 0-based button index to select (default 0). See describe's buttons/cancelIndex." } } },
+									{ "names", json{ { "type", "array" }, { "items", json{ { "type", "string" } } }, { "description", "autoDismiss: menu names to hide on open ([] clears; omit to list)." } } },
 								} },
 			};
 			return menu;
@@ -2849,7 +3254,7 @@ namespace dvb
 			"Run a Skyrim console command. action='exec' (default) queues command onto the main thread. With "
 			"capture=true a fresh per-window nonce uses exact observed unknown-command control lines; "
 			"unrecognised framing fails closed before the payload command runs. Exec returns {queued:false, "
-			"completed, windowId}; completed means the end control was observed, not that asynchronous engine "
+			"completed, windowId, lines, source, lossPossible}; completed means the end control was observed, not that asynchronous engine "
 			"work is quiescent. Print/task admission retains that exact window. Closing stops new admissions and "
 			"drains admitted work before publishing an immutable result; a drain timeout returns 504 with command "
 			"completion uncertain, blocks a successor and must not trigger replay. action='read' returns "
@@ -2874,7 +3279,7 @@ namespace dvb
 								{ "action", json{ { "type", "string" }, { "enum", json::array({ "exec", "read" }) }, { "description", "'exec' (default) runs command; 'read' copies the closed/drained window snapshot" } } },
 								{ "command", json{ { "type", "string" }, { "description", "the console command, exactly as typed after ~ (required for exec)" } } },
 								{ "capture", json{ { "type", "boolean" }, { "description", "exec: fence and capture this command's output for the next read" } } },
-								{ "maxLines", json{ { "type", "integer" }, { "description", "read: most recent lines to return (default 200, max 20000)" } } },
+								{ "maxLines", json{ { "type", "integer" }, { "description", "capture exec or read: most recent lines to return (default 200, max 20000)" } } },
 								{ "windowId", json{ { "type", "integer" }, { "minimum", 1 }, { "description", "read: require this exact windowId returned by capture exec; latest retained snapshot only, not history" } } },
 							} },
 		};
@@ -2894,8 +3299,10 @@ namespace dvb
 			"before anything has loaded) plus top-level metaAvailable/metaNote if none parsed; "
 			"'loadLast' loads the most recent save (a settled real-game state — avoids coc's "
 			"heavy new-game init); 'load'/'save' take a 'name' ('load' skips the mod-mismatch "
-			"confirmation modal). Save/load dispatch is fire-and-forget; inspect current "
-			"playerLoaded state for completion. 'advanceTime' (param 'hours', non-zero, may be "
+			"confirmation modal). 'delete' (param 'name') removes that save through the engine's own "
+			"Delete (SE/AE only, irreversible) and reports the result. All other actions except 'list' are "
+			"fire-and-forget; watch lifecycle events / "
+			"inspect playerLoaded for completion. 'advanceTime' (param 'hours', non-zero, may be "
 			"negative) jumps the calendar directly — no need to fall back to console 'set timescale "
 			"to N' and waiting real time — and returns { gameHour, daysPassed, day, month, year } "
 			"read back the same tick; runs synchronously on the main thread. 'setTimeScale' (param "
@@ -2927,7 +3334,9 @@ namespace dvb
 		game.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
-								{ "action", json{ { "type", "string" }, { "enum", json::array({ "list", "save", "load", "loadLast", "newGame", "advanceTime", "getTimeScale", "setTimeScale" }) }, { "description", "list | save | load | loadLast | newGame | advanceTime | getTimeScale | setTimeScale" } } },
+								{ "action", json{ { "type", "string" }, { "enum", json::array({ "list", "save", "load", "loadLast", "delete", "newGame", "advanceTime", "getTimeScale", "setTimeScale", "getDifficulty", "setDifficulty", "getAlwaysActive", "setAlwaysActive" }) } } },
+								{ "enabled", json{ { "type", "boolean" }, { "description", "setAlwaysActive: whether the game runs without window focus" } } },
+								{ "level", json{ { "type", "integer" }, { "description", "setDifficulty: game difficulty level" } } },
 								{ "phase", json{ { "type", "string" }, { "enum", json::array({ "inspect", "request", "confirm" }) }, { "description", "newGame: inspect (default), request confirmation, or confirm the owned New selection" } } },
 								{ "requestId", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "newGame: caller-generated unique ID, required for request/confirm; retain it across response loss" } } },
 								{ "confirmNewGame", json{ { "type", "boolean" }, { "description", "newGame confirm: explicit true required before starting normal game initialization" } } },
@@ -2947,11 +3356,239 @@ namespace dvb
 		};
 		a_registry.Register(std::move(game), &GameHandler);
 
+		ToolDescriptor actor;
+		actor.name = "actor";
+		actor.description =
+			"Drive an NPC's idle animation. 'listIdles' (param 'formId' of a loaded NPC, optional 'filter' EditorID "
+			"substring, 'limit' default 200) returns the idles that NPC can use right now as { editorId, formId, "
+			"animEvent, animFile, plugin, loopMin, loopMax, replayDelay }. 'playIdle' (params 'formId', 'idle' EditorID or FormID, "
+			"'loop' default false, 'repeatMs' 250..60000 default 5000, 'freezeAi' default false) plays the idle on the "
+			"NPC, which stands where it is under the do-nothing package; with loop:true it is replayed every repeatMs "
+			"(the engine does not report when an idle ends, so set it to the clip's length) until 'stopIdle' or the NPC "
+			"unloads, dies, or a load starts. Idles only animate while the NPC's AI runs, so a loop keeps the AI on; "
+			"freezeAi (single play only) turns the AI back off after the pose settles. 'stopIdle' ends any loop and "
+			"returns the NPC to its default idle (ResetRoot), optional 'freezeAi'. 'status' returns whether a loop is active and its idle. playIdle and stopIdle return { ref, ok, ... }; every action "
+			"refuses (409) the player, a dead or unloaded NPC. Main thread; SE and VR.";
+		actor.inputSchema = json{
+			{ "type", "object" },
+			{ "properties", json{
+								{ "action", json{ { "type", "string" }, { "enum", json::array({ "listIdles", "playIdle", "stopIdle", "status" }) }, { "description", "listIdles | playIdle | stopIdle | status" } } },
+								{ "formId", json{ { "type", "string" }, { "description", "the NPC reference (FormID like 0x000A2C8F, or EditorID)" } } },
+								{ "idle", json{ { "type", "string" }, { "description", "playIdle: the idle's EditorID or FormID" } } },
+								{ "loop", json{ { "type", "boolean" }, { "description", "playIdle: keep replaying the idle once the NPC stops running it (default false)" } } },
+								{ "repeatMs", json{ { "type", "integer" }, { "description", "playIdle with loop: milliseconds between replays, 250..60000 (default 5000)" } } },
+								{ "freezeAi", json{ { "type", "boolean" }, { "description", "playIdle (single play) or stopIdle: turn the NPC's AI off again once it settles; refused with loop:true" } } },
+								{ "filter", json{ { "type", "string" }, { "description", "listIdles: case-insensitive EditorID substring" } } },
+								{ "limit", json{ { "type", "integer" }, { "description", "listIdles: most idles to return (default 200)" } } },
+							} },
+			{ "required", json::array({ "action", "formId" }) },
+		};
+		a_registry.Register(std::move(actor), [](const json& a_args, const ToolContext&) -> json {
+			auto text = [&](const char* a_key) -> std::string {
+				if (!a_args.contains(a_key))
+					return {};
+				if (!a_args[a_key].is_string())
+					throw ToolError(400, std::format("'{}' must be a string", a_key));
+				return a_args[a_key].get<std::string>();
+			};
+			const std::string action = text("action");
+			const std::string formId = text("formId");
+			if (action != "listIdles" && action != "playIdle" && action != "stopIdle" && action != "status")
+				throw ToolError(400, std::format("unknown action '{}' (listIdles|playIdle|stopIdle|status)", action));
+			if (formId.empty())
+				throw ToolError(400, "'formId' (the NPC reference) is required");
+			const bool freezeAi = BooleanArgument(a_args, "freezeAi", false);
+			const bool loop = BooleanArgument(a_args, "loop", false);
+
+			std::string  idleArg;
+			std::int64_t repeatMs = ActorIdleLogic::kDefaultRepeatMs;
+			std::size_t  limit = 200;
+			std::string  filter;
+			if (action == "playIdle") {
+				idleArg = text("idle");
+				if (idleArg.empty())
+					throw ToolError(400, "'idle' (EditorID or FormID) is required for playIdle");
+				if (loop && freezeAi)
+					throw ToolError(400, "'freezeAi' cannot be combined with 'loop': a frozen NPC cannot replay its idle");
+				const auto gap = ActorIdleLogic::ParseRepeatMs(a_args.contains("repeatMs") ? a_args["repeatMs"] : json(nullptr));
+				if (!gap)
+					throw ToolError(400, "'repeatMs' must be an integer 250..60000");
+				repeatMs = *gap;
+			} else if (action == "listIdles") {
+				filter = text("filter");
+				if (a_args.contains("limit")) {
+					if (!a_args["limit"].is_number_integer() || a_args["limit"].get<std::int64_t>() <= 0)
+						throw ToolError(400, "'limit' must be an integer > 0");
+					limit = static_cast<std::size_t>(a_args["limit"].get<std::int64_t>());
+				}
+			}
+
+			return MainThread::RunAndWait([=]() -> json {
+				auto* form = LookupFormArg(formId);
+				auto* ref = form ? form->AsReference() : nullptr;
+				auto* npc = ref ? ref->As<RE::Actor>() : nullptr;
+				if (!npc)
+					throw ToolError(404, std::format("'{}' is not a placed actor reference", formId));
+				if (action == "listIdles")
+					return ActorIdle::List(npc, filter, limit);
+				if (action == "stopIdle")
+					return ActorIdle::Stop(npc, freezeAi);
+				if (action == "status")
+					return ActorIdle::Status(npc);
+				auto* idleForm = LookupFormArg(idleArg);
+				auto* idle = idleForm ? idleForm->As<RE::TESIdleForm>() : nullptr;
+				if (!idle)
+					throw ToolError(404, std::format("'{}' is not an idle", idleArg));
+				return ActorIdle::Play(npc, idle, loop, repeatMs, freezeAi);
+			});
+		});
+
+		ToolDescriptor forms;
+		forms.name = "forms";
+		forms.readOnly = true;
+		forms.description =
+			"Find loaded forms. 'find' (param 'formType': Armor | ArmorAddon | HeadPart | Idle | NPC | Weapon | Misc) lists "
+			"the forms of that type, ordered by FormID, filtered by any of 'name' (substring of the name or EditorID), "
+			"'model' (substring of any model path: a head part's, or an armor's addons'), 'plugin' (substring of the "
+			"plugin the form comes from), 'slot' (Armor/ArmorAddon: a biped slot number 30..61 that must be set) and "
+			"'headPartType' (HeadPart: Misc | Face | Eyes | Hair | FacialHair | Scar | Eyebrows); 'limit' (default 50, "
+			"max 500) and 'offset' page the result, which is { total, offset, returned, truncated, forms }. Every form "
+			"carries { formId, formType, plugin, localId, editorId, name }: plugin and localId are what "
+			"Game.GetFormFromFile takes, since the load-order index in formId differs between runtimes and saves. "
+			"A HeadPart adds { headPartType, sex, playable, extraPart, model, extraParts, validRaces (EditorIDs) }; an Armor adds "
+			"{ slotMask, slots, addons:[{ ..., slotMask, slots, maleModel, femaleModel }] }; an ArmorAddon adds its "
+			"slots and both models. 'headParts' (param 'formId' of an actor reference) returns the head parts on that "
+			"actor's base record, described as above, with sharedBase:true when the base is shared by every clone of "
+			"it (so a head part change on one changes all). 'describe' (param 'formId', any form) returns that form as "
+			"'find' describes it plus pluginInfo, the header of the plugin it comes from { name, author, description, "
+			"version, recordCount, masters, master, light }; an Idle also carries { animFile, animEvent, loopMin, loopMax, "
+			"replayDelay, noAttacking, blocking, parent, previous } and animation, the clip its event plays: an "
+			"idle names a behavior graph (usually Actors/Character/Behaviors/0_Master.hkx), so devbench reads the graph "
+			"and the behavior files it references from the game's archives and finds the clip named for the event "
+			"(event IdleCiceroDance1 plays clip CiceroDance1; a prefix such as MT_ or Tor_ is tolerated), then reads that "
+			"clip's file, giving { source:'behavior', behavior, clip, animationName, match (exact | noIdlePrefix | suffix | "
+			"contains, weakest last), candidates, found, resolvedPath, bytes, className, durationSeconds (the clip's "
+			"length), transformTracks, floatTracks }. The match is by name and does not follow the graph's transitions, so "
+			"treat suffix and contains matches as likely, not certain; an event no clip is named for gives found:false with "
+			"a note. An idle whose file is itself an animation reports that file directly (source:'file'). 'plugins' (optional 'filter' over name, author and "
+			"description, 'limit', 'offset') lists the loaded plugins, full then light, each with that header and its "
+			"load-order index. 'asset' (param 'path', relative to Data/Meshes or to Data) reads a game file from the "
+			"archives or loose files and reports { path, found, resolvedPath, bytes } and, for a Havok animation, its "
+			"className, durationSeconds and track counts.";
+		forms.inputSchema = json{
+			{ "type", "object" },
+			{ "properties", json{
+								{ "action", json{ { "type", "string" }, { "enum", json::array({ "find", "headParts", "describe", "plugins", "asset" }) }, { "description", "find | headParts | describe | plugins | asset" } } },
+								{ "formType", json{ { "type", "string" }, { "description", "find: Armor | ArmorAddon | HeadPart | Idle | NPC | Weapon | Misc" } } },
+								{ "type", json{ { "type", "string" }, { "description", "alias for formType" } } },
+								{ "name", json{ { "type", "string" }, { "description", "find: case-insensitive substring of the name or EditorID; plugins: of the plugin name, author or description (see filter)" } } },
+								{ "model", json{ { "type", "string" }, { "description", "find: case-insensitive substring of any model path (Armor, ArmorAddon, HeadPart)" } } },
+								{ "plugin", json{ { "type", "string" }, { "description", "find: case-insensitive substring of the plugin the form comes from" } } },
+								{ "slot", json{ { "type", "integer" }, { "description", "find: Armor/ArmorAddon: a biped slot number 30..61 that must be set (31 hair, 30 head, 41 long hair)" } } },
+								{ "headPartType", json{ { "type", "string" }, { "description", "find: HeadPart: Misc | Face | Eyes | Hair | FacialHair | Scar | Eyebrows" } } },
+								{ "limit", json{ { "type", "integer" }, { "description", "find: most forms to return (default 50, max 500)" } } },
+								{ "offset", json{ { "type", "integer" }, { "description", "find: forms to skip (default 0)" } } },
+								{ "formId", json{ { "type", "string" }, { "description", "headParts: the actor reference; describe: any form (FormID like 0xFF000D62, or EditorID)" } } },
+								{ "filter", json{ { "type", "string" }, { "description", "plugins: case-insensitive substring of the plugin name, author or description" } } },
+								{ "path", json{ { "type", "string" }, { "description", "asset: a game file path, relative to Data/Meshes or to Data (e.g. Actors/Character/Animations/Foo.hkx)" } } },
+							} },
+			{ "required", json::array({ "action" }) },
+		};
+		a_registry.Register(std::move(forms), [](const json& a_args, const ToolContext&) -> json {
+			const std::string action = a_args.value("action", std::string{});
+			if (action != "find" && action != "headParts" && action != "describe" && action != "plugins" && action != "asset")
+				throw ToolError(400, std::format("unknown action '{}' (find|headParts|describe|plugins|asset)", action));
+
+			auto text = [&](const char* a_key) -> std::string {
+				if (!a_args.contains(a_key))
+					return {};
+				if (!a_args[a_key].is_string())
+					throw ToolError(400, std::format("'{}' must be a string", a_key));
+				return a_args[a_key].get<std::string>();
+			};
+			auto count = [&](const char* a_key, std::size_t a_default, std::size_t a_min, std::size_t a_max) -> std::size_t {
+				if (!a_args.contains(a_key))
+					return a_default;
+				const auto& v = a_args[a_key];
+				if (!v.is_number_integer() || v.get<std::int64_t>() < static_cast<std::int64_t>(a_min) || v.get<std::int64_t>() > static_cast<std::int64_t>(a_max))
+					throw ToolError(400, std::format("'{}' must be an integer {}..{}", a_key, a_min, a_max));
+				return static_cast<std::size_t>(v.get<std::int64_t>());
+			};
+
+			if (action == "plugins") {
+				const std::string filter = text("filter");
+				const auto        limit = count("limit", FormSearchLogic::kDefaultLimit, 1, FormSearchLogic::kMaxLimit);
+				const auto        offset = count("offset", 0, 0, 1000000);
+				return MainThread::RunAndWait([=]() -> json { return AssetInfo::Plugins(filter, limit, offset); }, std::chrono::milliseconds(30000));
+			}
+
+			if (action == "asset") {
+				const std::string path = text("path");
+				if (path.empty())
+					throw ToolError(400, "'path' (a game file path, relative to Data or to Data/Meshes) is required for asset");
+				return MainThread::RunAndWait([path]() -> json { return AssetInfo::Animation(path); }, std::chrono::milliseconds(30000));
+			}
+
+			if (action == "describe") {
+				const std::string formId = text("formId");
+				if (formId.empty())
+					throw ToolError(400, "'formId' (any form) is required for describe");
+				return MainThread::RunAndWait([formId]() -> json {
+					auto* form = LookupFormArg(formId);
+					if (!form)
+						throw ToolError(404, std::format("'{}' is not a loaded form", formId));
+					return FormSearch::DescribeForm(form);
+				},
+					std::chrono::milliseconds(15000));
+			}
+
+			if (action == "headParts") {
+				const std::string formId = text("formId");
+				if (formId.empty())
+					throw ToolError(400, "'formId' (an actor reference) is required for headParts");
+				return MainThread::RunAndWait([formId]() -> json {
+					auto* form = LookupFormArg(formId);
+					auto* ref = form ? form->AsReference() : nullptr;
+					auto* npc = ref ? ref->As<RE::Actor>() : nullptr;
+					if (!npc)
+						throw ToolError(404, std::format("'{}' is not a placed actor reference", formId));
+					return FormSearch::HeadPartsOf(npc);
+				});
+			}
+
+			FormSearch::Query query;
+			query.formType = text("formType");
+			if (query.formType.empty())
+				query.formType = text("type");
+			if (query.formType.empty())
+				throw ToolError(400, std::format("'formType' is required for find ({})", FormSearch::SupportedTypes()));
+			query.name = text("name");
+			query.model = text("model");
+			query.plugin = text("plugin");
+			query.limit = count("limit", FormSearchLogic::kDefaultLimit, 1, FormSearchLogic::kMaxLimit);
+			query.offset = count("offset", 0, 0, 1000000);
+			if (a_args.contains("slot")) {
+				const auto& v = a_args["slot"];
+				const auto  mask = v.is_number_integer() ? FormSearchLogic::MaskForSlot(static_cast<int>(v.get<std::int64_t>())) : std::nullopt;
+				if (!mask)
+					throw ToolError(400, "'slot' must be an integer 30..61");
+				query.slotMask = *mask;
+			}
+			if (a_args.contains("headPartType")) {
+				const std::string type = text("headPartType");
+				const auto        parsed = FormSearchLogic::ParseHeadPartType(type);
+				if (!parsed)
+					throw ToolError(400, std::format("unknown headPartType '{}' (Misc | Face | Eyes | Hair | FacialHair | Scar | Eyebrows)", type));
+				query.headPartType = *parsed;
+			}
+			return MainThread::RunAndWait([query]() -> json { return FormSearch::Find(query); }, std::chrono::milliseconds(30000));
+		});
+
 		ToolDescriptor camera;
 		camera.name = "camera";
 		camera.description =
 			"Read or set the player camera. action='get' (default) returns { pov, freeCam, camX, "
-			"camY, camZ, camPitch, camYaw, stateId, freeCamBackend, freeCamOwned, orbit } (plus thirdPersonState: heading, zoom "
+			"camY, camZ, camPitch, camYaw, camAngles, stateId, freeCamBackend, freeCamOwned, orbit } (plus thirdPersonState: heading, zoom "
 			"and offsets, while in third person) read live on the main thread, where pov is first | "
 			"third | vanity | other. stateId is the runtime-specific CameraState value; interpret it "
 			"with freeCamBackend. action='setPov' applies a switch (param 'pov': first | third "
@@ -2967,12 +3604,22 @@ namespace dvb
 			"action='drive' (params 'x','y','z','pitch','yaw', all default 0) "
 			"sets the free camera's world transform — requires free-cam mode already on. "
 			"pitch/yaw are native free-camera angles in radians on both runtimes, writing "
-			"FreeCameraState::rotation directly; completes its field writes before return, so allow "
-			"a rendered frame before capture. "
+			"FreeCameraState::rotation directly; yaw increases clockwise from +Y (north) and the view "
+			"direction is (sin yaw, cos yaw) at pitch 0, the same sense as a reference's heading in "
+			"inspect refs rotation[2] (observed on AE 1.7.104 and VR 1.4.15; VR reports a negative yaw as the equivalent angle plus 2 pi). Completes its field writes before "
+			"return, so allow a rendered frame before capture. "
+			"While devbench owns the free camera, get reports camPitch/camYaw as exactly those native "
+			"angles (camAngles='freeCameraState'); otherwise they are generic XYZ Euler angles of the "
+			"camera's world rotation (camAngles='worldEuler'), which can differ in sign and branch "
+			"from the direction the camera renders and should not be used to verify a pose. "
 			"action='orbit' (params yawDeg default 180, pitchDeg, zoom, right, up; on=false stops) holds the gameplay "
 			"third-person camera round the player on every camera update, with the player's facing held for the orbit - no "
 			"free camera, so gameplay input keeps reaching the player (a held mouseLeft keeps charging a spell, for example). "
-			"It is rejected while the free camera is on and stops on load / new game. "
+			"It is refused (409) while the free camera is on, during a load, or when requested before a load / new game. "
+			"It ends - writing back the heading, tilt, zoom and offsets it overwrote - on on=false, when the camera leaves "
+			"third person (any POV switch), on freecam on or setPov (both answer orbitEnded), and is dropped without "
+			"restoring on load / new game. get reports orbit { on, applied, requested, lastEnd, session, revision }. "
+			"Not available on VR yet (501). "
 			"enable, disable, and drive all reject an active free camera owned elsewhere; "
 			"freeCamOwned reports devbench's own ownership. "
 			"On VR, after failed pre-load restoration, freecam off retries recovery using the "
@@ -2983,13 +3630,27 @@ namespace dvb
 			"record{action:'replay'} drives it exactly via this tool's freecam+drive instead of "
 			"setPov, since head-look is a degree of freedom setpos+setPov can't reproduce, on "
 			"either runtime. Devbench's own replay always owns and releases the free camera itself "
-			"for that duration.";
+			"for that duration. "
+			"action='frame' (param 'formId' of a placed reference; optional 'side' front (default) | back | left | right | top | "
+			"bottom, 'aroundDeg', 'distance', 'distanceScale', 'eyeHeight', 'pitchDeg') drives the free camera, which must already "
+			"be on, to look at that reference from one side and returns { side, target, pose: { x, y, z, pitch, yaw } }. front, "
+			"back, left and right are relative to the reference's own heading (inspect refs rotation[2]) with right on its clockwise "
+			"side; top looks straight down with the image's up being its front, bottom straight up. The camera sits 1.4 x the "
+			"reference's height away (distanceScale scales that, distance sets units) at eyeHeight (default 0.85) of its height; "
+			"aroundDeg replaces the side's horizontal angle. Heading and bounds come from the reference, so it suits actors and "
+			"placed objects; one without bounds is framed as a 128-unit-tall target.";
 		camera.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
-								{ "action", json{ { "type", "string" }, { "enum", json::array({ "get", "setPov", "freecam", "drive", "orbit" }) }, { "description", "get (default) | setPov | freecam | drive | orbit" } } },
+								{ "action", json{ { "type", "string" }, { "enum", json::array({ "get", "setPov", "freecam", "drive", "orbit", "frame" }) }, { "description", "get (default) | setPov | freecam | drive | orbit | frame" } } },
 								{ "yawDeg", json{ { "type", "number" }, { "description", "orbit: degrees round the player (0 behind, 180 in front; default 180)" } } },
-								{ "pitchDeg", json{ { "type", "number" }, { "minimum", -89 }, { "maximum", 89 }, { "description", "orbit: tilt in degrees, positive looks down (omit to leave it)" } } },
+								{ "pitchDeg", json{ { "type", "number" }, { "minimum", -89 }, { "maximum", 89 }, { "description", "orbit: tilt in degrees, positive looks down (omit to leave it); frame: camera tilt, positive looks down (default 0; top and bottom use +-89)" } } },
+								{ "formId", json{ { "type", "string" }, { "description", "frame: the placed reference to look at (FormID, EditorID or bare hex FormID)" } } },
+								{ "side", json{ { "type", "string" }, { "enum", json::array({ "front", "back", "left", "right", "top", "bottom" }) }, { "description", "frame: which side to look from (default front); front/back/left/right are relative to the reference's heading" } } },
+								{ "aroundDeg", json{ { "type", "number" }, { "description", "frame: degrees clockwise from the reference's front, replacing the side's horizontal angle" } } },
+								{ "distance", json{ { "type", "number" }, { "exclusiveMinimum", 0 }, { "maximum", CameraFrame::kMaxDistance }, { "description", "frame: camera distance in world units (default 1.4 x the reference's height)" } } },
+								{ "distanceScale", json{ { "type", "number" }, { "exclusiveMinimum", 0 }, { "maximum", CameraFrame::kMaxDistanceScale }, { "description", "frame: multiplier on the default distance (default 1)" } } },
+								{ "eyeHeight", json{ { "type", "number" }, { "minimum", 0 }, { "maximum", CameraFrame::kMaxEyeFraction }, { "description", "frame: camera height as a fraction of the reference's height (default 0.85)" } } },
 								{ "zoom", json{ { "type", "number" }, { "minimum", -1 }, { "maximum", 1 }, { "description", "orbit: the game's third-person zoom offset (omit to keep it)" } } },
 								{ "right", json{ { "type", "number" }, { "description", "orbit: camera offset to the side in units (with up; omit both to keep the game's own)" } } },
 								{ "up", json{ { "type", "number" }, { "description", "orbit: camera offset up in units" } } },
@@ -2999,7 +3660,7 @@ namespace dvb
 								{ "y", json{ { "type", "number" }, { "description", "drive: world Y (requires free-cam mode)" } } },
 								{ "z", json{ { "type", "number" }, { "description", "drive: world Z (requires free-cam mode)" } } },
 								{ "pitch", json{ { "type", "number" }, { "description", "drive: native free-cam pitch in radians (FreeCameraState::rotation.x)" } } },
-								{ "yaw", json{ { "type", "number" }, { "description", "drive: native free-cam yaw in radians (FreeCameraState::rotation.y)" } } },
+								{ "yaw", json{ { "type", "number" }, { "description", "drive: native free-cam yaw in radians (FreeCameraState::rotation.y), clockwise from +Y; 0 looks along +Y" } } },
 							} },
 		};
 		a_registry.Register(std::move(camera), &CameraHandler);
@@ -3009,6 +3670,8 @@ namespace dvb
 		a_registry.Register(BuildInspectDescriptor(), &InspectHandler);
 		a_registry.Register(BuildMenuDescriptor(), &MenuHandler);
 		a_registry.Register(Capture::BuildCaptureDescriptor(), &Capture::Handle);
+		a_registry.Register(Gfx::BuildDescriptor(), &Gfx::Handle);
+		a_registry.Register(Map::BuildDescriptor(), &Map::Handle);
 
 		// When a mod registers a kind/menu/provider, rebuild that base tool's descriptor so the new
 		// key is discoverable on the first call (the registry's registration path re-registers it
@@ -3017,9 +3680,11 @@ namespace dvb
 		ToolExtensions::SetChangeListener([reg = &a_registry](const std::string& a_baseTool) {
 			std::string base = a_baseTool;
 			std::transform(base.begin(), base.end(), base.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-			if (base == "inspect")
+			if (base == "inspect") {
+				if (ToolExtensions::Find("inspect", "draws"))
+					DrawStats::StandDown();
 				reg->Register(BuildInspectDescriptor(), &InspectHandler);
-			else if (base == "menu")
+			} else if (base == "menu")
 				reg->Register(BuildMenuDescriptor(), &MenuHandler);
 			else if (base == "capture")
 				reg->Register(Capture::BuildCaptureDescriptor(), &Capture::Handle);
@@ -3077,12 +3742,15 @@ namespace dvb
 		scenario.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
-								{ "action", json{ { "type", "string" }, { "enum", json::array({ "run", "status" }) }, { "description", "run (default, requires 'steps') | status (requires 'runId')" } } },
+								{ "action", json{ { "type", "string" }, { "enum", json::array({ "run", "status", "list" }) }, { "description", "run (default, requires 'steps') | status (requires 'runId') | list (retained run ids and their state)" } } },
 								{ "steps", json{ { "type", "array" }, { "description", "run: ordered steps; each is one of tool/wait/waitFor/waitUntil (see description)" }, { "items", json{ { "type", "object" } } } } },
 								{ "repeat", json{ { "type", "integer" }, { "description", "run: run the whole step list N times (default 1, max 1000)" } } },
 								{ "continueOnError", json{ { "type", "boolean" }, { "description", "run: keep going after a failed/timed-out step instead of aborting (default false)" } } },
 								{ "async", json{ { "type", "boolean" }, { "description", "run: return {queued:true, runId} immediately and run in the background (default false); true does not block" } } },
 								{ "runId", json{ { "type", "integer" }, { "description", "status: poll an async run started earlier (from run's 'runId')" } } },
+								{ "verbose", json{ { "type", "boolean" }, { "description", "status: return every step's result (default: a step count plus the failed steps)" } } },
+								{ "from", json{ { "type", "integer" }, { "description", "status: first step of a slice of the transcript" } } },
+								{ "limit", json{ { "type", "integer" }, { "description", "status: size of that slice (default 20)" } } },
 							} },
 		};
 		a_registry.Register(std::move(scenario),
@@ -3093,11 +3761,13 @@ namespace dvb
 						throw ToolError(400, "action='status' requires 'runId'");
 					const uint64_t runId = ParseRunId(a_args);
 					if (auto st = RunRegistry::Get().Status(runId))
-						return *st;
+						return RunStatusLogic::Compact(*st, a_args);
 					throw ToolError(404, std::format("unknown scenario runId {}", runId));
 				}
+				if (action == "list")
+					return json{ { "runs", RunRegistry::Get().List() } };
 				if (action != "run")
-					throw ToolError(400, std::format("unknown action '{}' (run|status)", action));
+					throw ToolError(400, std::format("unknown action '{}' (run|status|list)", action));
 				if (!a_args.contains("steps") || !a_args["steps"].is_array())
 					throw ToolError(400, "action='run' requires a 'steps' array");
 
@@ -3235,6 +3905,7 @@ namespace dvb
 								{ "timeScale", json{ { "type", "number" }, { "description", "replay: run the recorded trajectory this many times faster (0.1..3.0, up to 10.0 with allowHigh:true) and restore the previous scale when it ends — the setup/restore phase runs at normal speed regardless. The result reports goldensEligible plus timeScaleChanges[]" } } },
 								{ "allowHigh", json{ { "type", "boolean" }, { "description", "replay: permit a timeScale above 3.0, up to 10.0" } } },
 								{ "allowTimeScale", json{ { "type", "boolean" }, { "description", "start/replay: proceed while the game's time scale is not 1 (start would record an incomparable run; default false)" } } },
+								{ "holdCamera", json{ { "type", "boolean" }, { "description", "replay: hold the free camera so the recording's camera transform drives the view. Default: held, except on VR when the recording's tracked set is injected, where the HMD drives the view. Set it to force either choice." } } },
 								{ "runId", json{ { "type", "integer" }, { "description", "status: poll an async replay run started earlier (from replay's 'runId')" } } },
 							} },
 		};
@@ -3321,8 +3992,10 @@ namespace dvb
 					// Held from the trajectory boundary (not scene setup) to any exit; see ReplayHold.
 					const std::size_t trajectoryStepCount = plan.value("trajectoryStepCount", static_cast<std::size_t>(0));
 					const auto        cameraHold = std::make_shared<FreeCamera::ReplayHold>();
+					const bool        holdCamera = ScenarioPolicy::ShouldHoldReplayCamera(activity.value("vrTrackedSet", json::object()), REL::Module::IsVR(),
+						a_args.contains("holdCamera") ? std::optional<bool>(BooleanArgument(a_args, "holdCamera", true)) : std::nullopt);
 					auto              runReplay = [&a_registry, &a_events, a_ctx, steps, runId, coupling,
-													  activity, inputOwner, interpolate, cameraHold,
+													  activity, inputOwner, interpolate, cameraHold, holdCamera,
 													  trajectoryStepCount, scaleHold, replayScale,
 													  setupStepCount, allowTimeScale]() -> json {
 						ActiveReplayClaim activeReplayGuard{ runId };
@@ -3372,19 +4045,21 @@ namespace dvb
 							bool scaleEscalated = false;
 							result = ScenarioHandler(json{ { "steps", steps }, { "runId", runId }, { "smoothPose", interpolate } },
 								a_ctx, a_registry, a_events,
-								[&cameraActivated, cameraHold, trajectoryStepCount, &scaleEscalated,
-									scaleHold, replayScale, setupStepCount, allowTimeScale](std::size_t a_index) {
-									if (!cameraActivated && a_index == trajectoryStepCount) {
-										cameraActivated = true;
-										// No-op off VR; on VR, a failure here must abort the replay.
-										cameraHold->Activate();
-									}
-									if (!scaleEscalated && a_index == setupStepCount &&
-										replayScale != static_cast<float>(TimeScaleControl::kNormalScale)) {
-										scaleEscalated = true;
-										scaleHold->Escalate(replayScale, TimeScaleControl::kDefaultLeaseMs, allowTimeScale);
-									}
-								});
+								{ .replayMarking = ReplayMarking::WholeRun,
+									.beforeStep = [&cameraActivated, cameraHold, holdCamera, trajectoryStepCount, &scaleEscalated,
+													  scaleHold, replayScale, setupStepCount, allowTimeScale](std::size_t a_index) {
+										if (!cameraActivated && a_index == trajectoryStepCount) {
+											cameraActivated = true;
+											// A failure here must abort the replay.
+											if (holdCamera)
+												cameraHold->Activate();
+										}
+										if (!scaleEscalated && a_index == setupStepCount &&
+											replayScale != static_cast<float>(TimeScaleControl::kNormalScale)) {
+											scaleEscalated = true;
+											scaleHold->Escalate(replayScale, TimeScaleControl::kDefaultLeaseMs, allowTimeScale);
+										}
+									} });
 						} catch (const std::exception& e) {
 							const json cleanup = releaseRecordedInput();
 							a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", false }, { "error", e.what() } });
@@ -3435,7 +4110,7 @@ namespace dvb
 				if (action == "status" && a_args.contains("runId")) {
 					const uint64_t runId = ParseRunId(a_args);
 					if (auto st = RunRegistry::Get().Status(runId))
-						return *st;
+						return RunStatusLogic::Compact(*st, a_args);
 					throw ToolError(404, std::format("unknown replay runId {}", runId));
 				}
 				return Recording::Handle(a_args, a_events);
@@ -3467,20 +4142,32 @@ namespace dvb
 		ToolDescriptor wait;
 		wait.name = "wait";
 		wait.description =
-			"Advance time by waiting `hours`, synchronously and without touching the Wait "
-			"menu's UI at all: starts the wait, then drives its completion (autosave, script "
-			"events) to done before returning — no polling needed. Refuses with "
+			"Three ways to wait. `hours`: advance GAME time, synchronously and without touching the Wait "
+			"menu's UI: starts the wait and returns once the game has run it to the end, "
+			"one tick per frame as with the menu open (no autosave); refuses with "
 			"{ completed:false, reason } on the same gate the menu itself enforces (combat, "
-			"trespassing, midair, hostiles nearby, etc.). Refused with 409 while calendar custody is outstanding, including unverified cleanup.";
+			"trespassing, midair, hostiles nearby, etc.). Game-time waits return 409 while a calendar lease is outstanding. "
+			"`ms`: pause in REAL time. `until`: poll a live "
+			"condition (playerLoaded|noModal|noMenu|noBlockingMenu|weaponDrawn|handsReady|castingArtLeft|"
+			"castingArtRight) and return when it holds, or { completed:false, reason:'timeout' } after `timeoutMs`.";
 		wait.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
-								{ "hours", json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", kMaxWaitHours }, { "description", "hours to wait (> 0)" } } },
+								{ "hours", json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", kMaxWaitHours }, { "description", "game-time hours to wait (> 0); omit for a real-time wait" } } },
+								{ "ms", json{ { "type", "integer" }, { "minimum", 0 }, { "maximum", kMaxRealWaitMs }, { "description", "real-time milliseconds to pause (max 25000; loop for longer)" } } },
+								{ "until", json{ { "type", "string" }, { "description", "live condition to wait for (see the tool description)" } } },
+								{ "timeoutMs", json{ { "type", "integer" }, { "minimum", 0 }, { "maximum", kMaxRealWaitMs }, { "description", "until: give up after this long (default 10000; max 25000, so the call finishes inside the bridge's request timeout)" } } },
 							} },
-			{ "required", json::array({ "hours" }) },
 		};
 		a_registry.Register(std::move(wait), [](const json& a_args, const ToolContext&) {
-			return WaitOrSleepHandler(a_args, false);
+			const int modes = static_cast<int>(a_args.contains("hours")) + static_cast<int>(a_args.contains("ms")) + static_cast<int>(a_args.contains("until"));
+			if (modes > 1)
+				throw ToolError(400, "wait takes one of 'hours', 'ms' or 'until', not a combination");
+			if (a_args.contains("hours"))
+				return WaitOrSleepHandler(a_args, false);
+			if (a_args.contains("ms") || a_args.contains("until"))
+				return RealTimeWait(a_args);
+			throw ToolError(400, "wait needs 'hours' (game time), 'ms' (real-time pause) or 'until' (a live condition)");
 		});
 
 		ToolDescriptor sleep;

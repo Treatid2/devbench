@@ -3,6 +3,7 @@
 #include "GameEvents.h"
 #include "GameState.h"
 #include "InputHotkeys.h"
+#include "Json.h"
 #include "MainThread.h"
 #include "RecordingActivity.h"
 #include "ReplayTrajectory.h"
@@ -67,11 +68,15 @@ namespace dvb::Recording
 		// specify its own settleMs. Set from config via SetCaptureDefaults.
 		long g_captureSettleMs = 500;
 
-		// True while devbench is replaying a scenario (teleporting the player). The pose sampler
-		// skips these ticks: the replay's own setpos/setangle commands — captured via the console
-		// hook — already carry the trajectory, so re-sampling would double it. Lets a user record
-		// a session that plays back an existing recipe and embed it cleanly (composition).
-		std::atomic<bool> g_replaying{ false };
+		// Engaged ReplayMark holds. While above zero devbench is teleporting the player and the
+		// pose sampler skips its ticks: the replay's own setpos/setangle commands — captured via
+		// the console hook — already carry the trajectory, so re-sampling would double it.
+		std::atomic<int> g_replayMarks{ 0 };
+
+		bool Replaying()
+		{
+			return g_replayMarks.load(std::memory_order_relaxed) > 0;
+		}
 
 		std::vector<int> ReservedInputKeys()
 		{
@@ -523,7 +528,7 @@ namespace dvb::Recording
 					}
 					if (!running.load(std::memory_order_relaxed))
 						break;
-					if (pose.is_null() || g_replaying.load(std::memory_order_relaxed))
+					if (pose.is_null() || Replaying())
 						continue;  // raw tracking is still sampled, but replay's teleported player pose is not
 					// A main-menu-start recording has no anchor. Preserve its initial state and
 					// also capture the first loaded scene without pretending that was the start.
@@ -733,7 +738,7 @@ namespace dvb::Recording
 		// every pose array across ~9 indented lines.
 		std::string SerializeRecording(const json& a_scenario)
 		{
-			std::string s = "{\n\"meta\": " + a_scenario.value("meta", json::object()).dump(2);
+			std::string s = "{\n\"meta\": " + Dump(a_scenario.value("meta", json::object()), 2);
 			const auto  isCompactArray = [](std::string_view a_key, const json& a_value) {
 				return a_value.is_array() &&
 				       (a_key == "steps" || a_key == "activityEvents" || a_key == "trackingSamples");
@@ -742,26 +747,26 @@ namespace dvb::Recording
 			// known high-volume shape receive compact one-item-per-line formatting.
 			for (auto it = a_scenario.begin(); it != a_scenario.end(); ++it)
 				if (it.key() != "meta" && !isCompactArray(it.key(), *it))
-					s += ",\n" + json(it.key()).dump() + ": " + it->dump(2);
+					s += ",\n" + Dump(json(it.key())) + ": " + Dump(*it, 2);
 			if (a_scenario.contains("activityEvents") && a_scenario["activityEvents"].is_array()) {
 				s += ",\n\"activityEvents\": [\n";
 				const json& events = a_scenario["activityEvents"];
 				for (size_t i = 0; i < events.size(); ++i)
-					s += events[i].dump() + (i + 1 < events.size() ? ",\n" : "\n");
+					s += Dump(events[i]) + (i + 1 < events.size() ? ",\n" : "\n");
 				s += "]";
 			}
 			if (a_scenario.contains("trackingSamples") && a_scenario["trackingSamples"].is_array()) {
 				s += ",\n\"trackingSamples\": [\n";
 				const json& samples = a_scenario["trackingSamples"];
 				for (size_t i = 0; i < samples.size(); ++i)
-					s += samples[i].dump() + (i + 1 < samples.size() ? ",\n" : "\n");
+					s += Dump(samples[i]) + (i + 1 < samples.size() ? ",\n" : "\n");
 				s += "]";
 			}
 			if (!a_scenario.contains("steps") || a_scenario["steps"].is_array()) {
 				s += ",\n\"steps\": [\n";
 				const json steps = a_scenario.value("steps", json::array());
 				for (size_t i = 0; i < steps.size(); ++i)
-					s += steps[i].dump() + (i + 1 < steps.size() ? ",\n" : "\n");
+					s += Dump(steps[i]) + (i + 1 < steps.size() ? ",\n" : "\n");
 				s += "]";
 			}
 			s += "\n}\n";
@@ -1141,8 +1146,7 @@ namespace dvb::Recording
 	void NoteInputEvents(RE::InputEvent* const* a_events)
 	{
 		const auto generation = ActiveGeneration();
-		if (!a_events || !generation ||
-			g_replaying.load(std::memory_order_relaxed))
+		if (!a_events || !generation || Replaying())
 			return;
 		const std::vector<int> reservedKeys = ReservedInputKeys();
 		for (const auto* event = *a_events; event; event = event->next) {
@@ -1164,9 +1168,20 @@ namespace dvb::Recording
 		AppendActivity(json{ { "kind", "lifecycle" }, { "event", a_event } }, generation);
 	}
 
-	void SetReplaying(bool a_replaying)
+	void ReplayMark::Engage()
 	{
-		g_replaying.store(a_replaying, std::memory_order_relaxed);
+		if (m_engaged)
+			return;
+		g_replayMarks.fetch_add(1, std::memory_order_relaxed);
+		m_engaged = true;
+	}
+
+	void ReplayMark::Release()
+	{
+		if (!m_engaged)
+			return;
+		g_replayMarks.fetch_sub(1, std::memory_order_relaxed);
+		m_engaged = false;
 	}
 
 	void SetLoadSettleMs(int a_ms)
@@ -1411,7 +1426,7 @@ namespace dvb::Recording
 				}
 			if (!ok && !force)
 				throw ToolError(409, std::format("recording is for runtimes {} but this game is {} — pass force to replay anyway",
-										 compat.dump(), curVR ? "vr" : "flat (se/ae)"));
+										 Dump(compat), curVR ? "vr" : "flat (se/ae)"));
 		}
 
 		// Capability gate: if this recording declares checkpoints need a capture provider,

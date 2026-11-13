@@ -4,7 +4,6 @@
 
 #include "McpAdapter.h"
 #include "RestAdapter.h"
-#include "PathUtf8.h"
 #include "Version.h"
 
 #include <RE/Skyrim.h>  // REL::Module::IsVR
@@ -287,7 +286,7 @@ namespace dvb
 		const bool        vr = REL::Module::IsVR();
 		const std::string game = vr ? "vr" : "se";
 		std::error_code   ec;
-		const std::string exePath = PathUtf8(std::filesystem::absolute("Data/SKSE/Plugins/devbench/devbench-bridge.exe", ec));
+		const std::string exePath = Utf8(std::filesystem::absolute("Data/SKSE/Plugins/devbench/devbench-bridge.exe", ec));
 		const std::string name = "devbench-" + game;
 		json              result{
 			{ "exePath", exePath },
@@ -304,7 +303,7 @@ namespace dvb
 				"are also mirrored to externalStateDir, which isn't virtualized, for exactly that reason." },
 		};
 		if (auto dir = ExternalStateDir())
-			result["externalStateDir"] = PathUtf8(*dir);
+			result["externalStateDir"] = Utf8(*dir);
 		return result;
 	}
 }

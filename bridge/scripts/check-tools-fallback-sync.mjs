@@ -14,13 +14,26 @@ if (!baseRef) {
   throw new Error("usage: check-tools-fallback-sync.mjs <base-ref>");
 }
 
+// A core-tool file counts only when a changed code line (comments excluded) holds a string
+// literal of three or more characters: tool text and schema keys are always literals.
 const REGISTRATION_FILES = [
   "src/Tools.cpp",
   "src/Capture.cpp",
+  "src/Map.cpp",
   "src/HostApi.cpp",
   "src/KeyboardInput.cpp",
-  "src/ToolRegistry.h",
 ];
+// Not every edit to this header changes what tools advertise: only its descriptor
+// shape and default schema reach tools/list, so it counts only when a changed code
+// line (comments excluded) mentions one of those.
+const DESCRIPTOR_FILE = "src/ToolRegistry.h";
+const DESCRIPTOR_TOKENS =
+  /\b(DefaultInputSchema|ToolDescriptor|inputSchema|readOnly)\b/;
+const STRING_LITERAL = /"(?:[^"\\]|\\.){3,}"/;
+// Runtime code, not tool text: an #include, a result field built from a call
+// (`{ "key", Fn(x) },`), or a result field assigned from a non-literal (`j["key"] = x;`).
+const RESULT_FIELD =
+  /^(?:#include\s|\{\s*"\w+",\s*[^"]*\([^"]*\},?$|\w+\["\w+"\]\s*=\s*[^"]*;$)/;
 const FALLBACK_FILE = "bridge/src/tools-fallback.json";
 
 // Structural validation, independent of whether a registration file changed --
@@ -62,12 +75,36 @@ const changed = execFileSync(
   .split("\n")
   .filter(Boolean);
 
-const registrationChanged = REGISTRATION_FILES.some((f) => changed.includes(f));
+function changedCodeLines(file) {
+  if (!changed.includes(file)) return [];
+  const diff = execFileSync(
+    "git",
+    ["diff", "-U0", `${baseRef}...HEAD`, "--", file],
+    { encoding: "utf-8" },
+  );
+  return diff
+    .split("\n")
+    .filter((l) => /^[+-](?![+-])/.test(l))
+    .map((l) => l.slice(1).trim())
+    .filter((l) => l && !l.startsWith("//") && !l.startsWith("/*"));
+}
+
+const touchedRegistrationFiles = [
+  ...REGISTRATION_FILES.filter((f) =>
+    changedCodeLines(f).some(
+      (l) => STRING_LITERAL.test(l) && !RESULT_FIELD.test(l),
+    ),
+  ),
+  ...(changedCodeLines(DESCRIPTOR_FILE).some((l) => DESCRIPTOR_TOKENS.test(l))
+    ? [DESCRIPTOR_FILE]
+    : []),
+];
+const registrationChanged = touchedRegistrationFiles.length > 0;
 const fallbackChanged = changed.includes(FALLBACK_FILE);
 
 if (registrationChanged && !fallbackChanged) {
   console.error(
-    `A devbench core-tool file changed (${REGISTRATION_FILES.filter((f) => changed.includes(f)).join(", ")}) ` +
+    `A devbench core-tool file changed (${touchedRegistrationFiles.join(", ")}) ` +
       `without ${FALLBACK_FILE}. Run 'node bridge/scripts/sync-tools-fallback.mjs' against a live devbench ` +
       "and commit the result.",
   );

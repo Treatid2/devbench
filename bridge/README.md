@@ -66,56 +66,31 @@ You can also get this exact snippet live from a running game: `GET /api/tools`'s
 - `--install <path>` — target a specific Skyrim install directory (required if devbench
   isn't in one of the default Steam locations, or you're running a non-default copy).
 - `setup` — print the `.mcp.json` snippet instead of running as an MCP server.
-- `--rest-timeout-ms <milliseconds>` — tool-call REST deadline, integer1..540000;
-  default30000. Applies to the response headers AND complete body of each single
-  forwarded tool call. `tools/list` discovery retains its independent30s bound.
-  Invalid/missing/duplicate timeout values and unknown flags fail before starting
-  stdio or issuing requests. `setup` preserves an explicitly selected value in
-  its printed snippet; it still writes no configuration.
+- `--rest-timeout-ms <milliseconds>` — deadline for one forwarded tool call.
+  Accepts integers from 1 to 540,000 and defaults to 30,000. The deadline covers
+  response headers and the complete body. Tool discovery keeps its own
+  30-second deadline. The `setup` snippet includes the option when supplied.
 
 ## Long calls and uncertain results
 
-This option is per bridge process, not a native argument or an MCP per-call timeout
-extension. It forwards the SAME native method/arguments ONCE, without splitting
-waits or replaying. Tool requests force manual redirect handling after caller
-options: no `Location` is followed, including POST-preserving307/308 and
-method-transforming301/302/303. A3xx response is an uncertain, non-retryable HTTP
-error, preserving the original status and JSON/raw body where the runtime exposes
-them. No second request probes or qualifies the redirect target. The same deadline
-still covers the original response body; a stalled redirect body can time out.
-Example: `--game vr --rest-timeout-ms 124000` admits a120000ms
-server operation only if the independently configured MCP client envelope is
-strictly longer (e.g.125000ms). Other selected envelopes are60000/64000/65000 and
-30000/34000/35000ms (server/bridge/client). A shared bridge configuration must be
-large enough for its longest admitted operation. The entire owning package still
-has its own600s limit; selecting540000 does not establish that other work fits.
-Changing an outer client timeout alone cannot extend this bridge deadline.
+Set the option on the bridge process. For example, use
+`--game vr --rest-timeout-ms 124000` for a native call that may take 120
+seconds. Configure the MCP client to wait longer than the bridge deadline.
 
-The maximum is a finite bridge guard, not proof that a particular native operation,
-client, artifact or SDK supports that duration. Callers must qualify the actual
-selected bridge binary and client configuration. The old a1c0056/77104d76 issued
-binary has NO timeout flag and remains fixed30s; new source is not its runtime.
-Neither this option nor `setup` edits/reloads client config or deploys a bridge.
+A timeout stops the bridge waiting for a response. Native work may still
+complete. The MCP error includes `restError.outcome = "unknown"` and
+`restError.retrySafe = false`, along with the configured deadline and any
+received HTTP status and response body. Use the original request identity to
+check what happened before deciding whether to retry.
 
-POST timeout, transport/read failure, malformed response or HTTP error returns
-an MCP error with `restError` including code, outcome="unknown", retrySafe=false
-and timeoutMs; HTTP responses also preserve status and exact parsed body (or raw
-non-JSON text). A complete successful JSON response is passed through unchanged,
-including native error values in HTTP200. In particular a timed-out POST is NOT
-relabeled "game not running": native work may already have happened or may still
-complete. Reconcile its original identity/effects; never automatically replay.
-The abort bounds bridge response waiting, not native task cancellation or cleanup.
+The bridge rejects redirects on tool POSTs. This keeps the call on its
+original endpoint and preserves the redirect response in the error.
 
-`node --test test/rest-policy.test.mjs` runs offline policy/owned-loopback tests
-on Node24's native TypeScript stripping, no tsc/build output or game connection.
-The test-only resolver maps proxy.ts's two relative.js imports to their exact.ts
-sources during loading, then deregisters; it does not replace HTTP or production
-logic. Redirect regressions exercise actual `callTool` using an owned temporary
-runtime.json and two ephemeral loopback servers. They require one original POST,
-unchanged arguments, zero redirect-target requests, uncertain errors for each of
-301/302/303/307/308, non-overridable policy and a bounded stalled redirect body.
-Standalone executable compilation, matching issued source/artifact identity and
-actual stdio adapter/client qualification remain separate owner stages.
+Run the policy and loopback HTTP tests with Node.js 24 from `bridge/`:
+
+```sh
+node --test test/rest-policy.test.mjs
+```
 
 ## Development
 

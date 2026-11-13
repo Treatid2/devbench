@@ -69,6 +69,22 @@ namespace dvb
 		// covers a frozen main thread, which a `menu`/`lifecycle` event never can (those are
 		// published BY the main thread). 0 disables the watchdog.
 		int stallWatchdogMs = 5000;
+
+		// Fail a tool request carrying a top-level key its inputSchema doesn't declare (400) instead
+		// of only warning in the reply. Off by default: a tool with an incomplete schema would break.
+		bool strictToolArgs = false;
+
+		// Force the engine's [General] bAlwaysActive on at startup so the game keeps running (and tools keep
+		// working) while its window is in the background. Off by default: it is a user preference.
+		bool alwaysActive = false;
+
+		// Stop the engine's idle auto-vanity camera from taking over the view (it breaks captures and replays).
+		// On by default; the fAutoVanityModeDelay INI setting does not reliably prevent it.
+		bool disableVanityCamera = true;
+
+		// Menus hidden automatically the moment they open (e.g. "Tutorial Menu"), so an unattended
+		// script is not stuck behind a hint. A message box is never hidden this way. Empty = none.
+		std::vector<std::string> autoDismissMenus;
 	};
 
 	// Load Data/SKSE/Plugins/devbench/config.json. If the file is missing it is

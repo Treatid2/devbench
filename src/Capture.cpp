@@ -1,6 +1,7 @@
 #include "Capture.h"
-
 #include "CaptureProviderBurst.h"
+
+#include "CaptureBurstLogic.h"
 #include "Config.h"
 #include "EventBus.h"
 #include "GameState.h"
@@ -16,6 +17,9 @@
 #include <cstdio>
 #include <ctime>
 #include <fstream>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <thread>
 
@@ -47,25 +51,32 @@ namespace dvb::Capture
 
 		std::string GenericPath(const fs::path& a_p)
 		{
-			return a_p.generic_string();  // forward slashes, per the provider contract
+			return Utf8(fs::path(a_p.generic_wstring()));  // forward slashes, per the provider contract
 		}
 
-		// Where the file really sits on disk. Under Mod Organizer 2 the game sees a virtual Data
-		// folder and a file written there lands in MO2's overwrite folder; the open handle knows.
-		// Empty when the file cannot be opened.
+		struct HandleCloser
+		{
+			void operator()(HANDLE a_handle) const noexcept
+			{
+				if (a_handle && a_handle != INVALID_HANDLE_VALUE)
+					CloseHandle(a_handle);
+			}
+		};
+		using UniqueHandle = std::unique_ptr<void, HandleCloser>;
+
+		// The final on-disk path behind a_p, as UTF-8 with forward slashes; empty when it cannot be resolved.
 		std::string RealPath(const fs::path& a_p)
 		{
-			HANDLE h = CreateFileW(a_p.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-				OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-			if (h == INVALID_HANDLE_VALUE)
+			UniqueHandle h(CreateFileW(a_p.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+				OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+			if (!h || h.get() == INVALID_HANDLE_VALUE)
 				return {};
 			std::wstring buf(MAX_PATH, L'\0');
-			DWORD        n = GetFinalPathNameByHandleW(h, buf.data(), static_cast<DWORD>(buf.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+			DWORD        n = GetFinalPathNameByHandleW(h.get(), buf.data(), static_cast<DWORD>(buf.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
 			if (n >= buf.size()) {
 				buf.resize(n + 1);
-				n = GetFinalPathNameByHandleW(h, buf.data(), static_cast<DWORD>(buf.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+				n = GetFinalPathNameByHandleW(h.get(), buf.data(), static_cast<DWORD>(buf.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
 			}
-			CloseHandle(h);
 			if (n == 0 || n >= buf.size())
 				return {};
 			buf.resize(n);
@@ -73,30 +84,42 @@ namespace dvb::Capture
 				buf = L"\\\\" + buf.substr(8);
 			else if (buf.starts_with(L"\\\\?\\"))
 				buf = buf.substr(4);
-			return GenericPath(fs::path(buf));
+			return Utf8(fs::path(buf).generic_wstring());
 		}
 
-		// Adds realPath next to path, and says so when a virtual file system may be hiding it.
-		void AddRealPath(json& a_result, const fs::path& a_p)
+		// Advisory only: never turns a capture that was written into a failure. The handle lookup is
+		// synchronous on arbitrary storage, so it runs only when the caller asks for it.
+		void AddPathInfo(json& a_result, const fs::path& a_p, bool a_resolve) noexcept
 		{
-			const std::string real = RealPath(a_p);
-			a_result["realPath"] = real.empty() ? json(nullptr) : json(real);
-			const bool mo2 = GetModuleHandleW(L"usvfs_x64.dll") != nullptr;
-			a_result["virtualFileSystem"] = mo2;
-			std::error_code ec;
-			const fs::path  absolute = fs::absolute(a_p, ec);
-			if (mo2 && (real.empty() || real == GenericPath(absolute)))
-				a_result["pathNote"] =
-					"Mod Organizer 2 is running and did not reveal where this file really is; outside the "
-					"game it is probably under MO2's overwrite folder. Set captureDir in devbench's config "
-					"(or pass outDir) to a folder outside the game directory for a path that is the same "
-					"inside and outside the game.";
+			try {
+				const bool usvfs = GetModuleHandleW(L"usvfs_x64.dll") != nullptr;
+				a_result["usvfsLoaded"] = usvfs;
+				a_result["virtualFileSystem"] = usvfs;
+				std::string real;
+				if (a_resolve) {
+					real = RealPath(a_p);
+					a_result["realPath"] = real.empty() ? json(nullptr) : json(real);
+				}
+				if (usvfs) {
+					std::error_code ec;
+					const fs::path  absolute = fs::absolute(a_p, ec);
+					if (real.empty() || real == Utf8(absolute.generic_wstring()))
+						a_result["pathNote"] =
+							"a usvfs module (Mod Organizer 2's virtual file system) is loaded in the game, so 'path' may be "
+							"a virtual Data path that lands elsewhere on disk (often MO2's overwrite folder)" +
+							std::string(a_resolve ? " and the handle did not reveal another place" : "; pass resolveRealPath:true to look it up") +
+							". Set captureDir (or outDir) outside the game folder for a path that is the same inside and outside the game.";
+				}
+			} catch (...) {
+				a_result["realPath"] = nullptr;
+				a_result["pathNote"] = "the capture was written; looking up where it really is on disk failed";
+			}
 		}
 
-		// Names a client may reach for from other tools; the real ones are checkpointId and cleanup.
+		// Checked before any provider is chosen, so another failure never hides the corrective message.
 		void RejectMisnamedArgs(const json& a_args)
 		{
-			if (a_args.contains("id") && !a_args.contains("checkpointId"))
+			if (a_args.contains("id"))
 				throw ToolError(400, "capture: the file stem is 'checkpointId', not 'id'");
 			if (a_args.contains("deleteSource"))
 				throw ToolError(400, "capture: deleting the game's own screenshot is 'cleanup':true, not 'deleteSource'");
@@ -110,6 +133,16 @@ namespace dvb::Capture
 			if (a_value.empty() || a_value == "." || a_value == ".." ||
 				a_value.find('/') != std::string::npos || a_value.find('\\') != std::string::npos)
 				throw ToolError(400, std::format("invalid '{}': must be a single path segment (no '/', '\\\\', '.', or '..')", a_field));
+		}
+
+		std::string CheckpointIdOf(const json& a_args)
+		{
+			const std::string given = a_args.value("checkpointId", std::string{});
+			if (!given.empty())
+				return given;
+			static std::atomic<unsigned long long> sequence{ 0 };
+			return CaptureBurstLogic::AutoCheckpointId(
+				duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count(), sequence.fetch_add(1, std::memory_order_relaxed));
 		}
 
 		// ---- game root / directory scanning (shared by the native fallback and inspect kind=screenshots) ----
@@ -280,7 +313,7 @@ namespace dvb::Capture
 			fs::create_directories(sidecar.parent_path(), ec);
 			std::ofstream out(sidecar, std::ios::trunc);
 			if (out)
-				out << a_result.dump(2) << '\n';
+				out << Dump(a_result, 2) << '\n';
 			else
 				logs::warn("devbench capture: could not write sidecar {}", sidecar.string());
 		}
@@ -384,11 +417,8 @@ namespace dvb::Capture
 
 		json Native(const json& a_args)
 		{
-			const auto start = steady_clock::now();
-			RejectMisnamedArgs(a_args);
-			const std::string checkpointId = a_args.value("checkpointId", std::string{});
-			if (checkpointId.empty())
-				throw ToolError(400, "capture requires 'checkpointId'");
+			const auto        start = steady_clock::now();
+			const std::string checkpointId = CheckpointIdOf(a_args);
 			ValidatePathSegment("checkpointId", checkpointId);
 
 			// Preflight: bAllowScreenShot can disable vanilla capture outright.
@@ -454,8 +484,10 @@ namespace dvb::Capture
 				std::string dirList;
 				for (const auto& d : dirs)
 					dirList += (dirList.empty() ? "" : ", ") + d.string();
-				PublishAbandoned("", "", a_args, "timeout");
-				throw ToolError(504, std::format("no new screenshot appeared within {}ms (scanned: {})", timeoutMs, dirList));
+				json abandoned = a_args;
+				abandoned["checkpointId"] = checkpointId;
+				PublishAbandoned("", "", abandoned, "timeout");
+				throw ToolError(504, std::format("no new screenshot appeared within {}ms for checkpointId '{}' (scanned: {})", timeoutMs, checkpointId, dirList));
 			}
 
 			const std::string recording = a_args.value("recording", std::string("adhoc"));
@@ -492,7 +524,7 @@ namespace dvb::Capture
 				{ "provider", "native" },
 				{ "kind", "screenshot" },
 				{ "path", GenericPath(dest) },
-				{ "file", dest.filename().string() },
+				{ "file", Utf8(dest.filename()) },
 				{ "bytes", static_cast<std::uintmax_t>(fs::file_size(dest, ec)) },
 				{ "checkpointId", checkpointId },
 				{ "recording", recording },
@@ -516,29 +548,246 @@ namespace dvb::Capture
 			result.update(sceneStamp);
 			ComputeInconclusive(result);
 			MaybeScoreAgainstGolden(result, a_args, dest);
-			AddRealPath(result, dest);
+			AddPathInfo(result, dest, a_args.value("resolveRealPath", true));
 
 			WriteSidecar(dest, result);
 			PublishSaved(result);
 			return result;
 		}
 
+		// ---- burst capture: a provider writes a PNG sequence; devbench validates, tracks the run and reports it ----
+
+		struct BurstRun
+		{
+			std::uint64_t               runId{ 0 };
+			std::string                 requestId;
+			std::string                 provider;
+			std::string                 outputDir;
+			std::string                 prefix;
+			std::string                 manifestPath;
+			int                         count{ 0 };
+			int                         everyNFrames{ 1 };
+			long                        timeoutMs{ 0 };
+			float                       timeScale{ 1.0f };
+			std::optional<std::int64_t> providerRunId;
+			std::uint64_t               sinceSeq{ 0 };
+			steady_clock::time_point    started;
+			CaptureBurstLogic::RunState state;
+		};
+
+		std::mutex                        g_burstLock;
+		std::map<std::uint64_t, BurstRun> g_bursts;
+		std::uint64_t                     g_burstSeq = 0;
+		constexpr std::uintmax_t          kMaxManifestBytes = 1u << 20;
+		constexpr std::size_t             kMaxRememberedBursts = 32;
+
+		void RefreshBurst(BurstRun& a_run)
+		{
+			if (g_events && a_run.state.state != CaptureBurstLogic::State::kDone && a_run.state.state != CaptureBurstLogic::State::kFailed) {
+				for (const auto& ev : g_events->Since(a_run.sinceSeq)) {
+					a_run.sinceSeq = ev.seq;
+					CaptureBurstLogic::ApplyEvent(a_run.state, a_run.requestId, ev.topic, ev.payload);
+				}
+			}
+			CaptureBurstLogic::ApplyTimeout(a_run.state, static_cast<long>(duration_cast<milliseconds>(steady_clock::now() - a_run.started).count()), a_run.timeoutMs);
+		}
+
+		bool BurstRunning(const BurstRun& a_run)
+		{
+			return a_run.state.state == CaptureBurstLogic::State::kRunning;
+		}
+
+		int CountWrittenFrames(const BurstRun& a_run)
+		{
+			int             written = 0;
+			std::error_code ec;
+			for (const auto& entry : fs::directory_iterator(a_run.outputDir, ec)) {
+				if (CaptureBurstLogic::IsBurstFrame(entry.path().filename().string(), a_run.prefix, a_run.count))
+					++written;
+			}
+			return written;
+		}
+
+		std::string ResolveBurstProvider(const std::string& a_kind)
+		{
+			if (a_kind == "native")
+				throw ToolError(400, "capture burst needs a capture provider; the native fallback takes single frames only");
+			if (a_kind != "auto") {
+				if (!ToolExtensions::Find("capture", a_kind))
+					throw ToolError(404, std::format("no capture provider registered under '{}'", a_kind));
+				return a_kind;
+			}
+			const auto keys = ToolExtensions::Keys("capture");
+			if (const auto chosen = CaptureBurstLogic::DefaultProvider(keys))
+				return *chosen;
+			if (keys.empty())
+				throw ToolError(404, "no capture provider registered; a burst needs one (see inspect kind=registrants)");
+			std::string names;
+			for (const auto& k : keys)
+				names += (names.empty() ? "" : ", ") + k;
+			throw ToolError(400, std::format("multiple capture providers registered ({}) — pass an explicit kind", names));
+		}
+
+		json StartBurst(const json& a_args, const ToolContext& a_ctx)
+		{
+			std::string error;
+			const auto  request = CaptureBurstLogic::ParseBurst(a_args, error);
+			if (!request)
+				throw ToolError(400, "capture burst: " + error);
+			const std::string checkpointId = CheckpointIdOf(a_args);
+			ValidatePathSegment("checkpointId", checkpointId);
+			const std::string provider = ResolveBurstProvider(a_args.value("kind", std::string("auto")));
+			auto              entry = ToolExtensions::Find("capture", provider);
+			if (!entry)
+				throw ToolError(404, std::format("no capture provider registered under '{}'", provider));
+
+			const fs::path  outputDir = CaptureDir(a_args);
+			std::error_code ec;
+			fs::create_directories(outputDir, ec);
+			if (ec)
+				throw ToolError(500, std::format("capture burst: cannot create {}: {}", GenericPath(outputDir), ec.message()));
+			const fs::path manifestPath = outputDir / (checkpointId + "_manifest.json");
+
+			BurstRun run;
+			run.requestId = std::format("{}#burst#{}", checkpointId, g_requestSeq.fetch_add(1, std::memory_order_relaxed));
+			run.provider = provider;
+			run.outputDir = GenericPath(outputDir);
+			run.prefix = checkpointId;
+			run.manifestPath = GenericPath(manifestPath);
+			run.count = request->count;
+			run.everyNFrames = request->everyNFrames;
+			run.timeoutMs = request->timeoutMs;
+			run.timeScale = TimeScaleControl::Effective();
+
+			json providerArgs{
+				{ "action", "burst" },
+				{ "requestId", run.requestId },
+				{ "outputDir", run.outputDir },
+				{ "prefix", run.prefix },
+				{ "manifestPath", run.manifestPath },
+				{ "count", request->count },
+				{ "everyNFrames", request->everyNFrames },
+				{ "excludeUi", request->excludeUi },
+				{ "format", "png" },
+			};
+			if (request->subrect)
+				providerArgs["subrect"] = json{ { "x", request->subrect->x }, { "y", request->subrect->y }, { "w", request->subrect->w }, { "h", request->subrect->h } };
+
+			// Reserve the slot before the provider is called, so a concurrent request sees this burst running.
+			// The event snapshot is taken at the same point: a fast provider could publish its ready event first.
+			std::uint64_t runId = 0;
+			{
+				const std::lock_guard lock(g_burstLock);
+				for (auto& [id, other] : g_bursts) {
+					RefreshBurst(other);
+					if (BurstRunning(other))
+						throw ToolError(409, std::format("burst {} is still running (capture action='status' runId={})", id, id));
+				}
+				run.sinceSeq = g_events ? g_events->HeadSeq() : 0;
+				run.started = steady_clock::now();
+				run.runId = runId = ++g_burstSeq;
+				g_bursts.emplace(runId, run);
+			}
+
+			std::optional<std::int64_t> providerRunId;
+			try {
+				const json queued = InvokeProviderBurst(*entry, providerArgs, a_ctx);
+				if (queued.contains("error"))
+					throw ToolError(502, queued.value("error", std::string("capture provider refused the burst")));
+				if (queued.contains("runId") && queued["runId"].is_number_integer())
+					providerRunId = queued["runId"].get<std::int64_t>();
+			} catch (...) {
+				const std::lock_guard lock(g_burstLock);
+				g_bursts.erase(runId);
+				throw;
+			}
+
+			json out{
+				{ "queued", true },
+				{ "requestId", run.requestId },
+				{ "provider", provider },
+				{ "outputDir", run.outputDir },
+				{ "prefix", run.prefix },
+				{ "manifestPath", run.manifestPath },
+				{ "count", run.count },
+				{ "everyNFrames", run.everyNFrames },
+				{ "timeoutMs", run.timeoutMs },
+				{ "timeScale", run.timeScale },
+			};
+			if (providerRunId)
+				out["providerRunId"] = *providerRunId;
+			out["runId"] = runId;
+			const std::lock_guard lock(g_burstLock);
+			if (const auto reserved = g_bursts.find(runId); reserved != g_bursts.end())
+				reserved->second.providerRunId = providerRunId;
+			while (g_bursts.size() > kMaxRememberedBursts) {
+				const auto oldest = g_bursts.begin();
+				if (BurstRunning(oldest->second))
+					break;
+				g_bursts.erase(oldest);
+			}
+			return out;
+		}
+
+		json ReadManifest(const BurstRun& a_run)
+		{
+			std::error_code ec;
+			const auto      size = fs::file_size(a_run.state.manifestPath, ec);
+			if (ec)
+				return json{ { "manifestNote", "the provider reported a manifest path but no file is there" } };
+			if (size > kMaxManifestBytes)
+				return json{ { "manifestNote", "the manifest is larger than 1 MiB; read it from manifestPath" } };
+			std::ifstream file(a_run.state.manifestPath, std::ios::binary);
+			json          manifest = json::parse(file, nullptr, false);
+			if (!manifest.is_object())
+				return json{ { "manifestNote", "the manifest is not a JSON object; read it from manifestPath" } };
+			manifest["timeScale"] = a_run.timeScale;
+			return json{ { "manifest", std::move(manifest) } };
+		}
+
+		json BurstStatus(const json& a_args)
+		{
+			const auto it = a_args.find("runId");
+			if (it == a_args.end() || !it->is_number_integer() || it->get<std::int64_t>() < 1)
+				throw ToolError(400, "capture status requires 'runId', the run a burst returned");
+			BurstRun run;
+			{
+				const std::lock_guard lock(g_burstLock);
+				const auto            found = g_bursts.find(it->get<std::uint64_t>());
+				if (found == g_bursts.end())
+					throw ToolError(404, std::format("no burst with runId {}", it->get<std::int64_t>()));
+				RefreshBurst(found->second);
+				run = found->second;
+			}
+			json out = CaptureBurstLogic::StatusJson(run.state);
+			out["runId"] = run.runId;
+			out["requestId"] = run.requestId;
+			out["provider"] = run.provider;
+			out["outputDir"] = run.outputDir;
+			out["prefix"] = run.prefix;
+			out["count"] = run.count;
+			out["everyNFrames"] = run.everyNFrames;
+			out["timeScale"] = run.timeScale;
+			if (run.providerRunId)
+				out["providerRunId"] = *run.providerRunId;
+			out["elapsedMs"] = duration_cast<milliseconds>(steady_clock::now() - run.started).count();
+			if (BurstRunning(run))
+				out["written"] = CountWrittenFrames(run);
+			else if (run.state.state == CaptureBurstLogic::State::kDone && !run.state.manifestPath.empty())
+				out.update(ReadManifest(run));
+			return out;
+		}
+
 		// ---- provider dispatch ----
 
-		json DispatchToProvider(const std::string& a_providerKey, const json& a_args, const ToolContext& a_ctx, bool a_burst)
+		json DispatchToProvider(const std::string& a_providerKey, const json& a_args, const ToolContext& a_ctx)
 		{
 			const auto start = steady_clock::now();
 			auto       entry = ToolExtensions::Find("capture", a_providerKey);
 			if (!entry)
 				throw ToolError(404, std::format("no capture provider registered under '{}'", a_providerKey));
 
-			if (a_burst)
-				return InvokeProviderBurst(*entry, a_args, a_ctx);
-
-			RejectMisnamedArgs(a_args);
-			const std::string checkpointId = a_args.value("checkpointId", std::string{});
-			if (checkpointId.empty())
-				throw ToolError(400, "capture requires 'checkpointId'");
+			const std::string checkpointId = CheckpointIdOf(a_args);
 			ValidatePathSegment("checkpointId", checkpointId);
 			const std::string recording = a_args.value("recording", std::string("adhoc"));
 			const std::string variant = a_args.value("variant", std::string("default"));
@@ -554,7 +803,8 @@ namespace dvb::Capture
 			const std::string requestId = std::format("{}#{}#{}", checkpointId,
 				a_args.value("runId", 0), g_requestSeq.fetch_add(1, std::memory_order_relaxed));
 
-			json providerArgs = a_args;
+			json providerArgs = a_ctx.rawArgs ? *a_ctx.rawArgs : a_args;
+			providerArgs["checkpointId"] = checkpointId;
 			providerArgs["outputPath"] = GenericPath(outputPath);
 			providerArgs["requestId"] = requestId;
 
@@ -570,7 +820,7 @@ namespace dvb::Capture
 			const long  pollMs = a_args.value("pollMs", static_cast<long>(100));
 			const Ready ready = AwaitArtifact(sinceSeq, requestId, outputPath, timeoutMs, pollMs);
 			if (!ready.ok) {
-				PublishAbandoned(requestId, GenericPath(outputPath), a_args, "timeout");
+				PublishAbandoned(requestId, GenericPath(outputPath), providerArgs, "timeout");
 				throw ToolError(504, std::format("capture provider '{}' did not deliver: {}", a_providerKey, ready.error));
 			}
 
@@ -586,7 +836,7 @@ namespace dvb::Capture
 				{ "provider", a_providerKey },
 				{ "kind", "screenshot" },
 				{ "path", GenericPath(outputPath) },
-				{ "file", outputPath.filename().string() },
+				{ "file", Utf8(outputPath.filename()) },
 				{ "bytes", ready.bytes },
 				{ "checkpointId", checkpointId },
 				{ "recording", recording },
@@ -614,7 +864,7 @@ namespace dvb::Capture
 			result.update(sceneStamp);
 			ComputeInconclusive(result);
 			MaybeScoreAgainstGolden(result, a_args, outputPath);
-			AddRealPath(result, outputPath);
+			AddPathInfo(result, outputPath, a_args.value("resolveRealPath", true));
 
 			WriteSidecar(outputPath, result);
 			PublishSaved(result);
@@ -667,7 +917,7 @@ namespace dvb::Capture
 			const auto&     f = files[i];
 			std::error_code ec;
 			shots.push_back(json{
-				{ "file", f.path.filename().string() },
+				{ "file", Utf8(f.path.filename()) },
 				{ "path", GenericPath(f.path) },
 				{ "bytes", f.size },
 				// file_time_type's clock epoch is NOT the Unix epoch (e.g. 1601 on MSVC) --
@@ -709,16 +959,26 @@ namespace dvb::Capture
 			return json{ { "extensions", std::move(out) } };
 		}
 
-		const auto action = a_args.find("action");
-		const bool burstStatus = action != a_args.end() && *action == "burstStatus";
-		const bool burst = burstStatus || (action != a_args.end() && *action == "burst");
-		if (burst && kind == "native")
-			throw ToolError(400, "capture burst actions require a registered provider");
+		RejectMisnamedArgs(a_args);
 
-		// Check time scale when starting a capture, including the burst request.
-		// A status query can settle an existing run even if time scale has changed.
+		std::string action = a_args.value("action", std::string("capture"));
+		if (action == "screenshot")
+			action = "capture";
+		if (action == "status")
+			return BurstStatus(a_args);
+		const bool providerStatus = action == "burstStatus";
+		const bool providerBurst = action == "burst" &&
+			(a_args.contains("requestId") || a_args.contains("outputDir") || a_args.contains("prefix") || a_args.contains("manifestPath") ||
+				a_args.contains("scale"));
+		if (action == "burst" && !providerBurst)
+			return StartBurst(a_args, a_ctx);
+		if (action != "capture" && !providerBurst && !providerStatus)
+			throw ToolError(400, std::format("unknown action '{}' (capture|burst|status|burstStatus)", action));
+
+		// Past the discovery kinds a capture may actually run. It has to be taken at the speed its
+		// golden was, so a scaled game is refused rather than producing an incomparable image.
 		std::optional<Capturing> capturing;
-		if (!burstStatus) {
+		if (!providerStatus) {
 			// Atomic with TimeScaleControl::Set's own check (same mutex), so a concurrent
 			// setTimeScale can't slip a non-normal scale past this check, or vice versa.
 			std::lock_guard admissionLock(TimeScaleControl::AdmissionMutex());
@@ -729,16 +989,22 @@ namespace dvb::Capture
 			capturing.emplace();
 		}
 
+		if (providerBurst || providerStatus) {
+			const auto provider = ResolveBurstProvider(kind);
+			const auto entry = ToolExtensions::Find("capture", provider);
+			if (!entry)
+				throw ToolError(404, std::format("no capture provider registered under '{}'", provider));
+			return InvokeProviderBurst(*entry, a_args, a_ctx);
+		}
+
 		if (kind == "native")
 			return Native(a_args);
 
 		if (kind == "auto") {
 			const auto keys = ToolExtensions::Keys("capture");
-			if (keys.size() == 1)
-				return DispatchToProvider(keys.front(), a_args, a_ctx, burst);
+			if (const auto chosen = CaptureBurstLogic::DefaultProvider(keys))
+				return DispatchToProvider(*chosen, a_args, a_ctx);
 			if (keys.empty()) {
-				if (burst)
-					throw ToolError(404, "capture burst actions require a registered provider");
 				if (a_args.value("allowNative", false))
 					return Native(a_args);
 				throw ToolError(404,
@@ -753,12 +1019,18 @@ namespace dvb::Capture
 		}
 
 		// A named provider.
-		return DispatchToProvider(kind, a_args, a_ctx, burst);
+		return DispatchToProvider(kind, a_args, a_ctx);
 	}
 
 	bool InFlight()
 	{
-		return g_inFlight.load(std::memory_order_acquire) > 0;
+		if (g_inFlight.load(std::memory_order_acquire) > 0)
+			return true;
+		const std::lock_guard lock(g_burstLock);
+		return std::ranges::any_of(g_bursts, [](auto& a_entry) {
+			RefreshBurst(a_entry.second);
+			return BurstRunning(a_entry.second);
+		});
 	}
 
 	ToolDescriptor BuildCaptureDescriptor()
@@ -766,34 +1038,49 @@ namespace dvb::Capture
 		ToolDescriptor d;
 		d.name = "capture";
 		d.description =
-			"Capture a frame and return its file path plus correlation metadata. "
-			"Providers that advertise action='burst' in kind='extensions' can also start asynchronous bursts. "
-			"Keep the provider's runId and apiRequestId. Use the same provider with action='burstStatus' and runId, "
-			"or read capture.burst.progress and capture.burst.ready events. The provider reports progress, "
-			"terminal success or failure, and any published manifest. A queued result is only acceptance. "
-			"DevBench checks time scale at burst admission and returns the provider reply without waiting for files. "
+			"Capture a frame (screenshot) and return its file path plus correlation metadata. "
 			"kind='auto' (default) picks the sole registered capture provider (a mod that "
 			"registered under the C-ABI RegisterToolExtension(\"capture\", <key>, …) — see inspect "
-			"kind=registrants); zero registered providers is a 404 UNLESS allowNative=true, and two "
-			"or more is a 400 naming them (never silently guessed). kind='native' forces the "
+			"kind=registrants) or, among several, the only one not keyed '<name>.native'; zero registered providers is a 404 UNLESS allowNative=true, and an "
+			"ambiguous set is a 400 naming them (never silently guessed). kind='native' forces the "
 			"low-fidelity vanilla fallback (main-thread MenuControls::QueueScreenshot() + a "
 			"directory poll — no path control, no completion signal beyond polling, format fixed by "
 			"the user's .ini, may include open UI) — NOT comparable against a provider-authored "
 			"golden image. kind='providers' lists registered provider keys; kind='extensions' lists "
-			"them with descriptors. A single capture names the file with 'checkpointId' (not 'id'); "
+			"them with descriptors. The request names the file with 'checkpointId' (not 'id'); "
 			"'cleanup':true (native only; not 'deleteSource') deletes the game's own screenshot after "
-			"the copy. The result's 'path' is where the GAME sees the file; 'realPath' is where it "
-			"really is on disk — they differ under Mod Organizer 2, which puts files written into Data "
-			"in its overwrite folder ('virtualFileSystem':true, and 'pathNote' when the real place "
-			"could not be found: set captureDir or outDir outside the game folder). Optional 'golden' compares the capture against a reference image "
+			"the copy. The result's 'path' is where the GAME sees the file. 'usvfsLoaded' says a usvfs "
+			"module (Mod Organizer 2's virtual file system) is loaded, so that path may land elsewhere "
+			"on disk; 'resolveRealPath':true adds 'realPath', the file handle's final path (advisory: a "
+			"failed lookup never fails the capture), and 'pathNote' explains when neither settles it "
+			"(set captureDir or outDir outside the game folder). Optional 'golden' compares the capture against a reference image "
 			"via SSIM and adds {ssim, threshold, passed} to the result (or 'regions' for independent "
 			"per-region scores, {name,ssim,threshold,passed} each, overall 'passed' is AND across "
 			"all — see record{action:'replay'}'s 'goldens' arg, the normal way this gets set for a "
-			"checkpoint). A single capture result also carries {inconclusive, inconclusiveReason?} — true when "
+			"checkpoint). Every result also carries {inconclusive, inconclusiveReason?} — true when "
 			"sceneMismatch, any 'degraded' entry, or a native-fallback capture means 'passed' (if "
 			"present) should NOT be trusted as a real verdict; always check this before acting on "
 			"'passed'. This is devbench's fast single-checkpoint verdict; batch/corpus regression "
-			"across many recordings stays in tests/http/visual.py.";
+			"across many recordings stays in tests/http/visual.py. "
+			"action='burst' with requestId, outputDir and prefix dispatches directly to the provider. "
+			"Keep its runId and apiRequestId for burstStatus and capture.burst.progress/ready. "
+			"Without provider-managed arguments, action='burst' takes a frame-locked sequence through the registered provider "
+			"(never the native fallback): 'count' (1..240) frames, one every 'everyNFrames' presented "
+			"engine frames (default 1), named <checkpointId>_0000.png and so on under the capture "
+			"directory (recording/variant, or 'outDir'), optional 'subrect' {x,y,w,h} in 0..1 UV and "
+			"'excludeUi' (default true); 'scale' is refused. It returns at once with { queued, runId, "
+			"requestId, outputDir, prefix, manifestPath, timeoutMs, timeScale } and is not refused at a "
+			"non-1 time scale, which is how hair and cloth motion is slowed for it; only one burst runs "
+			"at a time (409), and game setTimeScale is refused while it does. action='status' with "
+			"'runId' reports { state (running | done | failed | timeout), captured, written, dropped, "
+			"width, height, uiExcluded, elapsedMs }; while running 'written' counts the files so far, "
+			"and when done the provider's manifest is inlined under 'manifest' with the burst's "
+			"'timeScale' added: { frames:[{index, file, gameFrame, gameTimeMs, wallMs}], dropped:[…], "
+			"… }. Frames the provider could not keep up with are dropped and counted, never waited "
+			"for. gameTimeMs is the provider's accumulated engine frame delta, which may not follow "
+			"the time scale; check it before using it for playback speed. A burst that has not "
+			"finished within timeoutMs (default 5 s plus 500 ms per presented frame) reports "
+			"timeout, and a ready event that arrives later still turns it to done.";
 		d.readOnly = false;
 		json kinds = json::array({ "auto", "native", "providers", "extensions" });
 		for (const auto& k : ToolExtensions::Keys("capture"))
@@ -802,46 +1089,32 @@ namespace dvb::Capture
 			{ "type", "object" },
 			{ "properties", json{
 								{ "kind", json{ { "type", "string" }, { "enum", kinds }, { "description", "auto (default) | native | providers | extensions | a registered provider key" } } },
-								{ "action", json{ { "type", "string" }, { "enum", { "capture", "burst", "burstStatus" } }, { "default", "capture" } } },
-								{ "checkpointId", json{ { "type", "string" }, { "description", "Single capture: stable file stem and correlation key" } } },
-								{ "requestId", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "Burst: caller-supplied request identity. Keep it when reconciling an uncertain reply." } } },
-								{ "outputDir", json{ { "type", "string" }, { "description", "Burst: absolute output directory in the game's filesystem" } } },
-								{ "prefix", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "Burst: safe frame filename stem" } } },
-								{ "count", json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 600 }, { "description", "Burst: requested frame count" } } },
-								{ "everyNFrames", json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 600 }, { "default", 1 }, { "description", "Burst: frame cadence. The CSX provider bounds (count-1)*everyNFrames to 216000." } } },
-								{ "manifestPath", json{ { "type", "string" }, { "description", "Burst: optional absolute JSON manifest path" } } },
-								{ "runId", json{ { "type", "integer" }, { "description", "For burstStatus, use the runId returned by the same provider." } } },
-								{ "scale", json{ { "type", "number" }, { "description", "Burst: the CSX provider supports scale=1." } } },
+								{ "action", json{ { "type", "string" }, { "enum", json::array({ "capture", "screenshot", "burst", "status", "burstStatus" }) }, { "description", "capture (default, one frame) | burst (a PNG sequence through the provider) | status (DevBench-managed run) | burstStatus (provider-managed run)" } } },
+								{ "count", json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 600 }, { "description", "burst: requested frames (up to 240 for DevBench-managed runs; provider limit otherwise)" } } },
+								{ "everyNFrames", json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 600 }, { "description", "burst: capture every Nth presented engine frame (default 1); not game time, so it does not follow the time scale" } } },
+								{ "runId", json{ { "type", "integer" }, { "description", "status or burstStatus: the runId the corresponding burst returned" } } },
+								{ "checkpointId", json{ { "type", "string" }, { "description", "file stem and correlation key (default shot_<epoch ms>_<n>; use the returned checkpointId or path); a burst's frames are <checkpointId>_NNNN.png" } } },
 								{ "recording", json{ { "type", "string" }, { "description", "recording file stem, for correlation (default 'adhoc')" } } },
 								{ "variant", json{ { "type", "string" }, { "description", "variant under test, for correlation (default 'default')" } } },
 								{ "allowNative", json{ { "type", "boolean" }, { "description", "permit kind=auto to fall back to the vanilla path when no provider is registered (default false)" } } },
 								{ "allowTimeScale", json{ { "type", "boolean" }, { "description", "capture anyway while the game's time scale is not 1 (default false; a scaled frame is not comparable to a golden taken at normal speed)" } } },
 								{ "excludeUi", json{ { "type", "boolean" }, { "description", "request a pre-UI capture source; native cannot honor this (default true)" } } },
+								{ "requestId", json{ { "type", "string" }, { "description", "provider-managed burst: caller request identity for reconciliation" } } },
+								{ "outputDir", json{ { "type", "string" }, { "description", "provider-managed burst: absolute output directory" } } },
+								{ "prefix", json{ { "type", "string" }, { "description", "provider-managed burst: frame filename stem" } } },
+								{ "manifestPath", json{ { "type", "string" }, { "description", "provider-managed burst: optional absolute manifest path" } } },
+								{ "scale", json{ { "type", "number" }, { "description", "provider-managed burst: requested scale (CSX supports 1)" } } },
 								{ "outDir", json{ { "type", "string" }, { "description", "override the capture bundle directory" } } },
-								{ "timeoutMs", json{ { "type", "integer" }, { "description", "Single capture: how long to wait for readiness (default 8000)" } } },
-								{ "pollMs", json{ { "type", "integer" }, { "description", "Single capture: poll interval while waiting (default 100)" } } },
-								{ "subrect", json{ { "type", { "object", "null" } }, { "description", "Single capture: optional {x,y,w,h} in 0..1 UV. Omit or use null for burst." } } },
+								{ "timeoutMs", json{ { "type", "integer" }, { "description", "how long to wait for the capture to be ready (default 8000)" } } },
+								{ "pollMs", json{ { "type", "integer" }, { "description", "poll interval while waiting (default 100)" } } },
+								{ "subrect", json{ { "type", "object" }, { "description", "optional {x,y,w,h} in 0..1 UV — provider-only, native ignores it" } } },
 								{ "cleanup", json{ { "type", "boolean" }, { "description", "native only: delete the game's source screenshot after copying (default false)" } } },
+								{ "resolveRealPath", json{ { "type", "boolean" }, { "description", "also look up the written file's final on-disk path from its handle and add it as 'realPath' (advisory; default true)" } } },
 								{ "golden", json{ { "type", "string" }, { "description", "path to a reference image to SSIM-compare this capture against (absolute, or relative to the game root); adds {ssim,threshold,passed} to the result" } } },
 								{ "threshold", json{ { "type", "number" }, { "description", "golden: SSIM >= threshold passes (default 0.98)" } } },
 								{ "regions", json{ { "type", "array" }, { "description", "golden: optional [{name,x,y,w,h,threshold?}] in 0..1 UV — score independent regions instead of the whole frame; overall passed is AND across all" } } },
 							} },
 		};
-		d.inputSchema.update(json::parse(R"({
-			"if": {"properties": {"action": {"const": "burst"}}, "required": ["action"]},
-			"then": {
-				"required": ["requestId", "outputDir", "prefix", "count"],
-				"properties": {"scale": {"const": 1}, "subrect": {"type": "null"}}
-			},
-			"else": {
-				"if": {"properties": {"action": {"const": "burstStatus"}}, "required": ["action"]},
-				"then": {
-					"required": ["runId"],
-					"properties": {"runId": {"minimum": 1, "maximum": 9007199254740991}}
-				},
-				"else": {"required": ["checkpointId"], "properties": {"subrect": {"type": "object"}}}
-			}
-		})"));
 		return d;
 	}
 

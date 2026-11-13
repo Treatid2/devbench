@@ -22,6 +22,9 @@ const CORE_TOOL_NAMES = new Set([
   "scenario",
   "inspect",
   "game",
+  "actor",
+  "forms",
+  "gfx",
   "camera",
   "papyrus",
   "capture",
@@ -31,6 +34,7 @@ const CORE_TOOL_NAMES = new Set([
   "sleep",
   "mcp_bridge_setup",
   "ping",
+  "notice",
 ]);
 
 const base = process.argv[2] ?? "http://127.0.0.1:8920";

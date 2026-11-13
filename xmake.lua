@@ -25,7 +25,7 @@ includes("xmake/cpp-mcp.lua")
 set_project("devbench")
 set_license("GPL-3.0")
 
-local version = "1.22.0"
+local version = "1.36.0"
 local ver = version:split("%.")
 set_version(version)
 
@@ -225,14 +225,30 @@ add_packages("nlohmann_json", "stb")
 add_includedirs("src")
 add_files("tests/*.cpp")
 add_files("src/ToolRegistry.cpp") -- exercised directly; pure logic, no game deps
+add_files("src/Notices.cpp") -- notice board; pure logic
 add_files("src/Ssim.cpp") -- exercised directly; pure logic, no game deps
 add_files("src/KeyboardInputState.cpp") -- key resolution + lease ownership; pure logic
 add_files("src/VRInputState.cpp") -- atomic tracked-set validation/encoding; pure logic
 add_files("src/ConsoleCaptureLogic.cpp") -- console capture slicing + line sampler; pure logic
-add_files("src/PrologueScan.cpp") -- relocatable-prologue check for the console print hook; pure logic
+add_files("src/HeldLightsLogic.cpp") -- held-light search coverage and counts; pure logic
 add_files("src/PapyrusDefaults.cpp") -- declared optional-parameter defaults for papyrus call; pure logic
+add_files("src/CameraOrbitLogic.cpp") -- camera orbit admission, baseline and restoration; pure logic
+add_files("src/CameraFrameLogic.cpp") -- camera frame pose math; pure logic
+add_files("src/PrologueScan.cpp") -- relocatable-prologue check for the console print hook; pure logic
+add_files("src/DifficultyLogic.cpp") -- difficulty level names and parsing; pure logic
+add_files("src/ActorIdleLogic.cpp") -- looping-idle replay gap and due check; pure logic
+add_files("src/CaptureBurstLogic.cpp") -- burst capture request validation and provider event folding; pure logic
+add_files("src/ReachLogic.cpp") -- reach solver, request parsing and frame building; pure logic
+add_files("src/GfxLogic.cpp") -- gfx path splitting and array index check; pure logic
+add_files("src/MapLogic.cpp") -- map tool argument validation; pure logic
+add_files("src/FormSearchLogic.cpp") -- form search matching, head part types and armor slot masks; pure logic
+add_files("src/HavokAnimationLogic.cpp") -- animation duration and track counts from a Havok packfile; pure logic
+add_files("src/PluginHeaderLogic.cpp") -- author, description and masters from a plugin's TES4 record; pure logic
+add_files("src/InspectLogic.cpp") -- lights scope/budget/ordering and the handsReady predicate; pure logic
 add_files("src/ReplayTrajectory.cpp") -- pose keyframe sampling/interpolation; pure logic
 add_files("src/RecordingActivity.cpp") -- activity contract + input/trajectory interleave; pure logic
+add_files("src/DrawStatsLogic.cpp")
+add_files("src/RunStatusLogic.cpp") -- run-status transcript compaction; pure logic
 add_headerfiles("tests/*.h")
 set_pcxxheader("tests/pch.h")
 add_defines("_WINSOCKAPI_")
