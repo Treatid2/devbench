@@ -267,22 +267,22 @@ namespace
 			try {
 				auto* tasks = SKSE::GetTaskInterface();
 				if (!tasks) throw std::runtime_error("SKSE task interface unavailable for safe startup");
-				const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+				using Startup = dvb::PostLoadStartup;
+				const auto deadline = Startup::Clock::now() + Startup::kDeferredStartAllowance;
 				tasks->AddTask([deadline] {
 					// Fail closed if an adapter violates the deferred-task contract.
 					// Never construct/drain transport workers on inline loader reentry.
-					if (g_postLoadCallbackDepth != 0 || std::chrono::steady_clock::now() >= deadline) {
-						(void)g_startup.SchedulingFailed(*g_postLoadOperations, {});
+					if (g_startup.CompleteDeferred(*g_postLoadOperations, g_postLoadCallbackDepth != 0,
+						Startup::Clock::now(), deadline) != Startup::Outcome::Ready)
 						return;
-					}
-					(void)g_startup.Complete(*g_postLoadOperations);
 					try { DrainStartupMilestones(); }
 					catch (...) {
 						(void)g_startup.PublicationFailed(*g_postLoadOperations, std::current_exception());
 						try { logs::error("devbench: deferred input/UI publication failed; admission revoked"); } catch (...) {}
 					}
 				});
-				try { logs::info("devbench: prepared; safe main-thread startup task queued (not ready)"); } catch (...) {}
+				try { logs::info("devbench: prepared; safe main-thread startup task queued (not ready, {} minute allowance)",
+					Startup::kDeferredStartAllowance.count()); } catch (...) {}
 			} catch (...) {
 				(void)g_startup.SchedulingFailed(operations, std::current_exception());
 			}

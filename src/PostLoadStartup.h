@@ -1,7 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <exception>
+#include <stdexcept>
 
 namespace dvb
 {
@@ -15,6 +17,9 @@ namespace dvb
 		enum class State { Idle, Preparing, Prepared, Starting, Disabled, Ready, Failed };
 		enum class Phase { Configuration, Construction, Preparation, Scheduling, Listening, Publication };
 		enum class Outcome { Prepared, Disabled, Ready, Failed, AlreadyAttempted };
+
+		using Clock = std::chrono::steady_clock;
+		static constexpr auto kDeferredStartAllowance = std::chrono::minutes(20);
 
 		bool Ready() const noexcept { return m_state.load() == State::Ready; }
 		State Current() const noexcept { return m_state.load(); }
@@ -68,6 +73,21 @@ namespace dvb
 			// SKSE nor turn a committed service into a false failed-start claim.
 			Report(a_ops, Outcome::Ready, phase, {});
 			return Outcome::Ready;
+		}
+
+		template <class Operations>
+		Outcome CompleteDeferred(Operations& a_ops, bool a_inline, Clock::time_point a_now,
+			Clock::time_point a_deadline) noexcept
+		{
+			try {
+				if (a_inline)
+					throw std::runtime_error("deferred startup task ran inline during PostLoad");
+				if (a_now >= a_deadline)
+					throw std::runtime_error("deferred startup task missed its scheduling deadline");
+			} catch (...) {
+				return SchedulingFailed(a_ops, std::current_exception());
+			}
+			return Complete(a_ops);
 		}
 
 		template <class Operations>

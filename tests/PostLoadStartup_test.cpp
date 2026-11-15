@@ -2,6 +2,7 @@
 #include "PostLoadStartup.h"
 
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace
@@ -29,6 +30,7 @@ namespace
 		bool escapedOwner = false;
 		bool reportReady = false;
 		bool hadException = false;
+		std::string reportedError;
 		Phase reportedPhase = Phase::Configuration;
 		Outcome reportedOutcome = Outcome::AlreadyAttempted;
 		Outcome nestedOutcome = Outcome::Ready;
@@ -65,6 +67,10 @@ namespace
 			reportedOutcome = outcome;
 			reportedPhase = phase;
 			hadException = static_cast<bool>(error);
+			if (error) {
+				try { std::rethrow_exception(error); }
+				catch (const std::exception& e) { reportedError = e.what(); }
+			}
 			reportReady = startup->Ready();
 			if (throwReport)
 				throw std::runtime_error("injected optional discovery/report failure");
@@ -203,4 +209,51 @@ TEST_CASE("failed safe-phase scheduling quarantines prepared owner without worke
 	CHECK(ops.quarantined);
 	CHECK(startup.Complete(ops) == Outcome::AlreadyAttempted);
 	CHECK(!startup.Ready());
+}
+
+TEST_CASE("deferred PostLoad accepts a cold start after ten simulated minutes only once")
+{
+	using namespace std::chrono_literals;
+	Startup startup;
+	Operations ops{ &startup };
+	const auto queued = Startup::Clock::time_point{};
+	const auto deadline = queued + Startup::kDeferredStartAllowance;
+	CHECK(deadline == queued + 20min);
+	CHECK(startup.Prepare(ops) == Outcome::Prepared);
+	CHECK(startup.CompleteDeferred(ops, false, queued + 10min, deadline) == Outcome::Ready);
+	CHECK(ops.entered == std::vector<Phase>({ Phase::Configuration, Phase::Construction,
+		Phase::Preparation, Phase::Listening, Phase::Publication }));
+	CHECK(startup.CompleteDeferred(ops, false, queued + 11min, deadline) == Outcome::AlreadyAttempted);
+	CHECK(ops.entered.size() == 5);
+}
+
+TEST_CASE("deferred PostLoad quarantines at and beyond twenty simulated minutes")
+{
+	using namespace std::chrono_literals;
+	const auto queued = Startup::Clock::time_point{};
+	const auto deadline = queued + Startup::kDeferredStartAllowance;
+	for (const auto now : { deadline, deadline + 1s }) {
+		Startup startup;
+		Operations ops{ &startup };
+		CHECK(startup.Prepare(ops) == Outcome::Prepared);
+		CHECK(startup.CompleteDeferred(ops, false, now, deadline) == Outcome::Failed);
+		CHECK(ops.reportedPhase == Phase::Scheduling);
+		CHECK(ops.reportedError.find("missed its scheduling deadline") != std::string::npos);
+		CHECK(ops.quarantined && ops.ownerRetained && !ops.published);
+		CHECK(ops.entered.size() == 3);
+		CHECK(startup.CompleteDeferred(ops, false, now, deadline) == Outcome::AlreadyAttempted);
+	}
+}
+
+TEST_CASE("deferred PostLoad reports inline re-entry separately and never starts workers")
+{
+	Startup startup;
+	Operations ops{ &startup };
+	const auto queued = Startup::Clock::time_point{};
+	CHECK(startup.Prepare(ops) == Outcome::Prepared);
+	CHECK(startup.CompleteDeferred(ops, true, queued, queued + Startup::kDeferredStartAllowance) == Outcome::Failed);
+	CHECK(ops.reportedPhase == Phase::Scheduling);
+	CHECK(ops.reportedError.find("ran inline during PostLoad") != std::string::npos);
+	CHECK(ops.quarantined && ops.ownerRetained && !ops.published);
+	CHECK(ops.entered.size() == 3);
 }
