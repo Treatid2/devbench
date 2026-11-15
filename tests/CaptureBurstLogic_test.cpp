@@ -23,7 +23,6 @@ TEST_CASE("a burst needs a count and takes the defaults for the rest")
 	CHECK(request->count == 60);
 	CHECK(request->everyNFrames == 1);
 	CHECK(request->excludeUi);
-	CHECK(!request->subrect.has_value());
 	CHECK(request->timeoutMs == DefaultTimeoutMs(60, 1));
 
 	CHECK(!Parse(json::object(), error).has_value());
@@ -47,7 +46,7 @@ TEST_CASE("format, excludeUi and timeout are validated and scale is refused")
 {
 	std::string error;
 	CHECK(!Parse(json{ { "count", 1 }, { "scale", 0.5 } }, error).has_value());
-	CHECK(error == "'scale' is not supported; crop with 'subrect'");
+	CHECK(error == "'scale' is not supported for a DevBench-managed burst");
 	CHECK(Parse(json{ { "count", 1 }, { "format", "png" } }, error).has_value());
 	CHECK(!Parse(json{ { "count", 1 }, { "format", "gif" } }, error).has_value());
 	CHECK(!Parse(json{ { "count", 1 }, { "excludeUi", 1 } }, error).has_value());
@@ -57,21 +56,12 @@ TEST_CASE("format, excludeUi and timeout are validated and scale is refused")
 	CHECK(!Parse(json{ { "count", 1 }, { "timeoutMs", kMaxTimeoutMs + 1 } }, error).has_value());
 }
 
-TEST_CASE("a subrect is a rectangle inside the unit square")
+TEST_CASE("managed capture burst: only whole frames are admitted")
 {
 	std::string error;
-	const auto  ok = Parse(json{ { "count", 1 }, { "subrect", json{ { "x", 0.25 }, { "y", 0.1 }, { "w", 0.5 }, { "h", 0.9 } } } }, error);
-	CHECK(ok.has_value());
-	if (ok) {
-		CHECK(ok->subrect->x == 0.25);
-		CHECK(ok->subrect->h == 0.9);
-	}
-	CHECK(Parse(json{ { "count", 1 }, { "subrect", json{ { "x", 0 }, { "y", 0 }, { "w", 1 }, { "h", 1 } } } }, error).has_value());
-	CHECK(!Parse(json{ { "count", 1 }, { "subrect", json{ { "x", 0.6 }, { "y", 0 }, { "w", 0.5 }, { "h", 1 } } } }, error).has_value());
-	CHECK(!Parse(json{ { "count", 1 }, { "subrect", json{ { "x", 0 }, { "y", 0 }, { "w", 0 }, { "h", 1 } } } }, error).has_value());
-	CHECK(!Parse(json{ { "count", 1 }, { "subrect", json{ { "x", -0.1 }, { "y", 0 }, { "w", 1 }, { "h", 1 } } } }, error).has_value());
-	CHECK(!Parse(json{ { "count", 1 }, { "subrect", json{ { "x", 0 }, { "y", 0 }, { "w", 1 } } } }, error).has_value());
-	CHECK(!Parse(json{ { "count", 1 }, { "subrect", "all" } }, error).has_value());
+	CHECK(Parse(json{ { "count", 1 }, { "subrect", nullptr } }, error).has_value());
+	CHECK(!Parse(json{ { "count", 1 }, { "subrect", { { "x", 0 }, { "y", 0 }, { "w", 0.5 }, { "h", 0.5 } } } }, error).has_value());
+	CHECK(error.find("requires whole frames") != std::string::npos);
 }
 
 TEST_CASE("the default timeout grows with the frames a burst presents and is capped")

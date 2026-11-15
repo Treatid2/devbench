@@ -14,20 +14,11 @@ namespace dvb::CaptureBurstLogic
 	inline constexpr int  kMaxEveryNFrames = 600;
 	inline constexpr long kMaxTimeoutMs = 600000;
 
-	struct Subrect
-	{
-		double x{ 0.0 };
-		double y{ 0.0 };
-		double w{ 1.0 };
-		double h{ 1.0 };
-	};
-
 	struct BurstRequest
 	{
 		int                    count{ 0 };
 		int                    everyNFrames{ 1 };
 		bool                   excludeUi{ true };
-		std::optional<Subrect> subrect;
 		long                   timeoutMs{ 0 };
 	};
 

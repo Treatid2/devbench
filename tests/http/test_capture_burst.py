@@ -35,6 +35,22 @@ def test_status_of_an_unknown_run_is_404(client):
     assert status == 404, (status, body)
 
 
+@pytest.mark.parametrize("extra", [{}, {"requestId": "crop-must-not-dispatch"}])
+def test_burst_refuses_even_a_valid_crop_before_provider_selection(client, extra):
+    status, body = client.call(
+        "capture",
+        {
+            "action": "burst",
+            "kind": "unregistered-crop-sentinel",
+            "count": 1,
+            "subrect": {"x": 0, "y": 0, "w": 0.5, "h": 0.5},
+            **extra,
+        },
+    )
+    assert status == 400, (status, body)
+    assert "requires whole frames" in body["error"], body
+
+
 def test_burst_refuses_the_native_fallback(client):
     status, body = client.call("capture", {"action": "burst", "checkpointId": "b", "count": 5, "kind": "native"})
     assert status == 400, (status, body)

@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cmath>
 
 namespace dvb::CaptureBurstLogic
 {
@@ -34,7 +33,6 @@ namespace dvb::CaptureBurstLogic
 	{
 		constexpr long             kBaseTimeoutMs = 5000;
 		constexpr long             kPerFrameMs = 500;
-		constexpr double           kUvSlack = 1.0e-6;
 		constexpr std::string_view kProgressTopic = "capture.burst.progress";
 		constexpr std::string_view kReadyTopic = "capture.burst.ready";
 
@@ -49,15 +47,6 @@ namespace dvb::CaptureBurstLogic
 			}
 			a_out = it->get<int>();
 			return true;
-		}
-
-		bool UnitField(const json& a_object, const char* a_name, double a_min, double a_max, double& a_out)
-		{
-			const auto it = a_object.find(a_name);
-			if (it == a_object.end() || !it->is_number())
-				return false;
-			a_out = it->get<double>();
-			return std::isfinite(a_out) && a_out >= a_min && a_out <= a_max;
 		}
 
 		int CountField(const json& a_payload, const char* a_name)
@@ -95,18 +84,13 @@ namespace dvb::CaptureBurstLogic
 		}
 
 		if (a_args.contains("scale")) {
-			a_error = "'scale' is not supported; crop with 'subrect'";
+			a_error = "'scale' is not supported for a DevBench-managed burst";
 			return std::nullopt;
 		}
 
-		if (const auto it = a_args.find("subrect"); it != a_args.end()) {
-			Subrect rect;
-			if (!it->is_object() || !UnitField(*it, "x", 0.0, 1.0, rect.x) || !UnitField(*it, "y", 0.0, 1.0, rect.y) || !UnitField(*it, "w", kUvSlack, 1.0, rect.w) ||
-				!UnitField(*it, "h", kUvSlack, 1.0, rect.h) || rect.x + rect.w > 1.0 + kUvSlack || rect.y + rect.h > 1.0 + kUvSlack) {
-				a_error = "'subrect' must be {x,y,w,h} in 0..1 UV, w and h above 0, staying inside the frame";
-				return std::nullopt;
-			}
-			request.subrect = rect;
+		if (a_args.contains("subrect") && !a_args["subrect"].is_null()) {
+			a_error = "burst requires whole frames; subrect is available for single capture";
+			return std::nullopt;
 		}
 
 		request.timeoutMs = DefaultTimeoutMs(request.count, request.everyNFrames);

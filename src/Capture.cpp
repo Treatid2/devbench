@@ -577,9 +577,24 @@ namespace dvb::Capture
 
 		std::mutex                        g_burstLock;
 		std::map<std::uint64_t, BurstRun> g_bursts;
+		ProviderBurstRun                 g_providerBurst;
 		std::uint64_t                     g_burstSeq = 0;
 		constexpr std::uintmax_t          kMaxManifestBytes = 1u << 20;
 		constexpr std::size_t             kMaxRememberedBursts = 32;
+
+		void RefreshProviderBurst()
+		{
+			const auto cursor = g_providerBurst.EventCursor();
+			if (!g_events || !cursor)
+				return;
+			for (const auto& ev : g_events->Since(*cursor)) {
+				if (ev.topic != "capture.burst.ready")
+					continue;
+				const auto provider = ev.payload.find("provider");
+				if (provider != ev.payload.end() && provider->is_string())
+					g_providerBurst.ObserveTerminal(provider->get_ref<const std::string&>(), ev.payload, ev.seq);
+			}
+		}
 
 		void RefreshBurst(BurstRun& a_run)
 		{
@@ -641,8 +656,10 @@ namespace dvb::Capture
 			if (!entry)
 				throw ToolError(404, std::format("no capture provider registered under '{}'", provider));
 
-			const fs::path  outputDir = CaptureDir(a_args);
 			std::error_code ec;
+			const fs::path outputDir = fs::absolute(CaptureDir(a_args), ec);
+			if (ec)
+				throw ToolError(500, std::format("capture burst: cannot resolve output directory: {}", ec.message()));
 			fs::create_directories(outputDir, ec);
 			if (ec)
 				throw ToolError(500, std::format("capture burst: cannot create {}: {}", GenericPath(outputDir), ec.message()));
@@ -670,9 +687,6 @@ namespace dvb::Capture
 				{ "excludeUi", request->excludeUi },
 				{ "format", "png" },
 			};
-			if (request->subrect)
-				providerArgs["subrect"] = json{ { "x", request->subrect->x }, { "y", request->subrect->y }, { "w", request->subrect->w }, { "h", request->subrect->h } };
-
 			// Reserve the slot before the provider is called, so a concurrent request sees this burst running.
 			// The event snapshot is taken at the same point: a fast provider could publish its ready event first.
 			std::uint64_t runId = 0;
@@ -966,6 +980,8 @@ namespace dvb::Capture
 			action = "capture";
 		if (action == "status")
 			return BurstStatus(a_args);
+		if (action == "burst" && a_args.contains("subrect") && !a_args["subrect"].is_null())
+			throw ToolError(400, "capture burst requires whole frames; subrect is available for single capture");
 		const bool providerStatus = action == "burstStatus";
 		const bool providerBurst = action == "burst" &&
 			(a_args.contains("requestId") || a_args.contains("outputDir") || a_args.contains("prefix") || a_args.contains("manifestPath") ||
@@ -994,7 +1010,10 @@ namespace dvb::Capture
 			const auto entry = ToolExtensions::Find("capture", provider);
 			if (!entry)
 				throw ToolError(404, std::format("no capture provider registered under '{}'", provider));
-			return InvokeProviderBurst(*entry, a_args, a_ctx);
+			if (providerStatus)
+				return g_providerBurst.Status(provider, *entry, a_args, a_ctx);
+			RefreshProviderBurst();
+			return g_providerBurst.Start(provider, *entry, a_args, a_ctx, g_events ? g_events->HeadSeq() : 0);
 		}
 
 		if (kind == "native")
@@ -1025,6 +1044,9 @@ namespace dvb::Capture
 	bool InFlight()
 	{
 		if (g_inFlight.load(std::memory_order_acquire) > 0)
+			return true;
+		RefreshProviderBurst();
+		if (g_providerBurst.InFlight())
 			return true;
 		const std::lock_guard lock(g_burstLock);
 		return std::ranges::any_of(g_bursts, [](auto& a_entry) {
@@ -1064,10 +1086,11 @@ namespace dvb::Capture
 			"across many recordings stays in tests/http/visual.py. "
 			"action='burst' with requestId, outputDir and prefix dispatches directly to the provider. "
 			"Keep its runId and apiRequestId for burstStatus and capture.burst.progress/ready. "
+			"While a provider-owned burst is active, non-normal time-scale changes require allowTimeScale:true. "
 			"Without provider-managed arguments, action='burst' takes a frame-locked sequence through the registered provider "
 			"(never the native fallback): 'count' (1..240) frames, one every 'everyNFrames' presented "
 			"engine frames (default 1), named <checkpointId>_0000.png and so on under the capture "
-			"directory (recording/variant, or 'outDir'), optional 'subrect' {x,y,w,h} in 0..1 UV and "
+			"directory (recording/variant, or 'outDir'), whole frames only, and "
 			"'excludeUi' (default true); 'scale' is refused. It returns at once with { queued, runId, "
 			"requestId, outputDir, prefix, manifestPath, timeoutMs, timeScale } and is not refused at a "
 			"non-1 time scale, which is how hair and cloth motion is slowed for it; only one burst runs "
@@ -1107,7 +1130,7 @@ namespace dvb::Capture
 								{ "outDir", json{ { "type", "string" }, { "description", "override the capture bundle directory" } } },
 								{ "timeoutMs", json{ { "type", "integer" }, { "description", "how long to wait for the capture to be ready (default 8000)" } } },
 								{ "pollMs", json{ { "type", "integer" }, { "description", "poll interval while waiting (default 100)" } } },
-								{ "subrect", json{ { "type", "object" }, { "description", "optional {x,y,w,h} in 0..1 UV — provider-only, native ignores it" } } },
+								{ "subrect", json{ { "type", "object" }, { "description", "single provider capture only: optional {x,y,w,h} in 0..1 UV; bursts require whole frames" } } },
 								{ "cleanup", json{ { "type", "boolean" }, { "description", "native only: delete the game's source screenshot after copying (default false)" } } },
 								{ "resolveRealPath", json{ { "type", "boolean" }, { "description", "also look up the written file's final on-disk path from its handle and add it as 'realPath' (advisory; default true)" } } },
 								{ "golden", json{ { "type", "string" }, { "description", "path to a reference image to SSIM-compare this capture against (absolute, or relative to the game root); adds {ssim,threshold,passed} to the result" } } },
