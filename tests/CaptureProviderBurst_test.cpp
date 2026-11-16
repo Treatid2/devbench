@@ -134,3 +134,49 @@ TEST_CASE("capture provider burst: cropped start refuses before invoking the pro
 	CHECK(calls == 0);
 	CHECK(!run.InFlight());
 }
+
+TEST_CASE("capture provider burst: lost, malformed and error-shaped start replies retain exclusion")
+{
+	const json request{ { "action", "burst" }, { "requestId", "batch" } };
+	const json statusRequest{ { "action", "burstStatus" }, { "runId", 17 } };
+	const json terminal{ { "done", true }, { "requestId", "batch" }, { "runId", 17 }, { "apiRequestId", "sequence" } };
+	for (const auto& reply : { json(nullptr), json{ { "queued", true } }, json{ { "error", "response lost" } } }) {
+		dvb::Capture::ProviderBurstRun run;
+		int admitted = 0;
+		auto status = terminal;
+		status["runId"] = 18;
+		const dvb::ToolExtensions::Entry provider{
+			json::parse(R"({"inputSchema":{"properties":{"action":{"enum":["burst","burstStatus"]}}}})"),
+			[&](const json& args, const dvb::ToolContext&) {
+				if (args == statusRequest)
+					return status;
+				++admitted;
+				CHECK(run.InFlight());
+				if (reply.is_null())
+					throw std::runtime_error("decode failure after admission");
+				return reply;
+			},
+		};
+
+		if (reply.is_null())
+			CHECK_THROWS(run.Start("communityshaders", provider, request, {}, 50));
+		else
+			CHECK(run.Start("communityshaders", provider, request, {}, 50) == reply);
+		CHECK(admitted == 1);
+		CHECK(run.InFlight());
+		CHECK_THROWS(run.Start("communityshaders", provider, request, {}, 51));
+		CHECK(admitted == 1);
+		run.ObserveTerminal("communityshaders", terminal, 50);
+		run.ObserveTerminal("another-provider", terminal, 51);
+		CHECK(run.Status("communityshaders", provider, statusRequest, {}) == status);
+		CHECK(run.InFlight());
+
+		if (reply.is_null()) {
+			run.ObserveTerminal("communityshaders", terminal, 51);
+		} else {
+			status = terminal;
+			CHECK(run.Status("communityshaders", provider, statusRequest, {}) == terminal);
+		}
+		CHECK(!run.InFlight());
+	}
+}
