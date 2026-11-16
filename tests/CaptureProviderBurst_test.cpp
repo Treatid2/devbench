@@ -72,7 +72,8 @@ TEST_CASE("capture provider burst: refuses an unadvertised action before invocat
 TEST_CASE("capture provider burst: time-scale guard persists until matching terminal proof")
 {
 	dvb::Capture::ProviderBurstRun run;
-	const json request{ { "action", "burst" }, { "requestId", "batch" } };
+	const json request{ { "action", "burst" }, { "requestId", "batch" },
+		{ "count", 2 }, { "outputDir", "L:/captures" }, { "prefix", "frame" } };
 	const json statusRequest{ { "action", "burstStatus" }, { "runId", 17 } };
 	json active{ { "queued", true }, { "done", false }, { "requestId", "batch" },
 		{ "runId", 17 }, { "apiRequestId", "seq-1" } };
@@ -137,7 +138,8 @@ TEST_CASE("capture provider burst: cropped start refuses before invoking the pro
 
 TEST_CASE("capture provider burst: lost, malformed and error-shaped start replies retain exclusion")
 {
-	const json request{ { "action", "burst" }, { "requestId", "batch" } };
+	const json request{ { "action", "burst" }, { "requestId", "batch" },
+		{ "count", 2 }, { "outputDir", "L:/captures" }, { "prefix", "frame" } };
 	const json statusRequest{ { "action", "burstStatus" }, { "runId", 17 } };
 	const json terminal{ { "done", true }, { "requestId", "batch" }, { "runId", 17 }, { "apiRequestId", "sequence" } };
 	for (const auto& reply : { json(nullptr), json{ { "queued", true } }, json{ { "error", "response lost" } } }) {
@@ -179,4 +181,41 @@ TEST_CASE("capture provider burst: lost, malformed and error-shaped start replie
 		}
 		CHECK(!run.InFlight());
 	}
+}
+
+TEST_CASE("capture provider burst: deterministic CSX refusal leaves the start slot available")
+{
+	dvb::Capture::ProviderBurstRun run;
+	const json request{ { "action", "burst" }, { "requestId", "batch" }, { "count", 541 },
+		{ "everyNFrames", 400 }, { "outputDir", "L:/captures" }, { "prefix", "frame" },
+		{ "manifestPath", "L:/captures/frames.JSON" }, { "scale", 1 }, { "excludeUi", true } };
+	const json accepted{ { "queued", true }, { "done", false }, { "requestId", "batch" },
+		{ "runId", 17 }, { "apiRequestId", "sequence" } };
+	int calls = 0;
+	const dvb::ToolExtensions::Entry provider{
+		json::parse(R"({"inputSchema":{"properties":{"action":{"enum":["burst"]}}}})"),
+		[&](const json& a_args, const dvb::ToolContext&) {
+			CHECK(a_args == request);
+			++calls;
+			return accepted;
+		},
+	};
+	for (const auto& invalid : {
+			 json{ { "count", -1 } }, json{ { "count", 601 } }, json{ { "everyNFrames", 0 } },
+			 json{ { "everyNFrames", 401 } }, json{ { "prefix", "../frame" } }, json{ { "prefix", "cOm1.PNG" } },
+			 json{ { "prefix", "frame." } }, json{ { "prefix", std::string(129, 'a') } },
+			 json{ { "outputDir", "captures" } }, json{ { "outputDir", std::string("L:/captures\0else", 16) } },
+			 json{ { "manifestPath", "L:/captures/NUL.json" } }, json{ { "manifestPath", "L:/captures/frames.png" } },
+			 json{ { "manifestPath", "frames.json" } }, json{ { "scale", 0.5 } }, json{ { "scale", "1" } },
+			 json{ { "excludeUi", 1 } },
+		 }) {
+		auto args = request;
+		args.update(invalid);
+		CHECK_THROWS(run.Start("CommunityShaders", provider, args, {}, 50));
+		CHECK(!run.InFlight());
+		CHECK(calls == 0);
+	}
+	CHECK(run.Start("CommunityShaders", provider, request, {}, 50) == accepted);
+	CHECK(run.InFlight());
+	CHECK(calls == 1);
 }

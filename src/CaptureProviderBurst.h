@@ -5,10 +5,85 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <mutex>
 
 namespace dvb::Capture
 {
+	inline bool SameBurstProvider(std::string_view a_left, std::string_view a_right)
+	{
+		return std::ranges::equal(a_left, a_right, [](unsigned char left, unsigned char right) {
+			return std::tolower(left) == std::tolower(right);
+		});
+	}
+
+	inline bool IsCsxBurstFilename(std::string_view a_name, std::size_t a_limit)
+	{
+		if (a_name.empty() || a_name.size() > a_limit || a_name.back() == ' ' || a_name.back() == '.')
+			return false;
+		for (const unsigned char ch : a_name) {
+			if (ch < 0x20 || ch > 0x7e || std::string_view("<>:\"/\\|?*").find(ch) != std::string_view::npos)
+				return false;
+		}
+		const auto stem = a_name.substr(0, a_name.find('.'));
+		for (const auto device : { "CON", "PRN", "AUX", "NUL" }) {
+			if (SameBurstProvider(stem, device))
+				return false;
+		}
+		return stem.size() != 4 || stem[3] < '1' || stem[3] > '9' ||
+			   (!SameBurstProvider(stem.substr(0, 3), "COM") && !SameBurstProvider(stem.substr(0, 3), "LPT"));
+	}
+
+	// The CSX reference provider validates these same input-only gates before
+	// DispatchRequest. Check them here too, before reserving an uncertain start.
+	// Provider-side filesystem, runtime and admission checks still apply.
+	inline void ValidateCsxBurstStart(const json& a_args)
+	{
+		const auto frames = [&](const char* a_field) {
+			const auto it = a_args.find(a_field);
+			const auto n = it != a_args.end() && it->is_number_integer() ? it->get<std::uint64_t>() : 0;
+			if (n < 1 || n > 600)
+				throw ToolError(400, std::string("capture burst '") + a_field + "' must be an integer in 1..600");
+			return n;
+		};
+		const auto count = frames("count");
+		const auto cadence = a_args.contains("everyNFrames") ? frames("everyNFrames") : 1;
+		if ((count - 1) * cadence > 216000)
+			throw ToolError(400, "capture burst cadence exceeds the CSX 216000-frame span limit");
+
+		const auto prefix = a_args.find("prefix");
+		if (prefix == a_args.end() || !prefix->is_string() ||
+			!IsCsxBurstFilename(prefix->get_ref<const std::string&>(), 128))
+			throw ToolError(400, "capture burst requires a safe ASCII filename prefix of 1..128 bytes");
+
+		const auto absolute = [&](const char* a_field) {
+			const auto it = a_args.find(a_field);
+			if (it != a_args.end() && it->is_string()) {
+				const auto& value = it->get_ref<const std::string&>();
+				if (value.find('\0') == std::string::npos) {
+					try {
+						auto path = std::filesystem::path(std::u8string(value.begin(), value.end())).lexically_normal();
+						if (path.is_absolute())
+							return path;
+					} catch (const std::filesystem::filesystem_error&) {}
+				}
+			}
+			throw ToolError(400, std::string("capture burst '") + a_field + "' must be an absolute UTF-8 path");
+		};
+		(void)absolute("outputDir");
+		if (a_args.contains("manifestPath")) {
+			const auto manifest = absolute("manifestPath");
+			const auto name = manifest.filename().u8string();
+			if (!IsCsxBurstFilename({ reinterpret_cast<const char*>(name.data()), name.size() }, 200) ||
+				!SameBurstProvider(manifest.extension().string(), ".json"))
+				throw ToolError(400, "capture burst manifestPath must name a safe JSON file");
+		}
+		if (a_args.contains("scale") && (!a_args["scale"].is_number() || a_args["scale"] != 1))
+			throw ToolError(400, "capture burst supports only whole native frames with scale=1");
+		if (a_args.contains("excludeUi") && !a_args["excludeUi"].is_boolean())
+			throw ToolError(400, "capture burst excludeUi must be a boolean");
+	}
+
 	// Use the descriptor and handler from the same registration snapshot. A legacy
 	// provider might ignore action and start a single capture if called anyway.
 	inline void ValidateProviderBurst(const ToolExtensions::Entry& a_provider, const json& a_args)
@@ -47,6 +122,8 @@ namespace dvb::Capture
 			if (request == a_args.end() || !request->is_string() ||
 				request->get_ref<const std::string&>().empty() || request->get_ref<const std::string&>().size() > 128)
 				throw ToolError(400, "capture provider burst requires a requestId of 1..128 bytes");
+			if (SameBurstProvider(a_key, "communityshaders"))
+				ValidateCsxBurstStart(a_args);
 			{
 				const std::lock_guard lock(m_mutex);
 				if (m_run)
@@ -113,9 +190,7 @@ namespace dvb::Capture
 		// exclusion intact. Bound IDs cannot be replaced by a later receipt.
 		void ApplyReceipt(std::string_view a_key, const json& a_reply)
 		{
-			if (!m_run || !std::ranges::equal(a_key, m_run->provider, [](unsigned char left, unsigned char right) {
-					return std::tolower(left) == std::tolower(right);
-				}))
+			if (!m_run || !SameBurstProvider(a_key, m_run->provider))
 				return;
 			const auto done = a_reply.find("done");
 			const auto request = a_reply.find("requestId");
